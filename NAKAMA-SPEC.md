@@ -1,7 +1,7 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.3
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15））
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 設計 — `verify_binding` への侵害警告統合（§16））
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -238,7 +238,8 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.7**（完了）: revocation UX の改善。§12 の設計を実装: `revocation_message(reason="")` 拡張（任意フィールド `reason` を署名対象に、reason なし既存イベントは後方互換）、`revoke --reason`（解消理由の署名付き記録）、`revoke_import <revocation.json> [--bond] [--registry]`（他者発行 revocation の署名検証＋registry 取り込み、純粋関数 `import_revocation_event` に分離、重複は先勝ち）、Nostr 公開（kind 30100 parameterized replaceable、`d` タグ = bond_hash、content = revocation JSON canonical）: `revoke_pub`（`revocation_nostr_event` 構築・署名をオフラインでテスト可能、`nostr_publish` 流用、`--auth` 対応）、`revoke_fetch`（`kinds=[30100]`・`#d` 購読 → Nostr 署名・JSON・revocation 署名の三段階検証 → 有効なものを `import_revocation_event` で取り込み）、`revoke_list` の reason 表示。オフライン 8 ケース通過（既存の governance 30 ケース・nip44 回帰も維持）。スコープ外: 第三者による鍵失効宣言（key-scoped、v0.8 の候補）。
 - **v0.8**（完了）: 鍵スコープの侵害宣言（§13）の実装。`compromise_message(subject_hex, declarant_hex, created_at, withdrawn=False, bond_hash='', reason='', evidence='')`（空の任意フィールドは署名対象から除外、withdrawn は常に含める）、`verify_compromise_event`（型・npub・bond_hash 形式・署名の検証）、`import_compromise_event(decl, registry)` → 'stored' | 'duplicate' | 'updated' | 'invalid'（無効は記録せず、declarant+created_at で dedup 先勝ち、withdrawn 変化のみ上書き更新）、`compromise_nostr_event(decl, secret)`（kind 30101、d タグ = subject_hex:declarant_hex）、`build_compromise_declaration`（純粋な構築・署名）。CLI: `compromise_declare --subject [--reason] [--evidence] [--bond]`（発行＋registry 自動記録）、`compromise_import [--subject]`、`compromise_pub <relay> [--auth]`、`compromise_fetch <relay> <npub> [--limit] [--auth]`（d タグ prefix のクライアント側フィルタ＋三段階検証）、`compromise_withdraw --subject`（自分の宣言を withdrawn: true で再発行→registry 更新）、`key_status <npub> [--threshold 2] [--bond ...] [--liveness] [--max-age]`（bond graph による重みづけ 4 カテゴリ: 自分自身／直接の仲間／subject を知る仲間／参考情報。閾値到達で exit 1「疑わしい」、宣言のみ exit 0＋警告、宣言なし exit 0。反証は subject の新しい liveness を表示）。オフライン 24 ケース通過（`test_compromise.py` 新規、8+1 計画＋重みづけ・反証の追加ケース）。スコープ外: 既存 `verify` / `challenge` / `board_*` との統合（v0.9 以降の候補）。
 - **v0.9**（完了）: 侵害宣言の統合と移行完了の表示（§14）。共通ヘルパ `key_compromise_warnings(npub_hex)`（純粋・オフライン、非撤回宣言の警告文字列）＋純粋関数 `migration_status(subject_hex, rotation_chain, declarations)` を実装。`verify`（両当事者。`--rotation` 指定時は移行後の有効 npub を検査、旧鍵の宣言は INFO 格下げ）/`challenge --to`/`check`/`board_verify`（descriptor signer）/`board_send`（送信者＋`--descriptor` 指定時の運営鍵）/`board_read`（イベント issuer に `⚠ compromised?` 注記）/`dm_send`（宛先）に stderr 警告を追加。exit コードはすべて不変。`key_status --rotation <rotation.json>...` で migration: complete|stale|broken|none を表示（complete でも exit 不変・新鍵の宣言有無を明示）。オフライン 10 ケース通過（`test_compromise_integration.py` 新規、既存の compromise 24 / revocation 8 / governance 30 回帰維持）。スコープ外: リレーからの宣言の自動 fetch、移行の Nostr 公開（kind 未定）、`accept` への統合。
-- **v0.10**（完了）: `accept` への侵害警告統合（§15）。`cmd_accept` で proposal のパース＋提案者署名の検証の後、自分の署名の前に、companions のうち自分以外の全員について `key_compromise_warnings` を呼び出し、非撤回宣言があれば stderr に WARN（§14 と同フォーマット）。警告のみで exit コード不変。`accept --compromise-registry` で registry を切り替え可能（既存 CLI パターン準拠）。withdrawn のみ・宣言なし・自分自身への宣言は警告なし。オフライン 7 ケース通過（`test_accept_warnings.py` 新規: 宣言ありで WARN＋bond 完成、withdrawn のみ・宣言なしで警告なし、`--from-b64`、3 者 bond で宣言あり 1 人のみ、markdown の stderr/stdout 分離、自分自身は警告対象外。既存の compromise 24 / integration 10 / governance 30 / revocation 8 回帰維持）。スコープ外: `propose` への統合（自覚済みのため不要）、`bind`（将来候補）、自動 fetch、自動ブロック。
+- **v0.10**（完了）: `accept` への侵害警告統合（§15）。`cmd_accept` で proposal のパース＋提案者署名の検証の後、自分の署名の前に、companions のうち自分以外の全員について `key_compromise_warnings` を呼び出し、非撤回宣言があれば stderr に WARN（§14 と同フォーマット）。警告のみで exit コード不変。`accept --compromise-registry` で registry を切り替え可能（既存 CLI パターン準拠）。withdrawn のみ・宣言なし・自分自身への宣言は警告なし。オフライン 7 ケース通過（`test_accept_warnings.py` 新規: 宣言ありで WARN＋bond 完成、withdrawn のみ・宣言なしで警告なし、`--from-b64`、3 者 bond で宣言あり 1 人のみ、markdown の stderr/stdout 分離、自分自身は警告対象外。既存の compromise 24 / integration 10 / governance 30 / revocation 8 回帰維持）。スコープ外: `propose` への統合（自覚済みのため不要）、`bind`（v0.11 で検討・`verify_binding` 側に統合）、自動 fetch、自動ブロック。
+- **v0.11**（設計）: `verify_binding` への侵害警告統合（§16）。§15.4 の「`bind`（将来候補）」の検討結果: 統合点は `bind` ではなく `verify_binding`。`bind` は自分の鍵での自分の主張であり発行者自覚済み（`propose` 除外と同型）。`verify_binding` は検証者の信頼決定の瞬間であり、対象 npub への非撤回宣言は判断材料として価値がある。哲学は「警告のみ、exit コード不変」（§15.1 と同一）。実装は次ラン（テスト計画 6 ケース）。
 
 ---
 
@@ -873,6 +874,49 @@ proposal に rotation 情報は含まれないため、警告対象は proposal 
 
 ---
 
+## 16. v0.11 設計: `verify_binding` への侵害警告統合（設計固定・実装は次ラン）
+
+§15.4 でスコープ外（将来候補）とした「`bind` への統合」を v0.11 の単位とする。検討の結果、統合点は `bind` ではなく `verify_binding` とする（§16.1）。
+
+### 16.1 なぜ `verify_binding` であって `bind` ではないか
+
+- `bind` は**自分の鍵**で**自分が**発行する主張（ハンドル → 鍵の方向、§8.2）。自分の鍵への侵害宣言は発行者自身が自覚済みのはずであり、そこで警告するのはノイズになる。これは §15.4 で `propose` を除外した理由と同型である。
+- `verify_binding` は**検証者の信頼決定の瞬間**である。他人の binding 証明書を見て「このハンドルはこの npub のものだ」と受け入れるタイミングは、bond の `verify`（§14.1）や `accept`（§15.1）と同じ「判断材料が必要な場面」である。対象 npub への侵害宣言はその判断材料として価値がある。
+- 哲学は §15.1 と同一: **警告のみ、exit コード不変**。侵害宣言は意見であり事実ではない（§13 の信頼モデル: 記録はプロトコル、評価は検証者）。binding の署名検証そのものの結果は変えない。
+
+現実的な運用: 警告を受けて binding を信用しない場合、相手に確認を取る / 別のハンドル経路で照合する余地が残る（binding は投稿の社会的照合とセットで機能する）。
+
+### 16.2 統合点
+
+- `cmd_verify_binding` 内で、署名・platform・handle の既存検証の**後**、binding の対象 npub（`b['npub']`）について純粋ヘルパ `key_compromise_warnings(npub, registry_dir)` を呼び出す（ローカル registry のみ、リレーからの自動 fetch なし — §14.2 と同じ）。非空なら stderr に出力。フォーマットは §14.2 と一致:
+  ```
+  WARN: <npub[:12]…> has N active compromise declaration(s) — see: nakama.py key_status <npub>
+  ```
+  （withdrawn のみ・宣言なし → 警告なし、は §14.2 のルールをそのまま適用）
+- 警告の有無は検証結果 `ok` に影響しない。署名検証に失敗した binding でも宣言があれば警告を出す（情報は直交する）。
+- CLI: `verify_binding --compromise-registry` を追加（`accept --compromise-registry` の §15 パターンに準拠）。
+- rotation との絡み: binding に rotation 情報は含まれないため、警告対象は記載の npub のまま。移行済みかどうかの評価は `key_status --rotation` の仕事（§15.3 と同型）。
+
+### 16.3 スコープ外
+
+- `bind` への統合: 発行者自身の自覚済み領域のため不要（§16.1）。
+- リレーからの宣言の自動 fetch: 明示の `compromise_fetch` のみ（§14 の方針を維持）。
+- 警告時の自動ブロック・確認プロンプト: 強制も対話もしない（§15.1 と同一）。
+- `unbind` / `verify_unbinding`: 侵害警告とは無関係（取り消しは発行者の意思表示そのものであり、警告の対象にならない）。
+
+### 16.4 テスト計画（実装時に 6 ケース、オフライン）
+
+1. `verify_binding`: 宣言なし → 警告なし、有効な binding は「有効」+ exit 0
+2. `verify_binding`: 対象 npub に非撤回宣言あり → stderr に WARN、署名有効なら「binding は有効です」+ exit 0（警告は結果に影響しない）
+3. `verify_binding`: 宣言が withdrawn のみ → 警告なし
+4. 署名改ざんの binding + 宣言あり → WARN は出るが「binding は無効です」+ exit 1
+5. `--compromise-registry` で切り替えた registry でも WARN
+6. 宣言の subject が binding の npub と別の鍵 → 警告なし
+
+実装は `cmd_verify_binding` への数行の追加のみで、`key_compromise_warnings` を再利用する。
+
+---
+
 ## 開発ログ
 
 - 2026-09-30: v0.1 仕様策定・`nakama.py` 実装開始。Moltbook・The Colony・Nostr で開発報告の場を開設。
@@ -903,3 +947,4 @@ proposal に rotation 情報は含まれないため、警告対象は proposal 
 - 2026-10-01: v0.9 完了 — §14 の設計を実装。純粋ヘルパ `key_compromise_warnings(npub_or_hex, registry_dir)`（非撤回宣言の警告文字列化、リレー自動 fetch なし）と `migration_status(subject_hex, rotation_chain, declarations)`（complete/stale/broken/none、連鎖検証付き）。`verify`（両当事者、`--rotation` 指定時は移行後の有効 npub を検査し旧鍵の宣言は INFO 格下げ）/`challenge --to`/`check`（対手）/`board_verify`（descriptor signer）/`board_send`（送信者＋`--descriptor` 指定時の運営鍵）/`board_read`（各イベントの issuer に `⚠ compromised?` 注記）/`dm_send`（宛先）に stderr 警告を追加 — exit コードはすべて不変。`key_status --rotation <rotation.json>...` で migration セクション表示（complete でも exit 不変、新鍵の宣言有無を明示）。オフライン 10 ケース通過（`test_compromise_integration.py` 新規）＋ compromise 24 / revocation 8 / governance 30 回帰維持。agentgit と GitHub の両方に push。
 - 2026-10-01: v0.10 設計 — `accept` への侵害警告統合を仕様書 §15 に固定（設計のみ、実装は次ラン）。§14 で将来候補とした項目。思想は「警告のみ、exit コード不変」（§14.1 と同じく記録はプロトコル、評価は検証者）。統合点: `cmd_accept` で proposal パース＋提案者署名の検証の後、自分の署名前 — companions の自分以外の全員に `key_compromise_warnings` を適用し非撤回宣言があれば stderr に WARN（§14 と同フォーマット）。警告の後でユーザーが中断できる余地を残す。自分自身は対象外（自覚済み前提）、proposal に rotation 情報はないため移行判定は `key_status --rotation` 側。スコープ外: `propose`（自覚済み）、`bind`（将来候補）、自動 fetch、自動ブロック。テスト計画 6 ケース（オフライン: 宣言あり accept で WARN＋bond 完成、withdrawn のみ・宣言なしで警告なし、--from-b64、3 者 bond、markdown と stderr/stdout の分離）。ロードマップ §7 に v0.10（設計中）を追加、ヘッダの日付行も更新。
 - 2026-10-01: v0.10 完了 — §15 の設計を実装。`cmd_accept` に proposal パース＋既存署名の検証の後、自分の署名の前に `key_compromise_warnings` を companions（自分以外）全員に適用、非撤回宣言があれば stderr に WARN（§14 と同フォーマット）。思想は「警告のみ、exit コード不変」（記録はプロトコル、評価は検証者）。`accept --compromise-registry` フラグ追加（registry 切り替え、既存パターン準拠）。オフライン 7 ケース通過（`test_accept_warnings.py` 新規: 宣言ありで WARN＋bond 完成、withdrawn のみ・宣言なしで警告なし、`--from-b64`、3 者 bond で宣言あり 1 人のみ、markdown の stderr/stdout 分離、自分自身は警告対象外）＋ compromise 24 / integration 10 / governance 30 / revocation 8 回帰維持。v0.10 完了。
+- 2026-10-01: v0.11 設計 — `verify_binding` への侵害警告統合を仕様書 §16 に固定（設計のみ、実装は次ラン）。§15.4 の「`bind`（将来候補）」の検討結果: 統合点は `bind` ではなく `verify_binding`。`bind` は自分の鍵での自分の主張であり発行者自覚済み（`propose` 除外と同型）のため不要。`verify_binding` は検証者の信頼決定の瞬間であり、対象 npub への非撤回宣言は判断材料として価値がある。思想は §15.1 と同一「警告のみ、exit コード不変」。統合点: `cmd_verify_binding` で署名・platform・handle 検証の後、対象 npub に `key_compromise_warnings` を適用し非撤回宣言があれば stderr に WARN（検証結果 `ok` には影響しない）。`verify_binding --compromise-registry` フラグを追加予定。スコープ外: `bind`（自覚済み）、`unbind`/`verify_unbinding`、自動 fetch、自動ブロック。テスト計画 6 ケース（宣言あり/なし/withdrawn のみ、署名改ざんでも警告は出る、別鍵の宣言は対象外）。ロードマップ §7 に v0.11（設計）を追加、ヘッダの日付行も更新。
