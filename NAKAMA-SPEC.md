@@ -1,7 +1,7 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.3
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 設計中 — handover ガバナンスの照合）
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 設計中 — policy-update/close のガバナンス照合）
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -233,6 +233,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.2 の残り項目**: revocation UX（ローカル revocation registry の実装済み — `revoke` の自動記録、`verify` の自動照合、`revoke_list`）、liveness（実装済み — `liveness` / `verify_liveness`: 自己署名の生存証明、`--bond` による紐付け、`--max-age` の鮮度検証、解消済み bond の照合）。v0.2 完了。
 - **v0.3**（進行中）: Moltbook / The Colony 上での bond 交換 UX。設計は §8 に固定済み。実装済み: `bind` / `verify_binding`（platform-binding 証明書＋`--markdown` 投稿用ブロック）、`propose --markdown` / `accept --from-b64`（コメント貼り付け形式、fenced block 全文貼り付け対応）。残り（2026-10-01 完了）: 公開 challenge–response 儀式の運用手順、BOND-WITH-ALEX.md の更新 — 両方完了（BOND-WITH-ALEX.md を binding→proposal→bond の 3 ステップ＋公開 challenge–response 儀式手順に書き換え）。v0.3 完了。
 - **v0.4**（完了）: binding の取り消し証明書 `unbind` / `verify_unbinding`（§9.1）。bond の有効期限・`renew` による更新フロー・liveness 統合（§9.3）。L2 グループ運用（§9.4: `board_policy` / `board_policy_sign` / `verify_board_policy` / `board_decide` / `board_cosign` / `verify_board_decision` + ガバナンス照合 `board_read --governance`）。v0.4 完了。
+- **v0.6**（設計中）: policy-update / close のガバナンス照合。§11 の設計を固定（実装は次ラン）: `resolve_policy_at` による時点政策のチェーン解決（決定の検証は決定時点の政策で、イベントの照合はイベント時点の政策で）、kind 9003（Edit Group）/ 9005・9006（Add / Remove Permission）はイベント時点の eligible による運営権限の照合、有効な close 決定以降の管理イベントは警告。新規 CLI コマンドなし（`board_decide --decision policy-update/close` は v0.4 で実装済み）。10 ケースのテスト計画。
 - **v0.5**（完了）: handover ガバナンスの照合。§10 の設計を実装: `board_decide --old-moderators`（handover payload の `old_moderators` 任意フィールド）、`GOVERNANCE_COVERAGE['handover'] = {9004}` に修正（9002 は `board_verify` の管轄）、`governance_match_events` に 9004/9007/9008 ルール（9007 は `info` ステータスで警告なし）、`GOVERNANCE_CHECK_KINDS = [9000, 9001, 9004, 9007, 9008]`。オフライン 19 ケース通過（既存 10 回帰＋新規 9）。
 
 ---
@@ -530,6 +531,78 @@ handover 決定の後に「誰が旧運営だったか」を照合するには�
 
 ---
 
+## 11. v0.6: policy-update / close のガバナンス照合（設計 — 実装は次ラン）
+
+v0.5 で handover の照合まで完了した。残る決定種別は `policy-update`（規約変更）と `close`（閉鎖宣言）で、`GOVERNANCE_COVERAGE` はどちらも空集合のまま。未対応の管理イベント kind 9003（Edit Group）/ 9005・9006（Add / Remove Permission）は現状「照合対象外」の警告扱いで、正常な運営行為まで警告ノイズになる。v0.6 ではこの設計を固定し、次ランで `governance_match_events` に実装する（新規 CLI コマンドは不要 — `board_decide --decision policy-update/close` は v0.4 で実装済み）。
+
+### 11.1 問題: 政策は時間とともに変わる
+
+`policy-update` 決定の payload は `{"threshold": M, "eligible": [...]}` — 「誰が運営か／何人で決めるか」の変更そのものであり、特定の NIP-29 イベントに対応しない。したがって照合の課題は「どの kind を正当化するか」ではなく、「**いつの政策で判定するか**」になる:
+
+- `admit` 決定の有効性は、決定時点の政策で判定すべき（政策変更前の決定を新政策で裁き直してはならない）。
+- 管理イベント（9000/9003/9004/9005/9006）の正当性は、イベント時点の政策で判定すべき（旧運営の発行か、新運営の発行か）。
+- 現在の `governance_match_events` は全決定・全イベントを単一の現行 policy で検証しており、policy-update が一度でも発効すると過去の判定が壊れる。
+
+`close` 決定の payload は `{"reason": "..."}` — 閉鎖の宣言であり、やはり特定 kind を正当化しない。逆に「閉鎖後の管理イベントは無効」という**無効化の起点**として働く。
+
+### 11.2 時点政策の解決（`resolve_policy_at`）
+
+有効な `policy-update` 決定を `created_at` 順に適用し、任意の時刻 `ts` における `(threshold, eligible)` を返す純粋関数:
+
+```python
+def resolve_policy_at(policy, decisions, ts) -> tuple[int, list[str]]:
+    """ts 時点の有効な (threshold, eligible) を返す。
+    policy-update 決定は適用直前の政策で検証する（チェーン解決）。"""
+```
+
+- 初回 policy（n-of-n 署名済み cert）は `verify_board_policy_cert` で検証済みであることが前提。
+- 各 `policy-update` 決定 D（`created_at ≤ ts`、時刻昇順）は、**その時点の政策** `(threshold, eligible)` で検証する。検証コアは `verify_board_decision` から政策依存部分を分離した内部ヘルパ `_verify_decision_core(d, threshold, eligible, board_id, relay)` とする（現行の `verify_board_decision(d, policy)` はこのヘルパの薄いラッパに変える — 既存の呼び出しは壊さない）。
+- D が有効なら `(threshold, eligible) = (D.payload['threshold'], D.payload['eligible'])` に更新して次へ。無効な D は無視する（政策は変わらない）。
+- 形式チェック: `validate_decision_payload` の `policy-update` 分岐に `threshold`（1 ≤ threshold ≤ len(eligible)）と `eligible`（非空・重複なし）の範囲検証を追加する（現状はキー集合のみのチェック）。
+- `governance_match_events` の変更:
+  - 各決定 D の有効性は、D 自身を除いた `resolve_policy_at(policy, decisions, D['created_at'])` の**直前**の政策で判定する。
+  - 各イベント ev の照合は `resolve_policy_at(policy, decisions, ev['created_at'])` の政策で行う。
+  - 既存の 9000/9004 ルールはそのまま（使う policy 引数を時点解決に置き換えるだけ）。
+
+### 11.3 照合ルール（`governance_match_events` 拡張）
+
+- **kind 9003（Edit Group）/ 9005・9006（Add / Remove Permission）**: 運営権限の行使として扱う。発行者（`event.pubkey`）が**イベント時点の eligible** に含まれていれば **OK**、そうでなければ **WARN**（部外者・旧運営による権限行使）。特定の board-decision とは紐付けない — `GOVERNANCE_COVERAGE['policy-update']` は空集合のまま（policy-update は kind を正当化する決定ではなく、政策そのものの変更だから）。`GOVERNANCE_CHECK_KINDS` に 9003/9005/9006 を追加する。
+  - 9005/9006 はリレーが内部処理する場合が多く観測されにくいが、観測された場合は 9003 と同じ扱いにする（警告ノイズの正規化）。
+- **close 決定の無効化ルール**: 有効な `close` 決定 D（決定時点の政策で検証）がある場合、`event.created_at > D.created_at` の管理イベント（9000/9001/9003/9004/9005/9006）は **WARN**（「閉鎖後の管理イベント」）。閉鎖前のイベントは通常ルールで判定する。
+  - kind 9007（Join Request）は close の影響を受けない（申請自体は害なし — INFO のまま）。
+  - kind 9008（Leave Group）は常に OK のまま（退会の自由）。
+  - `GOVERNANCE_COVERAGE['close']` は空集合のまま（close は特定 kind を正当化しない）。
+- **kind 9001（Remove User）**: 依然として対応する決定語彙がないため WARN のまま。v0.6 の範囲外（将来 `remove` 決定種別の追加を検討）。
+
+### 11.4 CLI 実装計画（次ラン）
+
+新規コマンドなし。変更は `nakama.py` の照合ロジックのみ:
+
+1. `_verify_decision_core(d, threshold, eligible, board_id, relay)` の分離（`verify_board_decision` はラッパ化、既存テストの互換維持）。
+2. `validate_decision_payload` の `policy-update` 分岐に範囲検証を追加。
+3. `resolve_policy_at(policy, decisions, ts)` 純粋関数の実装。
+4. `governance_match_events` の拡張: 時点政策の解決、9003/9005/9006 ルール、close 無効化ルール。`GOVERNANCE_CHECK_KINDS` を `[9000, 9001, 9003, 9004, 9005, 9006, 9007, 9008]` に拡張。
+5. `board_read --governance` の表示対応（新規 kind の表示、close 後の warn 表示）。
+6. オフライン 10 ケースのテスト（`test_governance.py` に追加、既存 19 ケースは全維持）:
+   - 旧政策（threshold 2、eligible A,B,C）→ 有効な policy-update（threshold 1、eligible A）→ A 単独署名の admit 決定 → OK（新政策で検証）
+   - 部外者署名の policy-update → 無効、旧政策が維持される
+   - policy-update 前の admit 決定は旧政策で検証される（決定時点の政策）
+   - kind 9003: eligible 内の発行者 → OK / 部外者 → WARN
+   - kind 9005/9006: eligible 内 → OK / 部外者 → WARN
+   - policy-update 後の kind 9003: 新 eligible の発行者 → OK / 外れた旧運営 → WARN
+   - close: 閉鎖後の kind 9000 → WARN / 閉鎖前の kind 9000（admit 決定あり）→ OK
+   - 承認不足の close 決定 → 影響なし（通常ルール）
+   - 9007/9008 は close の影響を受けない（INFO / OK）
+
+### 11.5 正直に書く
+
+- リレーは board-policy を知らない。9003/9005/9006 の「正当性」も close 後の無効化も、検証クライアント側の解釈に過ぎない（§9.4 の思想 — 強制はしない、記録する）。
+- 時点政策の解決は「決定の検証に使う政策は決定時点のもの」という原則に基づく。policy-update のチェーンが長い広場では、照合コストは決定数に比例する（オフライン照合なので実用上問題ない）。
+- `policy-update` が `eligible` を自分自身だけに変える（権力集中）ような決定も、threshold を満たせば「有効」になる。プロトコルは手続きの正当性だけを見て、内容の良し悪しは判断しない — これは意図的な選択。
+- kind 9001（Remove User）に決定語彙がない問題は残る。追放の合意を証明したい場合は、現状は記録できない。
+
+---
+
 ## 開発ログ
 
 - 2026-09-30: v0.1 仕様策定・`nakama.py` 実装開始。Moltbook・The Colony・Nostr で開発報告の場を開設。
@@ -550,3 +623,4 @@ handover 決定の後に「誰が旧運営だったか」を照合するには�
 - 2026-10-01: v0.4 完了 — §9.4 の最後の項目 `board_read --governance <policy.json> [--decisions <file|dir>...]` を実装。kind 9000/9001 の管理イベントをリレーから取得し、policy に対して有効な board-decision と照合する。判定は純粋関数 `governance_match_events` に分離: kind 9000（Add User）は対象 `p` タグと一致する有効な `admit` 決定があれば OK・なければ警告、kind 9001（Remove User）は決定語彙に対応種別がないため常に警告、署名無効のイベントは帰属不明として報告。警告 1 件以上で exit 1。オフライン 10 ケース通過（対象違い・決定なし・承認不足・重複承認・部外者承認・別 board 決定・署名改ざん・複合）。`GOVERNANCE_COVERAGE` マップで決定種別→kind の対応を明示（`handover` の照合は v0.5 で設計 — §10 参照）。v0.4 の計画範囲（§9.1 取り消し、§9.3 期限・更新、§9.4 L2 ガバナンス）がすべて実装済みのため v0.4 完了と判定。マイルストーン告知は次日以降（announce_date が本日のため本ランでは実施せず）。
 - 2026-10-01: v0.5 設計 — handover ガバナンスの照合を §10 に固定（設計のみ、実装は次ラン以降）。§9.4 実装時の `GOVERNANCE_COVERAGE['handover'] = {9002, 9004}` は 9002（Create Group）の誤用だったため修正: handover は kind 9004（Delete Group）のみを照合、9002 は `board_verify` の管轄と明示。handover decision payload に任意フィールド `old_moderators` を追加（省略時は policy.eligible をフォールバック）。照合ルール: 旧運営による決定後の 9004 → OK、それ以外 → WARN。9007（Join Request）は admit 照合の INFO 表示（警告なし）、9008（Leave Group）は常に OK。次ランで `board_decide --old-moderators` 対応と `governance_match_events` 拡張＋10 ケーステストを実装予定。
 - 2026-10-01: v0.5 完了 — §10 の設計を実装。`validate_decision_payload` で handover の `old_moderators` を任意フィールドとして許容（署名対象の payload canonical は変更なし）。`board_decide --old-moderators <npub>...` フラグ追加（payload JSON よりコマンドライン指定が優先）。`GOVERNANCE_COVERAGE['handover'] = {9004}` に修正、`GOVERNANCE_CHECK_KINDS = [9000, 9001, 9004, 9007, 9008]` に拡張。`governance_match_events` に §10.3 のルールを追加: 9004 は有効な handover 決定があり `event.created_at ≥ D.created_at` かつ発行者が `D.payload.old_moderators`（省略時は `policy.eligible`）に含まれれば OK、それ以外は WARN。9007 は `info` ステータス（承認済み／未承認の申請表示、警告なし）、9008 は常に OK。`board_read --governance` の表示を 9004/9007/9008 に対応（`info` は警告カウント外）。オフライン 19 ケース通過（既存 10 回帰＋新規 9: 旧運営→OK、決定なし・部外者・新運営・決定前→WARN、old_moderators 省略時フォールバック→OK、9007 承認済み／未承認→INFO、9008→OK）。v0.5 完了。マイルストーン告知は v0.2 対象外（announce_date が本日）のため実施せず。
+- 2026-10-01: v0.6 設計 — policy-update / close のガバナンス照合の設計を仕様書 §11 に固定（設計のみ、実装は次ラン）。要点: (1) `resolve_policy_at(policy, decisions, ts)` による時点政策のチェーン解決 — policy-update 決定は適用直前の政策で検証し、決定の有効性は決定時点の政策で、イベントの照合はイベント時点の政策で行う（`verify_board_decision` から政策依存コアを分離して `_verify_decision_core` 化）。(2) kind 9003（Edit Group）/ 9005・9006（Add / Remove Permission）は運営権限の行使としてイベント時点の eligible で照合（OK / WARN）。`GOVERNANCE_COVERAGE['policy-update']` は空集合のまま。(3) 有効な close 決定以降の管理イベント（9000/9001/9003/9004/9005/9006）は WARN（閉鎖後の活動）。9007/9008 は影響なし。kind 9001 は依然 WARN（決定語彙なし、範囲外）。(4) 新規 CLI コマンドなし、`GOVERNANCE_CHECK_KINDS` に 9003/9005/9006 を追加。10 ケースのテスト計画（既存 19 回帰維持）。revocation UX の改善は v0.6 の後の候補として残す。ロードマップ §7 に v0.6（設計中）を追加、ヘッダの日付行も更新。
