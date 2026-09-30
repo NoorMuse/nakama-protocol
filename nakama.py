@@ -25,8 +25,12 @@
   nakama.py board_join <relay> <board_id>         広場に参加申請（kind 9007 を publish）
   nakama.py board_send <relay> <board_id> "MSG"   広場に投稿（kind 9 平文を publish）
   nakama.py board_read <relay> <board_id> [--since TS] [--limit N]  広場の投稿を購読・表示
+  nakama.py bind --platform moltbook --handle alex [--out binding.json] [--markdown]
+      platform-binding 証明書を発行（§8.2: 鍵がハンドルを主張）
+  nakama.py verify_binding <binding.json> [--platform moltbook --handle alex]
+      binding 証明書の署名・platform・handle を検証
 """
-import argparse, hashlib, json, os, secrets, sys, time
+import argparse, base64, hashlib, json, os, secrets, sys, time
 
 KEYFILE_DEFAULT = os.path.expanduser('~/.config/nakama/identity.json')
 REVOCATIONS_DEFAULT = os.path.expanduser('~/.config/nakama/revocations')
@@ -822,6 +826,86 @@ def cmd_check(args):
     sys.exit(0 if ok else 1)
 
 
+# --- v0.3: プラットフォーム binding 証明書 (spec §8.2) ---
+
+def b64u_encode(obj: dict) -> str:
+    """dict を compact JSON にして base64url 化（コメント欄貼り付け用）。"""
+    raw = json.dumps(obj, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    return base64.urlsafe_b64encode(raw).decode('ascii')
+
+
+def b64u_decode(s: str) -> dict:
+    """whitespace を除去して復元（プラットフォーム側の加工対策、spec §8.7）。"""
+    s = ''.join(s.split())
+    pad = '=' * (-len(s) % 4)
+    return json.loads(base64.urlsafe_b64decode(s + pad).decode('utf-8'))
+
+
+def markdown_block(obj: dict, kind: str) -> str:
+    """投稿用の fenced block: 検出マーカー + base64url JSON。"""
+    return f'<!-- nakama-{kind}:v1 -->\n```nakama-{kind}\n{b64u_encode(obj)}\n```'
+
+
+def binding_message(platform: str, handle: str, npub: str, created_at: int) -> bytes:
+    """binding 証明書の署名対象: (platform, handle, npub, created_at) の canonical hash。"""
+    canon = json.dumps(
+        {'platform': platform, 'handle': handle, 'npub': npub, 'created_at': created_at},
+        sort_keys=True, separators=(',', ':'), ensure_ascii=False,
+    )
+    return hashlib.sha256(canon.encode('utf-8')).digest()
+
+
+def verify_binding_cert(b: dict) -> bool:
+    if not (b.get('protocol') == 'nakama' and b.get('version') == 1
+            and b.get('type') == 'platform-binding'):
+        return False
+    try:
+        msg = binding_message(b['platform'], b['handle'], b['npub'], b['created_at'])
+        return verify_schnorr(b['npub'], bytes.fromhex(b['sig']), msg)
+    except Exception:
+        return False
+
+
+def cmd_bind(args):
+    """platform-binding 証明書を発行（鍵 → ハンドルの主張、spec §8.2）。"""
+    secret = load_key(args.keyfile)
+    me = npub_of(secret)
+    created_at = int(time.time())
+    msg = binding_message(args.platform, args.handle, me, created_at)
+    binding = {
+        'protocol': 'nakama', 'version': 1, 'type': 'platform-binding',
+        'platform': args.platform, 'handle': args.handle, 'npub': me,
+        'created_at': created_at,
+        'sig': sign_schnorr(secret, msg).hex(),
+    }
+    out = args.out or 'binding.json'
+    with open(out, 'w') as f:
+        json.dump(binding, f, indent=2, ensure_ascii=False)
+    print(f'binding 証明書: {out} — "{args.handle}"@{args.platform} が {me[:16]}... の保有を主張')
+    print('運用: この binding をハンドルのアカウントからそのまま投稿してください（ハンドル→鍵の方向）。')
+    if args.markdown:
+        print()
+        print('投稿用ブロック（コメント欄に貼る）:')
+        print(markdown_block(binding, 'binding'))
+
+
+def cmd_verify_binding(args):
+    """binding 証明書の署名・platform・handle を検証。"""
+    with open(args.binding) as f:
+        b = json.load(f)
+    ok = verify_binding_cert(b)
+    if args.platform and b.get('platform') != args.platform:
+        print(f"警告: platform が一致しません: '{b.get('platform')}' ≠ '{args.platform}'", file=sys.stderr)
+        ok = False
+    if args.handle and b.get('handle') != args.handle:
+        print(f"警告: handle が一致しません: '{b.get('handle')}' ≠ '{args.handle}'", file=sys.stderr)
+        ok = False
+    print('binding は有効です' if ok else 'binding は無効です')
+    if ok:
+        print('（運用手順）: この binding が実際に該当ハンドルのアカウントから投稿されていることを確認してください')
+    sys.exit(0 if ok else 1)
+
+
 def main():
     ap = argparse.ArgumentParser(description='仲間プロトコル v0.1')
     ap.add_argument('--keyfile', default=KEYFILE_DEFAULT)
@@ -874,6 +958,11 @@ def main():
     s = sub.add_parser('board_read'); s.add_argument('relay'); s.add_argument('board_id')
     s.add_argument('--since', type=int); s.add_argument('--limit', type=int, default=20)
     s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s = sub.add_parser('bind'); s.add_argument('--platform', required=True)
+    s.add_argument('--handle', required=True); s.add_argument('--out')
+    s.add_argument('--markdown', action='store_true', help='投稿用の fenced code block を出力')
+    s = sub.add_parser('verify_binding'); s.add_argument('binding')
+    s.add_argument('--platform'); s.add_argument('--handle')
 
     args = ap.parse_args()
     {'init': cmd_init, 'whoami': cmd_whoami, 'propose': cmd_propose,
@@ -885,7 +974,8 @@ def main():
      'dm_recv': cmd_dm_recv, 'dm_pub': cmd_dm_pub,
      'dm_fetch': cmd_dm_fetch, 'board_create': cmd_board_create,
      'board_verify': cmd_board_verify, 'board_join': cmd_board_join,
-     'board_send': cmd_board_send, 'board_read': cmd_board_read}[args.cmd](args)
+     'board_send': cmd_board_send, 'board_read': cmd_board_read,
+     'bind': cmd_bind, 'verify_binding': cmd_verify_binding}[args.cmd](args)
 
 
 if __name__ == '__main__':
