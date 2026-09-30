@@ -21,6 +21,14 @@
   nakama.py revoke_pub <relay> <revocation.json> [--auth]  revocation を Nostr に公開（kind 30100、d タグ = bond_hash）
   nakama.py revoke_fetch <relay> <bond_hash> [--limit N] [--auth]  公開された revocation を購読して registry に取り込む
   nakama.py revoke_list                            解消済み bond の一覧を表示（理由つき）
+  nakama.py compromise_declare --subject <npub> [--reason 理由] [--evidence 証拠] [--bond bond.json]
+      鍵スコープの侵害宣言を発行（§13: 「この npub はもう本人ではない」と仲間が宣言）
+  nakama.py compromise_import <declaration.json> [--subject <npub>]  受け取った侵害宣言を検証して registry に取り込む
+  nakama.py compromise_pub <relay> <declaration.json> [--auth]  侵害宣言を Nostr に公開（kind 30101、d タグ = subject_hex:declarant_hex）
+  nakama.py compromise_fetch <relay> <npub> [--limit N] [--auth]  公開された侵害宣言を購読して registry に取り込む
+  nakama.py compromise_withdraw --subject <npub>  自分の侵害宣言を withdrawn: true で再発行（撤回）
+  nakama.py key_status <npub> [--threshold N] [--bond bond.json ...] [--liveness proof.json] [--max-age 秒]
+      侵害宣言の状態を照会（bond graph で重みづけ、閾値到達で「疑わしい」）
   nakama.py dm_send <相手npub> <メッセージ> [--out FILE]  gift wrap (kind 1059) を構築
   nakama.py dm_recv <giftwrap.json>                    gift wrap を復号して rumor を表示
   nakama.py dm_pub <relay> [--in FILE|--to-npub NPUB --message MSG]  gift wrap をリレーに publish
@@ -543,6 +551,432 @@ def cmd_revoke_list(args):
     for h, revoker, date, reason in rows:
         suffix = f'  理由: {reason}' if reason else ''
         print(f'  {h}...  解消: {revoker}...  ({date}){suffix}')
+
+
+COMPROMISES_DEFAULT = os.path.expanduser('~/.config/nakama/compromises')
+COMPROMISE_NOSTR_KIND = 30101
+
+
+def compromise_message(subject_hex: str, declarant_hex: str, created_at: int, withdrawn: bool = False,
+                       bond_hash_hex: str = '', reason: str = '', evidence: str = '') -> bytes:
+    """key-compromise-declaration の署名対象メッセージ（canonical bytes）。
+
+    bond_hash / reason / evidence は空ならメッセージから除外する（v0.7 の reason 拡張と対称）。
+    withdrawn は常に含める（撤回の署名対象になるため）。
+    """
+    body = {'subject': subject_hex, 'declarant': declarant_hex,
+            'created_at': created_at, 'withdrawn': withdrawn,
+            'type': 'key-compromise-declaration'}
+    if bond_hash_hex:
+        body['bond_hash'] = bond_hash_hex
+    if reason:
+        body['reason'] = reason
+    if evidence:
+        body['evidence'] = evidence
+    canon = json.dumps(body, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canon.encode()).digest()
+
+
+def compromise_registry_path(registry: str, subject_hex: str) -> str:
+    return os.path.join(registry, subject_hex + '.json')
+
+
+def npub_to_hex(npub: str) -> str:
+    return NostrPublicKey.from_npub(npub).hex()
+
+
+def verify_compromise_event(decl: dict) -> bool:
+    """key-compromise-declaration イベントの構造・署名検証。"""
+    if decl.get('protocol') != 'nakama' or decl.get('version') != 1 or \
+            decl.get('type') != 'key-compromise-declaration':
+        return False
+    try:
+        subject_hex = npub_to_hex(decl['subject'])
+        declarant_hex = npub_to_hex(decl['declarant'])
+    except Exception:
+        return False
+    bh = decl.get('bond_hash', '')
+    if bh and not (isinstance(bh, str) and len(bh) == 64
+                   and all(c in '0123456789abcdef' for c in bh)):
+        return False
+    reason = decl.get('reason', '')
+    evidence = decl.get('evidence', '')
+    if not isinstance(reason, str) or not isinstance(evidence, str):
+        return False
+    if not isinstance(decl.get('created_at'), int) or not isinstance(decl.get('withdrawn'), bool):
+        return False
+    msg = compromise_message(subject_hex, declarant_hex, decl['created_at'],
+                             decl['withdrawn'], bh, reason, evidence)
+    try:
+        return verify_schnorr(decl['declarant'], bytes.fromhex(decl['sig']), msg)
+    except Exception:
+        return False
+
+
+def import_compromise_event(decl: dict, registry: str) -> str:
+    """受け取った侵害宣言を registry に取り込む。戻り値: 'stored' | 'duplicate' | 'updated' | 'invalid'。
+
+    無効な署名のイベントは registry に触れず 'invalid'。declarant + created_at の一致は
+    dedup（先勝ち）だが、withdrawn フラグだけが違う場合は撤回・復活の更新として上書きする。
+    """
+    if not verify_compromise_event(decl):
+        return 'invalid'
+    subject_hex = npub_to_hex(decl['subject'])
+    declarant_hex = npub_to_hex(decl['declarant'])
+    os.makedirs(registry, exist_ok=True)
+    rp = compromise_registry_path(registry, subject_hex)
+    decls = []
+    if os.path.exists(rp):
+        try:
+            with open(rp) as f:
+                decls = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            decls = []
+        if not isinstance(decls, list):
+            decls = []
+    for i, old in enumerate(decls):
+        try:
+            old_declarant_hex = npub_to_hex(old['declarant'])
+        except Exception:
+            continue
+        if old_declarant_hex == declarant_hex and old.get('created_at') == decl['created_at']:
+            if old.get('withdrawn') == decl.get('withdrawn'):
+                return 'duplicate'
+            decls[i] = decl
+            with open(rp, 'w') as f:
+                json.dump(decls, f, indent=2)
+            os.chmod(rp, 0o600)
+            return 'updated'
+    decls.append(decl)
+    with open(rp, 'w') as f:
+        json.dump(decls, f, indent=2)
+    os.chmod(rp, 0o600)
+    return 'stored'
+
+
+def compromise_nostr_event(decl: dict, secret: bytes) -> dict:
+    """侵害宣言を Nostr 公開用イベント (kind 30101) として構築・署名する。
+
+    kind 30101 は parameterized replaceable: d タグ = subject_hex:declarant_hex。
+    同一宣言者の再発行で上書き（withdrawn による撤回）ができる。
+    """
+    content = json.dumps(decl, sort_keys=True, separators=(',', ':'))
+    subject_hex = npub_to_hex(decl['subject'])
+    declarant_hex = npub_to_hex(decl['declarant'])
+    return sign_event(secret, int(time.time()), COMPROMISE_NOSTR_KIND,
+                      [['d', f'{subject_hex}:{declarant_hex}']], content)
+
+
+def build_compromise_declaration(secret: bytes, subject: str, created_at: int,
+                                 withdrawn: bool = False, bond_hash_hex: str = '',
+                                 reason: str = '', evidence: str = '') -> dict:
+    """宣言者の鍵で key-compromise-declaration を構築・署名する（純粋、I/O なし）。"""
+    me = npub_of(secret)
+    msg = compromise_message(npub_to_hex(subject), hexpub_of(secret), created_at,
+                             withdrawn, bond_hash_hex, reason, evidence)
+    decl = {
+        'protocol': 'nakama', 'version': 1, 'type': 'key-compromise-declaration',
+        'subject': subject, 'declarant': me,
+        'created_at': created_at, 'withdrawn': withdrawn,
+        'sig': sign_schnorr(secret, msg).hex(),
+    }
+    if bond_hash_hex:
+        decl['bond_hash'] = bond_hash_hex
+    if reason:
+        decl['reason'] = reason
+    if evidence:
+        decl['evidence'] = evidence
+    return decl
+
+
+def cmd_compromise_declare(args):
+    secret = load_key(args.keyfile)
+    me = npub_of(secret)
+    try:
+        subject_hex = npub_to_hex(args.subject)
+    except Exception:
+        print('subject は有効な npub ではありません', file=sys.stderr)
+        sys.exit(1)
+    bh = ''
+    if args.bond:
+        with open(args.bond) as f:
+            b = json.load(f)
+        assert b.get('protocol') == 'nakama' and b.get('version') == 1, 'nakama v1 の bond ではありません'
+        if me not in b.get('companions', []):
+            print('あなたはこの bond の当事者ではありません', file=sys.stderr)
+            sys.exit(1)
+        bh = bond_hash(b)
+    import time
+    decl = build_compromise_declaration(secret, args.subject, int(time.time()),
+                                        False, bh, args.reason or '', args.evidence or '')
+    out = args.out or 'compromise.json'
+    with open(out, 'w') as f:
+        json.dump(decl, f, indent=2)
+    print(f'侵害宣言: {out} — {me[:16]}... が {args.subject[:16]}... の鍵は危ないと宣言しました。')
+    if not args.no_registry:
+        registry = args.registry or COMPROMISES_DEFAULT
+        result = import_compromise_event(decl, registry)
+        if result == 'stored':
+            print(f'ローカル registry に記録しました: {compromise_registry_path(registry, subject_hex)}')
+    print('宣言は公開チャネルで共有してください（仲間の公開記録に残ります）。虚偽の宣言はあなたの署名付きで残ることを忘れずに。')
+
+
+def cmd_compromise_import(args):
+    with open(args.declaration) as f:
+        decl = json.load(f)
+    assert decl.get('protocol') == 'nakama' and decl.get('version') == 1 and \
+        decl.get('type') == 'key-compromise-declaration', \
+        'nakama v1 の key-compromise-declaration ではありません'
+    if not verify_compromise_event(decl):
+        print('侵害宣言は無効です（registry には記録しません）', file=sys.stderr)
+        sys.exit(1)
+    if args.subject:
+        try:
+            if npub_to_hex(args.subject) != npub_to_hex(decl['subject']):
+                print('侵害宣言の subject が指定と一致しません（registry には記録しません）', file=sys.stderr)
+                sys.exit(1)
+        except Exception:
+            print('subject は有効な npub ではありません', file=sys.stderr)
+            sys.exit(1)
+    registry = args.registry or COMPROMISES_DEFAULT
+    result = import_compromise_event(decl, registry)
+    rp = compromise_registry_path(registry, npub_to_hex(decl['subject']))
+    if result == 'duplicate':
+        print(f'既に registry に記録済みです: {rp}')
+    elif result == 'updated':
+        print(f'registry を更新しました（撤回・復活）: {rp}')
+    else:
+        print(f'侵害宣言を registry に記録しました: {rp}')
+
+
+def cmd_compromise_pub(args):
+    """侵害宣言を Nostr リレーに publish (kind 30101, d タグ = subject_hex:declarant_hex)。"""
+    secret = load_key(args.keyfile)
+    with open(args.declaration) as f:
+        decl = json.load(f)
+    assert decl.get('protocol') == 'nakama' and decl.get('version') == 1 and \
+        decl.get('type') == 'key-compromise-declaration', \
+        'nakama v1 の key-compromise-declaration ではありません'
+    if not verify_compromise_event(decl):
+        print('侵害宣言は無効です（publish しません）', file=sys.stderr)
+        sys.exit(1)
+    ev = compromise_nostr_event(decl, secret)
+    accepted, reason = nostr_publish(args.relay, ev, auth_secret=secret if args.auth else None)
+    print(f'publish: {"受理" if accepted else "拒否"} ({reason}) id={ev["id"]}')
+    sys.exit(0 if accepted else 1)
+
+
+def cmd_compromise_fetch(args):
+    """subject に対する侵害宣言の公開イベント (kind 30101) を購読し、有効なものを registry に取り込む。"""
+    secret = load_key(args.keyfile)
+    try:
+        subject_hex = npub_to_hex(args.npub)
+    except Exception:
+        print('npub は有効ではありません', file=sys.stderr)
+        sys.exit(1)
+    filt = {'kinds': [COMPROMISE_NOSTR_KIND], 'limit': args.limit}
+    sub_id = secrets.token_hex(8)
+    events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=secret if args.auth else None)
+    registry = args.registry or COMPROMISES_DEFAULT
+    stored = updated = skipped = 0
+    prefix = subject_hex + ':'
+    for ev in sorted(events, key=lambda e: e.get('created_at', 0)):
+        if not verify_event_sig(ev):
+            skipped += 1
+            continue  # Nostr 署名の無効なイベントは無視
+        dtags = [t[1] for t in ev.get('tags', []) if len(t) >= 2 and t[0] == 'd']
+        if not any(d.startswith(prefix) for d in dtags):
+            skipped += 1
+            continue  # subject と関係ない宣言は無視（クライアント側 prefix フィルタ、§13.5）
+        try:
+            decl = json.loads(ev['content'])
+        except (ValueError, TypeError):
+            skipped += 1
+            continue  # content が JSON でないイベントは無視
+        if not isinstance(decl, dict):
+            skipped += 1
+            continue
+        try:
+            if npub_to_hex(decl.get('subject', '')) != subject_hex:
+                skipped += 1
+                continue  # subject 不一致（二重チェック）
+        except Exception:
+            skipped += 1
+            continue
+        result = import_compromise_event(decl, registry)
+        if result == 'stored':
+            stored += 1
+            print(f'取り込み: 侵害宣言を registry に記録しました (subject {subject_hex[:16]}..., declarant {decl["declarant"][:16]}...)')
+        elif result == 'updated':
+            updated += 1
+            print(f'更新: 侵害宣言の撤回・復活を反映しました (declarant {decl["declarant"][:16]}...)')
+        else:
+            skipped += 1  # duplicate / invalid
+    print(f'{len(events)} 件のイベントを取得: {stored} 件を取り込み、{updated} 件を更新、{skipped} 件をスキップ')
+
+
+def cmd_compromise_withdraw(args):
+    """自分の侵害宣言を withdrawn: true で再発行する（公開済みなら compromise_pub で上書き）。"""
+    secret = load_key(args.keyfile)
+    me = npub_of(secret)
+    try:
+        subject_hex = npub_to_hex(args.subject)
+    except Exception:
+        print('subject は有効な npub ではありません', file=sys.stderr)
+        sys.exit(1)
+    registry = args.registry or COMPROMISES_DEFAULT
+    rp = compromise_registry_path(registry, subject_hex)
+    target = None
+    if os.path.exists(rp):
+        try:
+            with open(rp) as f:
+                decls = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            decls = []
+        mine = [d for d in decls if isinstance(d, dict) and not d.get('withdrawn')
+                and verify_compromise_event(d) and d.get('declarant') == me]
+        if mine:
+            target = max(mine, key=lambda d: d['created_at'])
+    if target is None:
+        print(f'あなた（{me[:16]}...）の有効な侵害宣言が registry にありません: {args.subject[:16]}...', file=sys.stderr)
+        sys.exit(1)
+    import time
+    decl = build_compromise_declaration(secret, target['subject'], target['created_at'],
+                                        True, target.get('bond_hash', ''),
+                                        target.get('reason', ''), target.get('evidence', ''))
+    result = import_compromise_event(decl, registry)
+    out = args.out or 'compromise_withdrawn.json'
+    with open(out, 'w') as f:
+        json.dump(decl, f, indent=2)
+    if result == 'updated':
+        print(f'侵害宣言を撤回しました: {out}（registry の記録を withdrawn: true に更新）')
+        print('公開済みの宣言は compromise_pub で上書きしてください（kind 30101 の replaceable で撤回が効きます）。')
+    else:
+        print(f'撤回を記録しました: {result}', file=sys.stderr)
+
+
+def key_status(subject_npub: str, registry: str, me_npub: str | None,
+               bonds: list, threshold: int = 2) -> dict:
+    """subject の侵害宣言状態を評価する（純粋に近い: registry 読み＋判定）。
+
+    戻り値: {'declarations': [...], 'suspected_count': int, 'suspected': bool,
+             'withdrawn_count': int, 'invalid_count': int}
+    宣言は自分の bond graph（me の当事者である bond ファイル）で重みづける（§13.3）。
+    """
+    try:
+        subject_hex = npub_to_hex(subject_npub)
+    except Exception:
+        return {'declarations': [], 'suspected_count': 0, 'suspected': False,
+                'withdrawn_count': 0, 'invalid_count': 0, 'error': 'npub が無効です'}
+    rp = compromise_registry_path(registry, subject_hex)
+    decls = []
+    if os.path.exists(rp):
+        try:
+            with open(rp) as f:
+                decls = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            decls = []
+        if not isinstance(decls, list):
+            decls = []
+    # 自分の bond graph: me が当事者の bond の相手たち
+    companions = set()
+    bond_by_hash = {}
+    for b in bonds:
+        if not isinstance(b, dict) or b.get('protocol') != 'nakama' or b.get('version') != 1:
+            continue
+        comps = b.get('companions', [])
+        if me_npub is not None and me_npub in comps:
+            companions.update(c for c in comps if c != me_npub)
+        bond_by_hash[bond_hash(b)] = comps
+    rows = []
+    counted = set()
+    withdrawn_count = invalid_count = 0
+    for d in decls:
+        if not isinstance(d, dict) or not verify_compromise_event(d):
+            invalid_count += 1
+            continue
+        declarant = d['declarant']
+        withdrawn = d.get('withdrawn', False)
+        if withdrawn:
+            withdrawn_count += 1
+            rows.append({'declarant': declarant, 'created_at': d['created_at'],
+                         'reason': d.get('reason', ''), 'withdrawn': True,
+                         'category': '撤回済み'})
+            continue
+        # 重みづけカテゴリ（§13.3）
+        if me_npub is not None and declarant == me_npub:
+            cat = '自分自身'
+        elif declarant in companions:
+            cat = '直接の仲間'
+        elif d.get('bond_hash') and d['bond_hash'] in bond_by_hash \
+                and declarant in bond_by_hash[d['bond_hash']] \
+                and subject_npub in bond_by_hash[d['bond_hash']]:
+            cat = 'subject を知る仲間'
+        else:
+            cat = '参考情報'
+        rows.append({'declarant': declarant, 'created_at': d['created_at'],
+                     'reason': d.get('reason', ''), 'withdrawn': False,
+                     'category': cat})
+        if cat != '参考情報':
+            counted.add(declarant)
+    suspected_count = len(counted)
+    return {'declarations': sorted(rows, key=lambda r: r['created_at']),
+            'suspected_count': suspected_count,
+            'suspected': suspected_count >= threshold,
+            'withdrawn_count': withdrawn_count, 'invalid_count': invalid_count}
+
+
+def cmd_key_status(args):
+    me = None
+    if os.path.exists(args.keyfile):
+        try:
+            me = npub_of(load_key(args.keyfile))
+        except Exception:
+            me = None
+    bonds = []
+    for bp in args.bond or []:
+        try:
+            with open(bp) as f:
+                bonds.append(json.load(f))
+        except (OSError, json.JSONDecodeError):
+            print(f'bond ファイルを読めません: {bp}', file=sys.stderr)
+    registry = args.registry or COMPROMISES_DEFAULT
+    st = key_status(args.npub, registry, me, bonds, args.threshold)
+    if 'error' in st:
+        print(st['error'], file=sys.stderr)
+        sys.exit(1)
+    print(f'subject: {args.npub[:16]}... の侵害宣言: {len(st["declarations"])} 件（有効な宣言、撤回済み {st["withdrawn_count"]} 件を除く）')
+    for r in st['declarations']:
+        date = time.strftime('%Y-%m-%d', time.localtime(r['created_at']))
+        suffix = f'  理由: {r["reason"]}' if r['reason'] else ''
+        w = '（撤回済み）' if r['withdrawn'] else ''
+        print(f'  {r["declarant"][:16]}...  [{r["category"]}] ({date}){w}{suffix}')
+    if st['invalid_count']:
+        print(f'  ※ 署名無効な宣言 {st["invalid_count"]} 件は無視しました')
+    # 反証: subject の liveness が宣言より新しいか
+    if args.liveness:
+        try:
+            with open(args.liveness) as f:
+                p = json.load(f)
+            now = int(time.time())
+            if verify_liveness_event(p) and p.get('npub') == args.npub \
+                    and p['created_at'] <= now + 300 and now - p['created_at'] <= args.max_age:
+                newest = max((r['created_at'] for r in st['declarations'] if not r['withdrawn']), default=0)
+                if p['created_at'] > newest:
+                    print(f'反証あり: subject の新しい生存証明（{now - p["created_at"]} 秒前）が宣言より新しい — 判断はあなたに委ねます。')
+                else:
+                    print('生存証明は宣言より古いため反証になりません。')
+            else:
+                print('生存証明は無効または期限切れです（反証として使えません）。')
+        except (OSError, json.JSONDecodeError):
+            print('生存証明ファイルを読めません', file=sys.stderr)
+    if st['suspected']:
+        print(f'判定: 疑わしい（compromised suspected）— bond graph 内の宣言者 {st["suspected_count"]} 人 ≥ 閾値 {args.threshold}')
+        sys.exit(1)
+    if any(not r['withdrawn'] for r in st['declarations']):
+        print(f'判定: 宣言はあるが閾値未満（{st["suspected_count"]} / {args.threshold}）— 警告として扱ってください。')
+    else:
+        print('判定: 侵害宣言はありません。')
 
 
 def liveness_message(npub: str, created_at: int, nonce_hex: str, bond_hash_hex: str | None = None) -> bytes:
@@ -1790,6 +2224,30 @@ def main():
     s.add_argument('--limit', type=int, default=20)
     s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
     s.add_argument('--registry', default=None, help='revocation registry ディレクトリ (既定: ~/.config/nakama/revocations)')
+    s = sub.add_parser('compromise_declare'); s.add_argument('--subject', required=True, help='疑わしい鍵の npub')
+    s.add_argument('--reason', default='', help='宣言理由（署名付きで記録、任意）')
+    s.add_argument('--evidence', default='', help='証拠の参照: nostr event id / URL / メモ（任意）')
+    s.add_argument('--bond', default=None, help='宣言者と subject の bond ファイル（当事者確認＋bond_hash 埋め込み）')
+    s.add_argument('--out')
+    s.add_argument('--registry', default=None, help='compromise registry ディレクトリ (既定: ~/.config/nakama/compromises)')
+    s.add_argument('--no-registry', action='store_true', help='registry への記録を省略')
+    s = sub.add_parser('compromise_import'); s.add_argument('declaration'); s.add_argument('--subject', default=None)
+    s.add_argument('--registry', default=None, help='compromise registry ディレクトリ (既定: ~/.config/nakama/compromises)')
+    s = sub.add_parser('compromise_pub'); s.add_argument('relay'); s.add_argument('declaration')
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s = sub.add_parser('compromise_fetch'); s.add_argument('relay'); s.add_argument('npub')
+    s.add_argument('--limit', type=int, default=20)
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s.add_argument('--registry', default=None, help='compromise registry ディレクトリ (既定: ~/.config/nakama/compromises)')
+    s = sub.add_parser('compromise_withdraw'); s.add_argument('--subject', required=True, help='撤回対象の鍵の npub')
+    s.add_argument('--out')
+    s.add_argument('--registry', default=None, help='compromise registry ディレクトリ (既定: ~/.config/nakama/compromises)')
+    s = sub.add_parser('key_status'); s.add_argument('npub')
+    s.add_argument('--threshold', type=int, default=2, help='「疑わしい」扱いの宣言者数（既定 2）')
+    s.add_argument('--bond', action='append', default=[], help='自分の bond ファイル（bond graph 構築用、複数指定可）')
+    s.add_argument('--liveness', default=None, help='subject の生存証明ファイル（反証として評価）')
+    s.add_argument('--max-age', type=int, default=7 * 86400, help='反証に使う生存証明の許容する古さ（秒、既定7日）')
+    s.add_argument('--registry', default=None, help='compromise registry ディレクトリ (既定: ~/.config/nakama/compromises)')
     s = sub.add_parser('liveness'); s.add_argument('--bond', default=None, help='紐付ける bond ファイル')
     s.add_argument('--out')
     s = sub.add_parser('verify_liveness'); s.add_argument('proof'); s.add_argument('--bond', default=None)
@@ -1857,6 +2315,9 @@ def main():
      'verify_revocation': cmd_verify_revocation, 'revoke_list': cmd_revoke_list,
      'revoke_import': cmd_revoke_import, 'revoke_pub': cmd_revoke_pub,
      'revoke_fetch': cmd_revoke_fetch,
+     'compromise_declare': cmd_compromise_declare, 'compromise_import': cmd_compromise_import,
+     'compromise_pub': cmd_compromise_pub, 'compromise_fetch': cmd_compromise_fetch,
+     'compromise_withdraw': cmd_compromise_withdraw, 'key_status': cmd_key_status,
      'liveness': cmd_liveness, 'verify_liveness': cmd_verify_liveness, 'dm_send': cmd_dm_send,
      'dm_recv': cmd_dm_recv, 'dm_pub': cmd_dm_pub,
      'dm_fetch': cmd_dm_fetch, 'board_create': cmd_board_create,
