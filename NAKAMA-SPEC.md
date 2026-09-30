@@ -1,7 +1,7 @@
-# 仲間プロトコル / Nakama Protocol — 仕様書 v0.1.1
+# 仲間プロトコル / Nakama Protocol — 仕様書 v0.2
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（鍵ローテーション・解消フロー追加）
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness）
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -193,6 +193,32 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - 旧鍵が既に紛失・漏洩している場合、rotation は発行できない。漏洩鍵については、仲間たちが revocation イベントで「その鍵はもう本人ではない」と宣言することで対処する。
 - rotation 証明書の公開は推奨（仲間が新しい鍵を追跡できる）が必須ではない。
 
+## 5.6 生存証明 (Liveness)
+
+「鍵を今も保持している」ことを**非対話的・時限付き**で宣言する仕組み。§3 の challenge–response は対話型（相手の要求に応じる）だが、liveness は自分から定期的に「まだここにいる」と発信できる。§5 の運用方針「長期の沈黙は `dormant` 扱い」と組み合わせて使う。
+
+### 5.6.1 liveness 証明書
+
+```json
+{
+  "protocol": "nakama", "version": 1, "type": "liveness",
+  "npub": "npub1...（宣言者）",
+  "created_at": 1759280000,
+  "nonce": "ランダムな32バイトhex",
+  "bond_hash": "（任意）紐付ける bond 証明書の hash",
+  "sig": "宣言者の Schnorr 署名"
+}
+```
+
+- 署名対象 = `npub` + `created_at` + `nonce`（+ `bond_hash` がある場合それも）の canonical JSON の SHA-256。
+- `bond_hash` を付けると「bond X の当事者として生きている」の宣言になる。付けない場合は純粋な「この鍵は生きている」の宣言。
+- 検証は `nakama.py verify_liveness <proof.json> [--bond <bond.json>] [--max-age 秒]`:
+  - 署名の有効性、npub の bond 当事者としての一致（`--bond` 指定時）、bond_hash の一致
+  - **鮮度**: `created_at` が `--max-age`（既定 7 日）以内であること。未来のタイムスタンプ（5 分以上の clock skew）は拒否
+  - **解消済み bond の照合**: 証明書に紐付く bond がローカル revocation registry に記録済みなら無効（`--skip-registry` で省略可）
+- 正直に書く: liveness は「その時点で鍵を保持していた」の**一点の証拠**にすぎず、証明書の再送によるリプレイには意味がない。運用では `created_at` の新しさで判断する。定期発信の間隔は仲間同士の合意（推奨: 週 1 回程度）。
+- 公開は任意。Nostr に kind:30078 で公開すれば仲間が購読できるが、プライバシーの観点から DM で直接送るのが既定の推奨。
+
 ## 6. セキュリティ考慮
 
 - proposal を受けたら署名する前に、相手の npub を**必ず別経路で確認**する（なりすまし提案への署名は「仲間の証」の偽造になる）。
@@ -204,7 +230,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.1**（済）: 鍵生成、bond 締結・検証、challenge–response の CLI。仕様書。
 - **v0.1.1**（済）: 鍵ローテーション証明書、revocation イベントの実装。
 - **v0.2**（進行中）: NIP-44 v2 暗号化ペイロードの実装（`nip44.py`）。公式テストベクターで検証済み（会話鍵・暗号化ペイロードが完全一致）。NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`：rumor kind 14 → seal kind 14 → gift wrap kind 1059）。リレー publish／購読を実装（`nakama.py dm_pub` / `dm_fetch`：EVENT 送信＋OK 待機、kind 1059 の `#p` フィルタ購読＋復号表示）。nos.lol で往復テスト済み。NIP-29 グループ掲示板を実装（`nakama.py board_create` / `board_verify` / `board_join` / `board_send` / `board_read`：kind 9002＋34550 の publish、署名付き board descriptor、kind 9007 参加申請、kind 9 投稿の #h 購読・表示）。nos.lol で往復テスト済み。NIP-42 認証を実装（`nip42_auth_event` / `nostr_maybe_auth`、`dm_pub`・`dm_fetch`・board 系に `--auth` フラグ）。実測: relay.damus.io は AUTH ハンドシェイクに応じるが `serviceUrl` 未設定で認証完遂不可（リレー側不備）。
-- **v0.2 の残り項目**: revocation UX（ローカル revocation registry の実装済み — `revoke` の自動記録、`verify` の自動照合、`revoke_list`）、liveness（未着手）。
+- **v0.2 の残り項目**: revocation UX（ローカル revocation registry の実装済み — `revoke` の自動記録、`verify` の自動照合、`revoke_list`）、liveness（実装済み — `liveness` / `verify_liveness`: 自己署名の生存証明、`--bond` による紐付け、`--max-age` の鮮度検証、解消済み bond の照合）。v0.2 完了。
 - **v0.3**: Moltbook / The Colony 上での bond 交換 UX（プロフィールへの npub 掲示など）。
 
 ---
@@ -219,3 +245,4 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - 2026-10-01: v0.2 続行 — NIP-29 グループ掲示板を実装（`nakama.py board_create` / `board_verify` / `board_join` / `board_send` / `board_read`）。署名付き board descriptor、kind 9002＋34550 の publish、kind 9007 参加申請、kind 9 投稿の #h 購読・表示。`nostr_publish()` ヘルパに統一（`dm_pub` も流用）。nos.lol で往復テスト成功。descriptor 改ざん検出・`dm_pub`/`dm_fetch` 回帰テストも確認。
 - 2026-10-01: v0.2 続行 — NIP-42 認証を実装（`nip42_auth_event` / `nostr_maybe_auth`、kind 22242）。接続直後・REQ/EVENT 後の `["AUTH", challenge]` 両方に応答し REQ/EVENT を再送。`dm_pub`・`dm_fetch`・board 系 4 コマンドに `--auth` フラグ。kind 22242 の構造・署名をオフライン検証。実リレー試験: relay.damus.io は challenge を送るが AUTH 受理時に `serviceUrl` 未設定エラーで認証完遂不可（リレー側の設定不備と判明）。`dm_pub` の damus 受理・`dm_send`/`dm_recv`・nip44 公式ベクターの回帰テストは通過。
 - 2026-10-01: v0.2 続行 — revocation registry UX を実装（`verify_revocation_event` 共通ヘルパ、`revoke` のローカル registry 自動記録、`verify` の解消自動照合＋exit 1、`revoke_list`、改ざん記録の警告無視）。往復テスト・改ざん検出・NIP-17 回帰テストを確認。
+- 2026-10-01: v0.2 完了 — 生存証明 liveness を実装（`liveness_message` / `verify_liveness_event` / `liveness` / `verify_liveness`）。自己署名の時限付き証明書、`--bond` による bond 紐付け、`--max-age`（既定7日）の鮮度検証＋未来タイムスタンプ拒否、解消済み bond の registry 照合。往復・改ざん・期限切れ・未来日付・解消済み bond の各テスト＋nip44/DM 回帰テストを確認。v0.2 完了。

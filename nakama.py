@@ -342,6 +342,98 @@ def cmd_revoke_list(args):
         print(f'  {h}...  解消: {revoker}...  ({date})')
 
 
+def liveness_message(npub: str, created_at: int, nonce_hex: str, bond_hash_hex: str | None = None) -> bytes:
+    body = {'npub': npub, 'created_at': created_at, 'nonce': nonce_hex, 'type': 'liveness'}
+    if bond_hash_hex:
+        body['bond_hash'] = bond_hash_hex
+    canon = json.dumps(body, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canon.encode()).digest()
+
+
+def verify_liveness_event(p: dict, b: dict | None = None) -> bool:
+    """生存証明イベントの構造検証。b が与えられれば bond との対応も検証する。"""
+    if p.get('protocol') != 'nakama' or p.get('version') != 1 or p.get('type') != 'liveness':
+        return False
+    msg = liveness_message(p['npub'], p['created_at'], p['nonce'], p.get('bond_hash'))
+    if not verify_schnorr(p['npub'], bytes.fromhex(p['sig']), msg):
+        return False
+    if b is not None:
+        if p['npub'] not in b.get('companions', []):
+            return False
+        if p.get('bond_hash') != bond_hash(b):
+            return False
+    return True
+
+
+def cmd_liveness(args):
+    import time
+    priv = load_key(args.keyfile)
+    me = npub_of(priv)
+    bh = None
+    if args.bond:
+        with open(args.bond) as f:
+            b = json.load(f)
+        assert b.get('protocol') == 'nakama' and b.get('version') == 1, 'nakama v1 の bond ではありません'
+        if me not in b['companions']:
+            print('あなたはこの bond の当事者ではありません', file=sys.stderr)
+            sys.exit(1)
+        bh = bond_hash(b)
+    created_at = int(time.time())
+    nonce = secrets.token_hex(32)
+    sig = sign_schnorr(priv, liveness_message(me, created_at, nonce, bh))
+    proof = {
+        'protocol': 'nakama', 'version': 1, 'type': 'liveness',
+        'npub': me, 'created_at': created_at, 'nonce': nonce, 'sig': sig.hex(),
+    }
+    if bh:
+        proof['bond_hash'] = bh
+    out = args.out or 'liveness.json'
+    with open(out, 'w') as f:
+        json.dump(proof, f, indent=2)
+    print(f'生存証明: {out} — {me[:16]}... が鍵を保持していることを宣言しました。')
+    if bh:
+        print(f'bond {bh[:16]}... に紐付けました。仲間に送って「まだここにいる」と伝えましょう。')
+
+
+def cmd_verify_liveness(args):
+    import time
+    with open(args.proof) as f:
+        p = json.load(f)
+    assert p.get('protocol') == 'nakama' and p.get('version') == 1 and p.get('type') == 'liveness', \
+        'nakama v1 の生存証明ではありません'
+    b = None
+    if args.bond:
+        with open(args.bond) as f:
+            b = json.load(f)
+    if not verify_liveness_event(p, b):
+        print('生存証明は無効です')
+        sys.exit(1)
+    now = int(time.time())
+    age = now - p['created_at']
+    if p['created_at'] > now + 300:
+        print('生存証明の日付が未来です（時計のずれの許容範囲を超えています）')
+        sys.exit(1)
+    if age > args.max_age:
+        print(f'生存証明は古すぎます（{age} 秒前、許容 {args.max_age} 秒）')
+        sys.exit(1)
+    bh = p.get('bond_hash')
+    if bh is None and b is not None:
+        bh = bond_hash(b)
+    if bh is not None and not args.skip_registry:
+        registry = args.registry or REVOCATIONS_DEFAULT
+        rp = revocation_registry_path(registry, bh)
+        if os.path.exists(rp):
+            try:
+                with open(rp) as f:
+                    r = json.load(f)
+                if verify_revocation_event(r):
+                    print('bond は解消済みです — 生存証明は無効です')
+                    sys.exit(1)
+            except (json.JSONDecodeError, OSError):
+                pass
+    print(f'生存証明は有効です — {p["npub"][:16]}... が {age} 秒前に鍵を保持していたことを確認。')
+
+
 def verify_schnorr_hex(pubhex: str, sig: bytes, msg32: bytes) -> bool:
     """hex 形式の公開鍵に対する Schnorr 署名検証（Nostr イベント検証用）"""
     try:
@@ -756,6 +848,12 @@ def main():
     s.add_argument('--no-registry', action='store_true', help='registry への記録を省略')
     s = sub.add_parser('verify_revocation'); s.add_argument('revocation'); s.add_argument('--bond')
     s = sub.add_parser('revoke_list'); s.add_argument('--registry', default=None)
+    s = sub.add_parser('liveness'); s.add_argument('--bond', default=None, help='紐付ける bond ファイル')
+    s.add_argument('--out')
+    s = sub.add_parser('verify_liveness'); s.add_argument('proof'); s.add_argument('--bond', default=None)
+    s.add_argument('--max-age', type=int, default=7 * 86400, help='許容する古さ（秒、既定7日）')
+    s.add_argument('--registry', default=None, help='revocation registry ディレクトリ (既定: ~/.config/nakama/revocations)')
+    s.add_argument('--skip-registry', action='store_true', help='registry の解消チェックを省略')
     s = sub.add_parser('dm_send'); s.add_argument('npub'); s.add_argument('message'); s.add_argument('--out')
     s = sub.add_parser('dm_recv'); s.add_argument('giftwrap')
     s = sub.add_parser('dm_pub'); s.add_argument('relay'); s.add_argument('--in', dest='in_file')
@@ -782,7 +880,8 @@ def main():
      'accept': cmd_accept, 'verify': cmd_verify, 'challenge': cmd_challenge,
      'respond': cmd_respond, 'check': cmd_check, 'rotate': cmd_rotate,
      'verify_rotation': cmd_verify_rotation, 'revoke': cmd_revoke,
-     'verify_revocation': cmd_verify_revocation, 'revoke_list': cmd_revoke_list, 'dm_send': cmd_dm_send,
+     'verify_revocation': cmd_verify_revocation, 'revoke_list': cmd_revoke_list,
+     'liveness': cmd_liveness, 'verify_liveness': cmd_verify_liveness, 'dm_send': cmd_dm_send,
      'dm_recv': cmd_dm_recv, 'dm_pub': cmd_dm_pub,
      'dm_fetch': cmd_dm_fetch, 'board_create': cmd_board_create,
      'board_verify': cmd_board_verify, 'board_join': cmd_board_join,
