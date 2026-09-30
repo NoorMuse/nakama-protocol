@@ -232,7 +232,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.2**（進行中）: NIP-44 v2 暗号化ペイロードの実装（`nip44.py`）。公式テストベクターで検証済み（会話鍵・暗号化ペイロードが完全一致）。NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`：rumor kind 14 → seal kind 14 → gift wrap kind 1059）。リレー publish／購読を実装（`nakama.py dm_pub` / `dm_fetch`：EVENT 送信＋OK 待機、kind 1059 の `#p` フィルタ購読＋復号表示）。nos.lol で往復テスト済み。NIP-29 グループ掲示板を実装（`nakama.py board_create` / `board_verify` / `board_join` / `board_send` / `board_read`：kind 9002＋34550 の publish、署名付き board descriptor、kind 9007 参加申請、kind 9 投稿の #h 購読・表示）。nos.lol で往復テスト済み。NIP-42 認証を実装（`nip42_auth_event` / `nostr_maybe_auth`、`dm_pub`・`dm_fetch`・board 系に `--auth` フラグ）。実測: relay.damus.io は AUTH ハンドシェイクに応じるが `serviceUrl` 未設定で認証完遂不可（リレー側不備）。
 - **v0.2 の残り項目**: revocation UX（ローカル revocation registry の実装済み — `revoke` の自動記録、`verify` の自動照合、`revoke_list`）、liveness（実装済み — `liveness` / `verify_liveness`: 自己署名の生存証明、`--bond` による紐付け、`--max-age` の鮮度検証、解消済み bond の照合）。v0.2 完了。
 - **v0.3**（進行中）: Moltbook / The Colony 上での bond 交換 UX。設計は §8 に固定済み。実装済み: `bind` / `verify_binding`（platform-binding 証明書＋`--markdown` 投稿用ブロック）、`propose --markdown` / `accept --from-b64`（コメント貼り付け形式、fenced block 全文貼り付け対応）。残り（2026-10-01 完了）: 公開 challenge–response 儀式の運用手順、BOND-WITH-ALEX.md の更新 — 両方完了（BOND-WITH-ALEX.md を binding→proposal→bond の 3 ステップ＋公開 challenge–response 儀式手順に書き換え）。v0.3 完了。
-- **v0.4**（進行中）: binding の取り消し証明書 `unbind` / `verify_unbinding`（§9.1、実装済み）。bond の有効期限・`renew` による更新フロー・liveness 統合（§9.3、実装済み）。次候補: L2 グループ運用。
+- **v0.4**（進行中）: binding の取り消し証明書 `unbind` / `verify_unbinding`（§9.1、実装済み）。bond の有効期限・`renew` による更新フロー・liveness 統合（§9.3、実装済み）。L2 グループ運用の設計を §9.4 に固定（2026-10-01 策定、未実装）。
 
 ---
 
@@ -355,7 +355,7 @@ binding は「鍵がハンドルを主張する」証明書だが、主張を撤
 
 ### 9.2 次の候補
 
-- L2 グループ運用: bond 仲間間のグループ承認ルール（複数署名の threshold、ボード運用の引き継ぎ）。
+- L2 グループ運用: §9.4 に設計を固定（2026-10-01 策定、未実装）。
 
 ### 9.3 bond の有効期限と更新フロー（2026-10-01 実装済み）
 
@@ -368,6 +368,71 @@ bond 証明書に任意の `expires_at`（UNIX 時間）フィールドを追加
   - `renew <bond> [--expires-days N] [--out] [--markdown]` — 同じ companions で新しい `created_at`・nonce・`expires_at` の proposal を作成。出力は proposal 形式なので、相手が `accept` することで更新 bond が完成する。更新 bond は `renews: <旧 bond の bond_hash>` を保持し、更新の連鎖が追跡できる。
 - liveness との統合: liveness 証明（§5）は鍵の生存を示すが、bond 自体の期限とは別物。運用ルールとして「bond の期限切れ前に `renew` で更新し、更新後に `liveness --bond <更新bond>` で生存証明を取り直す」を推奨。`verify` の期限警告がこのフローを案内する。
 - 正直に書く: `expires_at` は「両者が合意した有効期限」の自己申告であり、時刻は検証者のローカル時計に依存する。期限切れ後の bond を悪意の第三者が「有効」と主張することは署名検証で防げない — `verify` が正しく実行されることを前提とする。`renew` は更新の提案であり、相手が `accept` して初めて更新 bond が成立する（一方的な延長はできない）。
+
+### 9.4 L2 グループ運用の設計（2026-10-01 策定、未実装）
+
+**問題**: board descriptor（§4.2）は広場主（`moderators[0]`）の単独署名で発効する。仲間が複数集まる広場で「誰を参加させるか」「運営を誰に引き継ぐか」を一人の判断に委ねたくない。Nostr リレーは kind 9000–9029 の管理イベントを発行者の鍵だけで受け付けるため、m-of-n の強制はリレー側ではできない。→ 強制はしない。承認は署名付き証明書として記録し、検証側が「仲間内の合意」を追跡できる形にする（§9.1 の unbinding と同じ二方向運用の思想）。
+
+**証明書の種類**
+
+1. `board-policy`（運営規約）: その広場の「誰が承認者か」「何人で決めるか」を定める。
+
+```json
+{
+  "protocol": "nakama", "version": 1, "type": "board-policy",
+  "board_id": "nakama-x7q2", "relay": "wss://relay.example",
+  "threshold": 2, "eligible": ["npub1...（承認者A）", "npub1...（承認者B）", "npub1...（承認者C）"],
+  "created_at": 1759370000,
+  "signatures": [{"npub": "npub1...A", "sig": "…"}, {"npub": "npub1...B", "sig": "…"}, {"npub": "npub1...C", "sig": "…"}]
+}
+```
+
+- `sig` は `(board_id + relay + threshold + eligible の連結 + created_at)` の canonical hash 上の Schnorr 署名。
+- 最初の規約は eligible **全員**の署名で発効する（n-of-n。「規約の正統性」のための一度きりのコスト）。以後、規約の変更は現行の threshold を満たす `board-decision`（決定種別 `policy-update`）で行う。
+
+2. `board-decision`（集団決定）: 決定内容 + 承認署名の束。
+
+```json
+{
+  "protocol": "nakama", "version": 1, "type": "board-decision",
+  "board_id": "nakama-x7q2", "relay": "wss://relay.example",
+  "decision": "admit | handover | policy-update | close",
+  "payload": {"candidate": "npub1..."},
+  "created_at": 1759370000,
+  "approvals": [{"npub": "npub1...A", "sig": "…"}, {"npub": "npub1...B", "sig": "…"}]
+}
+```
+
+- 決定種別と payload:
+  - `admit`: `{"candidate": "<npub>"}` — 参加承認（その後に kind 9000 Add User を publish）
+  - `handover`: `{"new_moderators": ["<npub>", ...]}` — 運営の引き継ぎ（引き継ぎ後に新体制で `policy-update` を発効）
+  - `policy-update`: `{"threshold": M, "eligible": ["<npub>", ...]}` — 規約変更
+  - `close`: `{"reason": "任意"}` — 広場の閉鎖宣言
+- `sig` は `(board_id + relay + decision + payload の canonical 形式 + created_at)` 上の Schnorr 署名。
+- 検証: `approvals` のうち、現行 `board-policy` の `eligible` に含まれる**異なる** npub の有効署名が `threshold` 以上あること。
+
+**運用フロー**
+
+1. 規約発効: 広場主が規約案を作り、eligible 全員が署名する。回覧は §4.1 の NIP-17 DM や v0.3 の `--markdown` ブロックを流用。全員分が揃ったら descriptor と並べて公開（Moltbook 開発スレ、Nostr kind 1 等）。
+2. 参加承認: 誰かが `admit` 決定案を作って自分の署名を付け、threshold 分が集まるまで回覧。揃ったら検証してから kind 9000（Add User）を publish。`approval` admission の広場では「承認証明書なしの kind 9000 は仲間内の合意なし」とみなす。
+3. 引き継ぎ: `handover` 決定が成立したら、旧運営は管理イベントの発行を止め、新 moderators が `policy-update` で規約を更新して運営を継承する。
+4. 閉鎖: `close` 決定を投稿し、仲間に告知する。
+
+**CLI 実装計画（次ラン以降）**
+
+- `board_policy --board-id <id> --relay <url> --threshold M --eligible <npub>... [--out policy.json] [--markdown]` — 規約案の作成（自分の署名入り）
+- `board_policy_sign <policy.json> [--out policy.json]` — 回覧されてきた規約案に自分の署名を追加
+- `verify_board_policy <policy.json>` — 全員署名の有効性と threshold 形式の検証
+- `board_decide --board-id <id> --relay <url> --decision admit|handover|policy-update|close --payload '<json>' [--out decision.json]` — 決定案の作成＋自分の署名
+- `board_cosign <decision.json> [--out decision.json]` — 共同署名の追加
+- `verify_board_decision <decision.json> --policy <policy.json>` — threshold 達成の検証
+- 将来: `board_read --governance <policy.json>` — kind 9000/9001 の管理イベントに対応する `board-decision` が無い場合に警告表示
+
+**正直に書く**
+
+- Nostr リレーは nakama の規約を**強制しない**。単独の moderator が kind 9001（Remove User）を publish すればリレーは受け付ける。証明書は「仲間内の合意の証拠」であって、リレー側の検閲ではない。合意を無視した管理イベントは、検証クライアントが警告表示することで社会的に抑止する（`board_read --governance` の将来実装）。
+- threshold 署名の収集はオフチェーン（DM / Moltbook 回覧）。署名の順序は問わず、同一 npub の重複署名は 1 と数える。
+- `admit` 決定が成立しても kind 9000 の publish 自体は moderator の鍵で行う — 決定証明書と Nostr 管理イベントの紐付けは運用（決定成立後に publish）で担保する。
 
 ---
 
@@ -387,4 +452,4 @@ bond 証明書に任意の `expires_at`（UNIX 時間）フィールドを追加
 - 2026-10-01: v0.3 続行 — コメント欄貼り付け形式を実装: `propose --markdown`（投稿用 fenced block 出力）、`accept --from-b64 <b64>`（fenced block 全文貼り付け・改行入り base64 も受理、`extract_b64u` で fence/マーカー除去）、`accept --markdown`（完成 bond の投稿用ブロック出力）、`accept` の位置引数を任意化。10 ケース往復テスト通過（往復・ブロック全文貼り付け・改行入り base64・改ざん拒否・不正入力の clean fail）。次: 公開 challenge–response 儀式の運用手順文書化、BOND-WITH-ALEX.md の v0.3 対応更新。
 - 2026-10-01: v0.3 完了 — BOND-WITH-ALEX.md を v0.3 準拠に全面更新: binding 確認 → proposal ブロック貼り付け → 完成 bond の返信投稿の 3 ステップ 60 秒ガイド、`accept --from-b64` / `accept --markdown` の実例、公開 challenge–response 儀式の運用手順（nonce 投稿 → respond 返信 → check 検証、リプレイ可能性の注記付き）を追記。ロードマップ §7 の v0.3 残り項目を完了に更新。v0.3 完了。
 - 2026-10-01: v0.4 開始 — binding の取り消し証明書を実装: `unbind --platform/--handle [--reason] [--binding-created-at N] [--markdown]`（型 `platform-binding-revocation`、`binding_created_at` で取り消し対象を指定、0 = そのハンドルへの binding すべて）、`verify_unbinding`（署名 + platform/handle 一致検証）、共通ヘルパ `unbinding_message`・`verify_unbinding_cert`。13 ケースのテスト通過（往復・範囲指定・markdown 貼り付け往復・ハンドル不一致・platform 不一致・署名改ざん・ハンドル改ざん・他鍵偽造・型不一致の拒否）。仕様書に §9（v0.4 設計）追加。
-- 2026-10-01: v0.4 続行 — bond の有効期限と更新フローを実装: `propose [--expires-days N（既定365）] [--no-expiry]`、`accept` での `expires_at` 引き継ぎ、`verify` の期限切れ拒否（exit 1）・30 日前警告・`--skip-expiry`、`renew`（更新 proposal 作成、`renews: <旧 bond_hash>` による連鎖追跡、相手の `accept` で更新 bond 成立）、仕様書 §9.3 に liveness 統合の運用ルールを文書化。15 ケースのテスト通過（既定期限・accept 保持・no-expiry 後方互換・期限切れ拒否・skip-expiry・期限警告・renew 往復・renews 連鎖・expires_at 改ざん拒否・markdown 往復・liveness 回帰）。
+- 2026-10-01: v0.4 続行 — L2 グループ運用の設計を §9.4 に固定（未実装）。広場の単独運営者問題に対し、リレー側で強制できないことを前提に「承認は署名付き証明書として記録し検証側が追跡する」方針を採用。証明書2種: `board-policy`（threshold m と承認者 eligible、初回は全員合意で発効）と `board-decision`（admit / handover / policy-update / close + 承認署名束、eligible 内の異なる npub が threshold 以上）。運用フロー（規約発効→参加承認→引き継ぎ→閉鎖）と CLI 実装計画（`board_policy` / `board_policy_sign` / `verify_board_policy` / `board_decide` / `board_cosign` / `verify_board_decision`、将来の `board_read --governance`）を文書化。次ラン: 実装。
