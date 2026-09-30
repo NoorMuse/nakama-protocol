@@ -2432,12 +2432,30 @@ def fetch_threshold_status(d: dict, policy: dict, decisions: list):
     return ok, n, len(eligible)
 
 
+def save_policy_snapshot(out_dir, policy):
+    """fetch 時点の政策スナップショットを保存する (spec §23)。
+
+    --policy で指定・検証済みの政策 dict をそのまま
+    <out_dir>/policy-snapshot-<unixts>.json> にコピー保存し、パスを返す。
+    検証者はこのファイルを --policy に再指定することで、fetch 時点の
+    threshold 判定を再現できる（§20 の「--policy の検証者入手前提」を明示化）。
+    --out + --policy の両指定時のみ呼ぶこと。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f'policy-snapshot-{int(time.time())}.json')
+    with open(path, 'w') as f:
+        json.dump(policy, f, indent=2, ensure_ascii=False)
+    return path
+
+
 def cmd_board_decide_fetch(args):
     """board の board-decision 公開イベント (kind 30103, #h=board_id) を購読し、有効なものを表示する。
 
     --policy <policy.json> 指定時のみ、各決定の threshold 充足・不足を
     表示する（spec §20。policy は verify_board_policy_cert で事前検証し、
     無効 / board_id 不一致なら拒否で exit 1。exit コードは不変）。
+    --out と --policy の両指定時は fetch 時点の政策スナップショットを
+    policy-snapshot-<ts>.json として保存する（spec §23）。
     """
     secret = load_key(args.keyfile)
     policy = None
@@ -2492,6 +2510,10 @@ def cmd_board_decide_fetch(args):
                 json.dump(d, f, indent=2, ensure_ascii=False)
         print(f'{len(merged)} 件の決定を {args.out}/ に保存しました'
               '（board_read --governance --decisions にそのまま渡せます）')
+        if policy is not None:
+            spath = save_policy_snapshot(args.out, policy)
+            print(f'fetch 時点の政策スナップショットを {spath} に保存しました'
+                  '（検証者はこのファイルを --policy に指定して threshold 判定を再現できます）')
 
 
 def cmd_board_draft_pub(args):
@@ -2523,6 +2545,8 @@ def cmd_board_draft_fetch(args):
     （§21.5）。草案の時点解決は現行政策のみ — policy-update 決定の草案は扱わず、
     30103 決定もこの fetch には含まれないため resolve_policy_at は空集合で呼ぶ
     （§21.5）。成立の公開宣言は kind 30103 の存在（§21.3）。
+    --out と --policy の両指定時は fetch 時点の政策スナップショットを
+    policy-snapshot-<ts>.json として保存する（spec §23）。
     """
     secret = load_key(args.keyfile)
     policy = None
@@ -2577,6 +2601,10 @@ def cmd_board_draft_fetch(args):
                 json.dump(d, f, indent=2, ensure_ascii=False)
         print(f'{len(merged)} 件の草案を {args.out}/ に保存しました'
               '（board_cosign で追記 → board_draft_pub にそのまま渡せます）')
+        if policy is not None:
+            spath = save_policy_snapshot(args.out, policy)
+            print(f'fetch 時点の政策スナップショットを {spath} に保存しました'
+                  '（検証者はこのファイルを --policy に指定して threshold 判定を再現できます）')
 
 
 def cmd_board_fetch_all(args):
@@ -2592,6 +2620,8 @@ def cmd_board_fetch_all(args):
     草案は現行政策のみ（§21.5）。--out は内部マーカーを剥がしたプレーン決定
     JSON を <core_hash>.json で保存（board_cosign / board_read --governance
     --decisions 互換。fetch 時点のスナップショット）。
+    --out と --policy の両指定時は fetch 時点の政策スナップショットを
+    policy-snapshot-<ts>.json として保存する（spec §23）。
     """
     secret = load_key(args.keyfile)
     policy = None
@@ -2674,6 +2704,10 @@ def cmd_board_fetch_all(args):
         print(f'{len(merged)} 件の決定を {args.out}/ に保存しました'
               '（board_read --governance --decisions / board_cosign にそのまま渡せます。'
               'fetch 時点のスナップショット — 草案の approvals は増える可能性があります）')
+        if policy is not None:
+            spath = save_policy_snapshot(args.out, policy)
+            print(f'fetch 時点の政策スナップショットを {spath} に保存しました'
+                  '（検証者はこのファイルを --policy に指定して threshold 判定を再現できます）')
 
 
 # --- v0.4: ガバナンス照合 (spec §9.4: board_read --governance) ---
