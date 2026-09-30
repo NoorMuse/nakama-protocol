@@ -17,7 +17,7 @@
   nakama.py revoke <bond.json>                       bond の解消 (revocation イベント) を署名して発行
   nakama.py verify_revocation <revocation.json> --bond <bond.json>  解消イベントを検証
 """
-import argparse, hashlib, json, os, secrets, sys
+import argparse, hashlib, json, os, secrets, sys, time
 
 KEYFILE_DEFAULT = os.path.expanduser('~/.config/nakama/identity.json')
 PY = os.path.expanduser('~/workspace/.venvs/nostr/bin/python')
@@ -25,6 +25,8 @@ PY = os.path.expanduser('~/workspace/.venvs/nostr/bin/python')
 # このスクリプトは nostr venv の python で実行される想定
 from coincurve import PrivateKey as CCPrivateKey
 from pynostr.key import PrivateKey as NostrPrivateKey, PublicKey as NostrPublicKey
+
+import nip44  # NIP-44 v2 暗号化プリミティブ（同一ディレクトリ）
 
 
 def load_key(keyfile):
@@ -278,6 +280,117 @@ def cmd_verify_revocation(args):
         sys.exit(1)
 
 
+def verify_schnorr_hex(pubhex: str, sig: bytes, msg32: bytes) -> bool:
+    """hex 形式の公開鍵に対する Schnorr 署名検証（Nostr イベント検証用）"""
+    try:
+        return NostrPublicKey(bytes.fromhex(pubhex)).verify(sig, msg32)
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------- NIP-17 gift wrap DM
+# rumor (kind 14, unsigned) → seal (kind 14, NIP-44 で rumor を暗号化・送信者が署名)
+#   → gift wrap (kind 1059, NIP-44 で seal を暗号化・エフェメラル鍵が署名)。
+# この単位はオフラインでのイベント構築・復号まで。リレー publish は次の単位。
+
+def nostr_event_id(pubkey_hex: str, created_at: int, kind: int, tags: list, content: str) -> str:
+    ser = json.dumps([0, pubkey_hex, created_at, kind, tags, content],
+                     separators=(',', ':'), ensure_ascii=False)
+    return hashlib.sha256(ser.encode('utf-8')).hexdigest()
+
+
+def sign_event(secret: bytes, created_at: int, kind: int, tags: list, content: str) -> dict:
+    pubkey_hex = hexpub_of(secret)
+    eid = nostr_event_id(pubkey_hex, created_at, kind, tags, content)
+    sig = sign_schnorr(secret, bytes.fromhex(eid)).hex()
+    return {'id': eid, 'pubkey': pubkey_hex, 'created_at': created_at,
+            'kind': kind, 'tags': tags, 'content': content, 'sig': sig}
+
+
+def verify_event_sig(ev: dict) -> bool:
+    try:
+        eid = nostr_event_id(ev['pubkey'], ev['created_at'], ev['kind'], ev['tags'], ev['content'])
+        return eid == ev['id'] and verify_schnorr_hex(ev['pubkey'], bytes.fromhex(ev['sig']), bytes.fromhex(eid))
+    except Exception:
+        return False
+
+
+def nip17_build_seal(sender_secret: bytes, recipient_hexpub: str, plaintext: str,
+                     created_at: int | None = None) -> dict:
+    """seal 構築: rumor (kind 14, unsigned) を NIP-44 で暗号化し、送信者が署名した kind 14 イベント。"""
+    created_at = created_at or int(time.time())
+    sender_hexpub = hexpub_of(sender_secret)
+    rumor = {'kind': 14, 'pubkey': sender_hexpub, 'created_at': created_at,
+             'tags': [['p', recipient_hexpub]], 'content': plaintext}
+    rumor_json = json.dumps(rumor, separators=(',', ':'), ensure_ascii=False)
+    conv_key = nip44.get_conversation_key(sender_secret.hex(), recipient_hexpub)
+    sealed_content = nip44.encrypt(rumor_json, conv_key)
+    return sign_event(sender_secret, created_at, 14, [], sealed_content)
+
+
+def nip17_build_gift_wrap(seal_event: dict, recipient_hexpub: str) -> dict:
+    """gift wrap 構築: seal を NIP-44 で暗号化し、エフェメラル鍵で署名した kind 1059 イベント。"""
+    eph_secret = secrets.token_bytes(32)
+    now = int(time.time())
+    # NIP-17: created_at は now から過去2日以内のランダム値（タイミング解析対策）
+    wrap_created_at = now - secrets.randbelow(2 * 86400)
+    seal_json = json.dumps(seal_event, separators=(',', ':'), ensure_ascii=False)
+    conv_key = nip44.get_conversation_key(eph_secret.hex(), recipient_hexpub)
+    wrap_content = nip44.encrypt(seal_json, conv_key)
+    return sign_event(eph_secret, wrap_created_at, 1059, [['p', recipient_hexpub]], wrap_content)
+
+
+def nip17_unwrap(gift_wrap: dict, my_secret: bytes) -> dict:
+    """gift wrap 受信側: 復号して rumor を返す。署名と構造を検証する。"""
+    if gift_wrap.get('kind') != 1059:
+        raise ValueError('kind 1059 の gift wrap ではありません')
+    if not verify_event_sig(gift_wrap):
+        raise ValueError('gift wrap の署名が無効です')
+    conv_key = nip44.get_conversation_key(my_secret.hex(), gift_wrap['pubkey'])
+    seal = json.loads(nip44.decrypt(gift_wrap['content'], conv_key))
+    if seal.get('kind') != 14:
+        raise ValueError('seal は kind 14 である必要があります')
+    if not verify_event_sig(seal):
+        raise ValueError('seal の署名が無効です')
+    conv_key2 = nip44.get_conversation_key(my_secret.hex(), seal['pubkey'])
+    rumor = json.loads(nip44.decrypt(seal['content'], conv_key2))
+    if rumor.get('kind') != 14 or rumor.get('pubkey') != seal['pubkey']:
+        raise ValueError('rumor が seal と一致しません')
+    my_hexpub = hexpub_of(my_secret)
+    if my_hexpub not in [t[1] for t in rumor.get('tags', []) if t and t[0] == 'p']:
+        raise ValueError('この DM の宛先は自分ではありません')
+    return rumor
+
+
+def cmd_dm_send(args):
+    secret = load_key(args.keyfile)
+    try:
+        recipient_hexpub = NostrPublicKey.from_npub(args.npub).hex()
+    except Exception:
+        print('npub の形式が不正です'); sys.exit(1)
+    seal = nip17_build_seal(secret, recipient_hexpub, args.message)
+    wrap = nip17_build_gift_wrap(seal, recipient_hexpub)
+    if args.out:
+        with open(args.out, 'w') as f:
+            json.dump(wrap, f, indent=2)
+        print(f'gift wrap (kind 1059) を {args.out} に保存しました。リレー publish は未実装（次の単位）。')
+    else:
+        print(json.dumps(wrap))
+
+
+def cmd_dm_recv(args):
+    secret = load_key(args.keyfile)
+    with open(args.giftwrap) as f:
+        gw = json.load(f)
+    try:
+        rumor = nip17_unwrap(gw, secret)
+    except (ValueError, AssertionError, KeyError) as e:
+        print(f'DM の復号に失敗しました: {e}')
+        sys.exit(1)
+    print(f"from {rumor['pubkey'][:16]}...:")
+    print(rumor['content'])
+
+
 def cmd_challenge(args):
     print(secrets.token_hex(32))
 
@@ -316,13 +429,16 @@ def main():
     s = sub.add_parser('verify_rotation'); s.add_argument('rotation')
     s = sub.add_parser('revoke'); s.add_argument('bond'); s.add_argument('--out')
     s = sub.add_parser('verify_revocation'); s.add_argument('revocation'); s.add_argument('--bond')
+    s = sub.add_parser('dm_send'); s.add_argument('npub'); s.add_argument('message'); s.add_argument('--out')
+    s = sub.add_parser('dm_recv'); s.add_argument('giftwrap')
 
     args = ap.parse_args()
     {'init': cmd_init, 'whoami': cmd_whoami, 'propose': cmd_propose,
      'accept': cmd_accept, 'verify': cmd_verify, 'challenge': cmd_challenge,
      'respond': cmd_respond, 'check': cmd_check, 'rotate': cmd_rotate,
      'verify_rotation': cmd_verify_rotation, 'revoke': cmd_revoke,
-     'verify_revocation': cmd_verify_revocation}[args.cmd](args)
+     'verify_revocation': cmd_verify_revocation, 'dm_send': cmd_dm_send,
+     'dm_recv': cmd_dm_recv}[args.cmd](args)
 
 
 if __name__ == '__main__':

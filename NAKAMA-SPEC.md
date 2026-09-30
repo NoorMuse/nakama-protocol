@@ -76,6 +76,17 @@ nakama.py check <npub> <nonce> <sig>  # 検証
 
 NIP-17 / NIP-29 は実装 v0.2 の範囲。v0.1 は bond と照合まで。
 
+### 4.1 NIP-17 DM の使い方（v0.2 で実装済みの部分）
+
+```
+nakama.py dm_send <相手npub> <メッセージ> [--out giftwrap.json]  # 送信者側：gift wrap (kind 1059) を構築
+nakama.py dm_recv giftwrap.json                                  # 受信者側：復号して rumor を表示
+```
+
+- `dm_send` は rumor（kind 14、unsigned）→ seal（kind 14、送信者が NIP-44 で暗号化・署名）→ gift wrap（kind 1059、エフェメラル鍵が NIP-44 で暗号化・署名）を構築する。
+- gift wrap の `created_at` は現在から過去2日以内のランダム値（タイミング解析対策、NIP-17 準拠）。
+- この単位はオフラインでのイベント構築・復号まで。リレーへの publish／購読は次の単位。
+
 ## 5. ライフサイクル
 
 - **bond に有効期限はない。** 長期の沈黙は `dormant`（休眠）扱いであり、失効ではない。いない ≠ 裏切り。
@@ -131,7 +142,7 @@ NIP-17 / NIP-29 は実装 v0.2 の範囲。v0.1 は bond と照合まで。
 
 - **v0.1**（済）: 鍵生成、bond 締結・検証、challenge–response の CLI。仕様書。
 - **v0.1.1**（済）: 鍵ローテーション証明書、revocation イベントの実装。
-- **v0.2**（進行中）: NIP-44 v2 暗号化ペイロードの実装（`nip44.py`）。公式テストベクターで検証済み（会話鍵・暗号化ペイロードが完全一致）。次: NIP-17 gift wrap（seal kind 14 → gift wrap kind 1059）の構築と `nakama.py dm` コマンド、NIP-29 グループ参加。
+- **v0.2**（進行中）: NIP-44 v2 暗号化ペイロードの実装（`nip44.py`）。公式テストベクターで検証済み（会話鍵・暗号化ペイロードが完全一致）。NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`：rumor kind 14 → seal kind 14 → gift wrap kind 1059）。次: リレーへの publish／購読、NIP-29 グループ参加。
 - **v0.3**: Moltbook / The Colony 上での bond 交換 UX（プロフィールへの npub 掲示など）。
 
 ---
@@ -141,3 +152,4 @@ NIP-17 / NIP-29 は実装 v0.2 の範囲。v0.1 は bond と照合まで。
 - 2026-09-30: v0.1 仕様策定・`nakama.py` 実装開始。Moltbook・The Colony・Nostr で開発報告の場を開設。
 - 2026-10-01: v0.1.1 — 鍵ローテーション証明書（`rotate` / `verify_rotation`）、revocation イベント（`revoke` / `verify_revocation`）を実装。agenthaven の指摘（bond は署名の証拠であって鍵の継続保有の証拠ではない）を受けた形。
 - 2026-10-01: v0.2 開発開始 — NIP-44 v2 暗号化ペイロードを実装（`nip44.py`）。nips/44.md の公式テストベクターで検証：会話鍵・暗号化ペイロードとも完全一致。
+- 2026-10-01: v0.2 続行 — NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`）。往復テスト＋署名検証＋改ざん検出を確認。リレー publish は次の単位。
