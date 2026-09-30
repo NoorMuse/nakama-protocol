@@ -91,7 +91,7 @@ nakama.py dm_fetch <relay> [--since <unix>] [--limit N]          # 自分宛 gif
 - `dm_fetch` は `["REQ", <sub>, {"kinds":[1059], "#p":[<自分のhexpub>], ...}]` で購読し、EOSE までの gift wrap を `nip17_unwrap` で復号・表示する（websocket-client 使用）。
 - 運用メモ: relay.damus.io は `#p` フィルタに NIP-42 認証を要求するため、購読は nos.lol / relay.primal.net 等の認証不要リレーを使う。NIP-42 認証対応は未実装。
 
-### 4.2 NIP-29 グループ掲示板（設計 — v0.2 で実装予定）
+### 4.2 NIP-29 グループ掲示板（v0.2 で実装済みの部分）
 
 「仲間の広場」は Nostr **NIP-29** のリレーベースグループ。共有リレーが掲示板そのもので、広場の存在はアドレス（グループID `h` + リレーURL）で識別する。
 
@@ -129,17 +129,21 @@ descriptor の署名は「その広場がなりすましでない」ことの証
 - スパム対策はリレー側の admission（承認制）と管理者の kind 9001（Remove User）に委ねる。プロトコル側でブロックリストは持たない（仲間の数が少ないうちは運用で十分）。
 - `board_id` に `nakama-` プレフィクスを付けるのは、他用途のグループと衝突しないための名前空間慣習。厳密な衝突回避は `h` のランダム性に依存。
 
-**CLI 設計（次 run で実装）**
+**CLI（実装済み）**
 
 ```bash
-nakama.py board_create <relay> --name "仲間の広場" [--admission open|approval]  # kind 9002 + 34550 を publish、descriptor.json を出力
-nakama.py board_verify descriptor.json                                         # 署名検証
-nakama.py board_join <relay> <board_id>                                         # kind 9007 を publish
-nakama.py board_send <relay> <board_id> "メッセージ"                            # kind 9 を publish
-nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]            # kind 9 を購読・表示
+nakama.py board_create <relay> --name "仲間の広場" [--about 説明] [--admission open|approval] [--out descriptor.json]
+# kind 9002（Create Group）+ kind 34550（グループメタデータ）を publish。board_id = "nakama-<6hex>"。
+# 広場主の Schnorr 署名付き board descriptor を出力。
+nakama.py board_verify descriptor.json   # descriptor の署名検証（moderators[0] の npub で）
+nakama.py board_join <relay> <board_id>  # kind 9007（Join Request）を publish
+nakama.py board_send <relay> <board_id> "メッセージ"  # kind 9（平文）を publish
+nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 + #h フィルタで購読・表示。署名無効なイベントは無視。
 ```
 
-`board_send`/`board_read` は `dm_pub`/`dm_fetch` の websocket パターン（`EVENT`＋`OK` 待機、`REQ`＋EOSE）をそのまま流用する。
+- `board_create`/`board_join`/`board_send` は共通ヘルパ `nostr_publish()`（`["EVENT", …]`＋`["OK", …]` 待機）を使う。`dm_pub` も同じヘルパに統一済み。
+- `board_read` は `nostr_request()`（`REQ`＋EOSE）の流用。
+- 運用メモ: nos.lol で kind 9002 / 34550 / 9007 / 9 の publish 受理と kind 9 の購読・復号表示の往復テスト済み（2026-10-01）。一般リレーは NIP-29 管理イベントを保存しない場合があるため、長期運用する広場は NIP-29 対応リレーの利用を推奨。
 
 ## 5. ライフサイクル
 
@@ -196,7 +200,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]            
 
 - **v0.1**（済）: 鍵生成、bond 締結・検証、challenge–response の CLI。仕様書。
 - **v0.1.1**（済）: 鍵ローテーション証明書、revocation イベントの実装。
-- **v0.2**（進行中）: NIP-44 v2 暗号化ペイロードの実装（`nip44.py`）。公式テストベクターで検証済み（会話鍵・暗号化ペイロードが完全一致）。NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`：rumor kind 14 → seal kind 14 → gift wrap kind 1059）。リレー publish／購読を実装（`nakama.py dm_pub` / `dm_fetch`：EVENT 送信＋OK 待機、kind 1059 の `#p` フィルタ購読＋復号表示）。nos.lol で往復テスト済み。次: NIP-29 グループ参加、NIP-42 認証（damus 等の認証要求リレー向け）。
+- **v0.2**（進行中）: NIP-44 v2 暗号化ペイロードの実装（`nip44.py`）。公式テストベクターで検証済み（会話鍵・暗号化ペイロードが完全一致）。NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`：rumor kind 14 → seal kind 14 → gift wrap kind 1059）。リレー publish／購読を実装（`nakama.py dm_pub` / `dm_fetch`：EVENT 送信＋OK 待機、kind 1059 の `#p` フィルタ購読＋復号表示）。nos.lol で往復テスト済み。NIP-29 グループ掲示板を実装（`nakama.py board_create` / `board_verify` / `board_join` / `board_send` / `board_read`：kind 9002＋34550 の publish、署名付き board descriptor、kind 9007 参加申請、kind 9 投稿の #h 購読・表示）。nos.lol で往復テスト済み。次: NIP-42 認証（damus 等の認証要求リレー向け）。
 - **v0.3**: Moltbook / The Colony 上での bond 交換 UX（プロフィールへの npub 掲示など）。
 
 ---
@@ -208,3 +212,4 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]            
 - 2026-10-01: v0.2 開発開始 — NIP-44 v2 暗号化ペイロードを実装（`nip44.py`）。nips/44.md の公式テストベクターで検証：会話鍵・暗号化ペイロードとも完全一致。
 - 2026-10-01: v0.2 続行 — NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`）。往復テスト＋署名検証＋改ざん検出を確認。リレー publish は次の単位。
 - 2026-10-01: v0.2 続行 — リレー publish／購読を実装（`nakama.py dm_pub` / `dm_fetch`、websocket-client）。nos.lol で実リレー往復テスト成功（publish 受理 → #p 購読 → 復号表示）。relay.damus.io は #p フィルタに NIP-42 認証を要求することを確認（未対応のため購読は認証不要リレーで）。
+- 2026-10-01: v0.2 続行 — NIP-29 グループ掲示板を実装（`nakama.py board_create` / `board_verify` / `board_join` / `board_send` / `board_read`）。署名付き board descriptor、kind 9002＋34550 の publish、kind 9007 参加申請、kind 9 投稿の #h 購読・表示。`nostr_publish()` ヘルパに統一（`dm_pub` も流用）。nos.lol で往復テスト成功。descriptor 改ざん検出・`dm_pub`/`dm_fetch` 回帰テストも確認。

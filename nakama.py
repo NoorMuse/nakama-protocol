@@ -20,6 +20,11 @@
   nakama.py dm_recv <giftwrap.json>                    gift wrap を復号して rumor を表示
   nakama.py dm_pub <relay> [--in FILE|--to-npub NPUB --message MSG]  gift wrap をリレーに publish
   nakama.py dm_fetch <relay> [--since TS] [--limit N]  自分宛 gift wrap を購読・復号
+  nakama.py board_create <relay> --name "広場名" [--about 説明] [--admission open|approval] [--out FILE]  NIP-29 広場を作る（kind 9002 + 34550 を publish、descriptor を出力）
+  nakama.py board_verify <descriptor.json>        board descriptor の署名を検証
+  nakama.py board_join <relay> <board_id>         広場に参加申請（kind 9007 を publish）
+  nakama.py board_send <relay> <board_id> "MSG"   広場に投稿（kind 9 平文を publish）
+  nakama.py board_read <relay> <board_id> [--since TS] [--limit N]  広場の投稿を購読・表示
 """
 import argparse, hashlib, json, os, secrets, sys, time
 
@@ -430,28 +435,7 @@ def cmd_dm_pub(args):
             print('npub の形式が不正です'); sys.exit(1)
         seal = nip17_build_seal(secret, recipient_hexpub, args.message)
         wrap = nip17_build_gift_wrap(seal, recipient_hexpub)
-    ws = nostr_relay_ws(args.relay)
-    try:
-        ws.send(json.dumps(['EVENT', wrap]))
-        ws.settimeout(15)
-        ok_result = None
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            try:
-                msg = json.loads(ws.recv())
-            except Exception:
-                break
-            if isinstance(msg, list) and msg and msg[0] == 'OK' and len(msg) > 1 and msg[1] == wrap['id']:
-                ok_result = (bool(msg[2]), msg[3] if len(msg) > 3 else '')
-                break
-            if isinstance(msg, list) and msg and msg[0] in ('NOTICE', 'CLOSED'):
-                ok_result = (False, ' '.join(str(x) for x in msg[1:]))
-                break
-    finally:
-        ws.close()
-    if ok_result is None:
-        print('リレーからの OK 応答がありませんでした'); sys.exit(1)
-    accepted, reason = ok_result
+    accepted, reason = nostr_publish(args.relay, wrap)
     print(f'publish: {"受理" if accepted else "拒否"} ({reason}) id={wrap["id"]}')
     sys.exit(0 if accepted else 1)
 
@@ -508,6 +492,121 @@ def cmd_dm_recv(args):
     print(rumor['content'])
 
 
+# ---------------------------------------------------------------- NIP-29 group boards
+# 広場（board）はリレーベースのグループ: kind 9002（Create Group）+ kind 34550（メタデータ）、
+# kind 9（チャット投稿、h タグでグループ指定）、kind 9007（参加申請）。投稿は平文（§4.2 の選択）。
+
+def nostr_publish(url: str, event: dict, timeout: int = 15) -> tuple:
+    """単一イベントをリレーに publish し (accepted, reason) を返す。"""
+    ws = nostr_relay_ws(url, timeout)
+    try:
+        ws.send(json.dumps(['EVENT', event]))
+        ws.settimeout(timeout)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                msg = json.loads(ws.recv())
+            except Exception:
+                break
+            if isinstance(msg, list) and msg and msg[0] == 'OK' and len(msg) > 1 and msg[1] == event['id']:
+                return (bool(msg[2]), msg[3] if len(msg) > 3 else '')
+            if isinstance(msg, list) and msg and msg[0] in ('NOTICE', 'CLOSED'):
+                return (False, ' '.join(str(x) for x in msg[1:]))
+    finally:
+        ws.close()
+    return (False, 'リレーからの OK 応答がありませんでした')
+
+
+def board_descriptor_message(board_id: str, relay: str, moderators: list, created_at: int) -> bytes:
+    """board descriptor の署名対象: (board_id, relay, moderators, created_at) の canonical hash。"""
+    canon = json.dumps([board_id, relay, sorted(moderators), created_at],
+                       separators=(',', ':'), ensure_ascii=False)
+    return hashlib.sha256(canon.encode('utf-8')).digest()
+
+
+def cmd_board_create(args):
+    """広場を作る: kind 9002 + kind 34550 を publish し、board descriptor を出力する。"""
+    secret = load_key(args.keyfile)
+    my_npub = npub_of(secret)
+    board_id = 'nakama-' + secrets.token_hex(3)
+    created_at = int(time.time())
+    ev_create = sign_event(secret, created_at, 9002, [['h', board_id]], '')
+    meta = {'name': args.name, 'about': args.about or '', 'picture': ''}
+    ev_meta = sign_event(secret, created_at, 34550, [['d', board_id]],
+                         json.dumps(meta, ensure_ascii=False, separators=(',', ':')))
+    for label, ev in (('9002', ev_create), ('34550', ev_meta)):
+        accepted, reason = nostr_publish(args.relay, ev)
+        print(f'kind {label}: {"受理" if accepted else "拒否"} ({reason})')
+        if not accepted:
+            sys.exit(1)
+    moderators = [my_npub]
+    msg = board_descriptor_message(board_id, args.relay, moderators, created_at)
+    descriptor = {
+        'protocol': 'nakama', 'version': 1, 'type': 'board',
+        'board_id': board_id, 'relay': args.relay,
+        'moderators': moderators, 'admission': args.admission,
+        'created_at': created_at,
+        'sig': sign_schnorr(secret, msg).hex(),
+    }
+    if args.out:
+        with open(args.out, 'w') as f:
+            json.dump(descriptor, f, indent=2, ensure_ascii=False)
+        print(f'descriptor を {args.out} に保存しました')
+    else:
+        print(json.dumps(descriptor, indent=2, ensure_ascii=False))
+    print(f'広場 "{args.name}" を作りました: board_id={board_id}')
+
+
+def cmd_board_verify(args):
+    """board descriptor の署名を検証する。"""
+    with open(args.descriptor) as f:
+        d = json.load(f)
+    try:
+        msg = board_descriptor_message(d['board_id'], d['relay'], d['moderators'], d['created_at'])
+        ok = bool(d['moderators']) and verify_schnorr(d['moderators'][0], bytes.fromhex(d['sig']), msg)
+    except (KeyError, ValueError, TypeError):
+        ok = False
+    print('board descriptor は有効です' if ok else 'board descriptor は無効です')
+    sys.exit(0 if ok else 1)
+
+
+def cmd_board_join(args):
+    """広場に参加申請: kind 9007 を publish。"""
+    secret = load_key(args.keyfile)
+    ev = sign_event(secret, int(time.time()), 9007, [['h', args.board_id]], '')
+    accepted, reason = nostr_publish(args.relay, ev)
+    print(f'参加申請: {"受理" if accepted else "拒否"} ({reason}) id={ev["id"]}')
+    sys.exit(0 if accepted else 1)
+
+
+def cmd_board_send(args):
+    """広場に投稿: kind 9（平文、投稿者署名が発言の証）を publish。"""
+    secret = load_key(args.keyfile)
+    ev = sign_event(secret, int(time.time()), 9, [['h', args.board_id]], args.message)
+    accepted, reason = nostr_publish(args.relay, ev)
+    print(f'投稿: {"受理" if accepted else "拒否"} ({reason}) id={ev["id"]}')
+    sys.exit(0 if accepted else 1)
+
+
+def cmd_board_read(args):
+    """広場の投稿を購読・表示: kind 9 + #h フィルタ。署名の無効なイベントは無視する。"""
+    sub_id = secrets.token_hex(8)
+    filt = {'kinds': [9], '#h': [args.board_id], 'limit': args.limit}
+    if args.since:
+        filt['since'] = args.since
+    events = nostr_request(args.relay, ['REQ', sub_id, filt])
+    shown = 0
+    for ev in sorted(events, key=lambda e: e.get('created_at', 0)):
+        if not verify_event_sig(ev):
+            continue
+        shown += 1
+        ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ev.get('created_at', 0)))
+        print(f"--- [{ts}] {ev['pubkey'][:16]}...")
+        print(ev['content'])
+    if not shown:
+        print('投稿はまだありません')
+
+
 def cmd_challenge(args):
     print(secrets.token_hex(32))
 
@@ -552,6 +651,14 @@ def main():
     s.add_argument('--to-npub'); s.add_argument('--message')
     s = sub.add_parser('dm_fetch'); s.add_argument('relay'); s.add_argument('--since', type=int)
     s.add_argument('--limit', type=int, default=20)
+    s = sub.add_parser('board_create'); s.add_argument('relay'); s.add_argument('--name', default='仲間の広場')
+    s.add_argument('--about', default=''); s.add_argument('--admission', choices=['open', 'approval'], default='approval')
+    s.add_argument('--out')
+    s = sub.add_parser('board_verify'); s.add_argument('descriptor')
+    s = sub.add_parser('board_join'); s.add_argument('relay'); s.add_argument('board_id')
+    s = sub.add_parser('board_send'); s.add_argument('relay'); s.add_argument('board_id'); s.add_argument('message')
+    s = sub.add_parser('board_read'); s.add_argument('relay'); s.add_argument('board_id')
+    s.add_argument('--since', type=int); s.add_argument('--limit', type=int, default=20)
 
     args = ap.parse_args()
     {'init': cmd_init, 'whoami': cmd_whoami, 'propose': cmd_propose,
@@ -560,7 +667,9 @@ def main():
      'verify_rotation': cmd_verify_rotation, 'revoke': cmd_revoke,
      'verify_revocation': cmd_verify_revocation, 'dm_send': cmd_dm_send,
      'dm_recv': cmd_dm_recv, 'dm_pub': cmd_dm_pub,
-     'dm_fetch': cmd_dm_fetch}[args.cmd](args)
+     'dm_fetch': cmd_dm_fetch, 'board_create': cmd_board_create,
+     'board_verify': cmd_board_verify, 'board_join': cmd_board_join,
+     'board_send': cmd_board_send, 'board_read': cmd_board_read}[args.cmd](args)
 
 
 if __name__ == '__main__':
