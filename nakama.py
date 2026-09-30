@@ -29,6 +29,7 @@
 import argparse, hashlib, json, os, secrets, sys, time
 
 KEYFILE_DEFAULT = os.path.expanduser('~/.config/nakama/identity.json')
+REVOCATIONS_DEFAULT = os.path.expanduser('~/.config/nakama/revocations')
 PY = os.path.expanduser('~/workspace/.venvs/nostr/bin/python')
 
 # このスクリプトは nostr venv の python で実行される想定
@@ -162,6 +163,19 @@ def cmd_verify(args):
         print(f'{npub[:24]}... : {"有効" if valid else "無効/欠落"}{note}')
         ok = ok and valid
     print('bond は有効です 🤝' if ok else 'bond は無効です')
+    if ok and not args.skip_registry:
+        registry = args.registry or REVOCATIONS_DEFAULT
+        path = revocation_registry_path(registry, bond_hash(b))
+        if os.path.isfile(path):
+            with open(path) as f:
+                r = json.load(f)
+            if verify_revocation_event(r, b):
+                print(f'⚠ ただしこの bond は解消されています: {r["revoker"][:24]}... が '
+                      f'{time.strftime("%Y-%m-%d", time.localtime(r["created_at"]))} に解消を宣言')
+                print('bond は無効です')
+                sys.exit(1)
+            else:
+                print('⚠ registry 内の revocation 記録は署名検証に失敗しました（無視して続行）', file=sys.stderr)
     sys.exit(0 if ok else 1)
 
 
@@ -265,7 +279,32 @@ def cmd_revoke(args):
     with open(out, 'w') as f:
         json.dump(rev, f, indent=2)
     print(f'revocation イベント: {out} — bond {h[:16]}... の解消を宣言しました。')
+    if not args.no_registry:
+        registry = args.registry or REVOCATIONS_DEFAULT
+        os.makedirs(registry, exist_ok=True)
+        rp = revocation_registry_path(registry, h)
+        with open(rp, 'w') as f:
+            json.dump(rev, f, indent=2)
+        os.chmod(rp, 0o600)
+        print(f'ローカル registry に記録しました: {rp}')
     print('解消イベントは公開チャネルで共有してください（仲間の公開記録に残ります）。')
+
+
+def verify_revocation_event(r: dict, b: dict | None = None) -> bool:
+    """revocation イベントの構造検証。b が与えられれば bond との対応も検証する。"""
+    if r.get('protocol') != 'nakama' or r.get('version') != 1 or r.get('type') != 'revocation':
+        return False
+    if b is not None:
+        if r.get('bond_hash') != bond_hash(b):
+            return False
+        if r.get('revoker') not in b.get('companions', []):
+            return False
+    msg = revocation_message(r['bond_hash'], r['revoker'], r['created_at'])
+    return verify_schnorr(r['revoker'], bytes.fromhex(r['sig']), msg)
+
+
+def revocation_registry_path(registry: str, bond_hash_hex: str) -> str:
+    return os.path.join(registry, bond_hash_hex + '.json')
 
 
 def cmd_verify_revocation(args):
@@ -275,18 +314,32 @@ def cmd_verify_revocation(args):
         'nakama v1 の revocation ではありません'
     with open(args.bond) as f:
         b = json.load(f)
-    if r['bond_hash'] != bond_hash(b):
-        print('bond と一致しません')
-        sys.exit(1)
-    if r['revoker'] not in b.get('companions', []):
-        print('署名者が bond の当事者ではありません')
-        sys.exit(1)
-    msg = revocation_message(r['bond_hash'], r['revoker'], r['created_at'])
-    if verify_schnorr(r['revoker'], bytes.fromhex(r['sig']), msg):
+    if verify_revocation_event(r, b):
         print(f"revocation は有効です — bond {r['bond_hash'][:16]}... は {r['revoker'][:16]}... により解消されました。")
     else:
         print('revocation は無効です')
         sys.exit(1)
+
+
+def cmd_revoke_list(args):
+    registry = args.registry or REVOCATIONS_DEFAULT
+    if not os.path.isdir(registry):
+        print('revocation registry は空です')
+        return
+    rows = []
+    for fn in sorted(os.listdir(registry)):
+        if not fn.endswith('.json'):
+            continue
+        with open(os.path.join(registry, fn)) as f:
+            r = json.load(f)
+        if verify_revocation_event(r):
+            rows.append((r['bond_hash'][:16], r['revoker'][:16], time.strftime('%Y-%m-%d', time.localtime(r['created_at']))))
+    if not rows:
+        print('revocation registry は空です')
+        return
+    print(f'解消済み bond: {len(rows)} 件')
+    for h, revoker, date in rows:
+        print(f'  {h}...  解消: {revoker}...  ({date})')
 
 
 def verify_schnorr_hex(pubhex: str, sig: bytes, msg32: bytes) -> bool:
@@ -687,6 +740,8 @@ def main():
     s = sub.add_parser('propose'); s.add_argument('npub'); s.add_argument('--out')
     s = sub.add_parser('accept'); s.add_argument('proposal'); s.add_argument('--out')
     s = sub.add_parser('verify'); s.add_argument('bond'); s.add_argument('--rotation', action='append', default=[])
+    s.add_argument('--registry', default=None, help='revocation registry ディレクトリ (既定: ~/.config/nakama/revocations)')
+    s.add_argument('--skip-registry', action='store_true', help='registry の解消チェックを省略')
     sub.add_parser('challenge')
     s = sub.add_parser('respond'); s.add_argument('nonce')
     s = sub.add_parser('check'); s.add_argument('npub'); s.add_argument('nonce'); s.add_argument('sig')
@@ -697,7 +752,10 @@ def main():
     s.add_argument('--out')
     s = sub.add_parser('verify_rotation'); s.add_argument('rotation')
     s = sub.add_parser('revoke'); s.add_argument('bond'); s.add_argument('--out')
+    s.add_argument('--registry', default=None, help='revocation registry ディレクトリ (既定: ~/.config/nakama/revocations)')
+    s.add_argument('--no-registry', action='store_true', help='registry への記録を省略')
     s = sub.add_parser('verify_revocation'); s.add_argument('revocation'); s.add_argument('--bond')
+    s = sub.add_parser('revoke_list'); s.add_argument('--registry', default=None)
     s = sub.add_parser('dm_send'); s.add_argument('npub'); s.add_argument('message'); s.add_argument('--out')
     s = sub.add_parser('dm_recv'); s.add_argument('giftwrap')
     s = sub.add_parser('dm_pub'); s.add_argument('relay'); s.add_argument('--in', dest='in_file')
@@ -724,7 +782,7 @@ def main():
      'accept': cmd_accept, 'verify': cmd_verify, 'challenge': cmd_challenge,
      'respond': cmd_respond, 'check': cmd_check, 'rotate': cmd_rotate,
      'verify_rotation': cmd_verify_rotation, 'revoke': cmd_revoke,
-     'verify_revocation': cmd_verify_revocation, 'dm_send': cmd_dm_send,
+     'verify_revocation': cmd_verify_revocation, 'revoke_list': cmd_revoke_list, 'dm_send': cmd_dm_send,
      'dm_recv': cmd_dm_recv, 'dm_pub': cmd_dm_pub,
      'dm_fetch': cmd_dm_fetch, 'board_create': cmd_board_create,
      'board_verify': cmd_board_verify, 'board_join': cmd_board_join,
