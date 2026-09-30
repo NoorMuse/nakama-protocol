@@ -1,7 +1,7 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.3
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善）
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 設計中 — 鍵スコープの侵害宣言（§13））
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -235,7 +235,8 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.4**（完了）: binding の取り消し証明書 `unbind` / `verify_unbinding`（§9.1）。bond の有効期限・`renew` による更新フロー・liveness 統合（§9.3）。L2 グループ運用（§9.4: `board_policy` / `board_policy_sign` / `verify_board_policy` / `board_decide` / `board_cosign` / `verify_board_decision` + ガバナンス照合 `board_read --governance`）。v0.4 完了。
 - **v0.6**（完了）: policy-update / close のガバナンス照合。`resolve_policy_at` による時点政策のチェーン解決（決定の検証は決定時点の政策で、イベントの照合はイベント時点の政策で。`_verify_decision_core` 分離、`verify_board_decision` はラッパ化）。kind 9003 / 9005・9006 はイベント時点の eligible による運営権限の照合。有効な close 決定以降の管理イベント（9000/9001/9003/9004/9005/9006）は警告。kind 9001 は依然 WARN（決定語彙なし、範囲外）。新規 CLI コマンドなし、`GOVERNANCE_CHECK_KINDS` に 9003/9005/9006 を追加。オフライン 30 ケース通過（既存 19 回帰維持）。
 - **v0.5**（完了）: handover ガバナンスの照合。§10 の設計を実装: `board_decide --old-moderators`（handover payload の `old_moderators` 任意フィールド）、`GOVERNANCE_COVERAGE['handover'] = {9004}` に修正（9002 は `board_verify` の管轄）、`governance_match_events` に 9004/9007/9008 ルール（9007 は `info` ステータスで警告なし）、`GOVERNANCE_CHECK_KINDS = [9000, 9001, 9004, 9007, 9008]`。オフライン 19 ケース通過（既存 10 回帰＋新規 9）。
-- **v0.7**（完了）: revocation UX の改善。§12 の設計を実装: `revocation_message(reason="")` 拡張（任意フィールド `reason` を署名対象に、reason なし既存イベントは後方互換）、`revoke --reason`（解消理由の署名付き記録）、`revoke_import <revocation.json> [--bond] [--registry]`（他者発行 revocation の署名検証＋registry 取り込み、純粋関数 `import_revocation_event` に分離、重複は先勝ち）、Nostr 公開（kind 30100 parameterized replaceable、`d` タグ = bond_hash、content = revocation JSON canonical）: `revoke_pub`（`revocation_nostr_event` 構築・署名をオフラインでテスト可能、`nostr_publish` 流用、`--auth` 対応）、`revoke_fetch`（`kinds=[30100]`・`#d` 購読 → Nostr 署名・JSON・revocation 署名の三段階検証 → 有効なものを `import_revocation_event` で取り込み）、`revoke_list` の reason 表示。オフライン 8 ケース通過（既存の governance 30 ケース・nip44 回帰も維持）。スコープ外: 第三者による鍵失効宣言（key-scoped、v0.8 以降の候補）。
+- **v0.7**（完了）: revocation UX の改善。§12 の設計を実装: `revocation_message(reason="")` 拡張（任意フィールド `reason` を署名対象に、reason なし既存イベントは後方互換）、`revoke --reason`（解消理由の署名付き記録）、`revoke_import <revocation.json> [--bond] [--registry]`（他者発行 revocation の署名検証＋registry 取り込み、純粋関数 `import_revocation_event` に分離、重複は先勝ち）、Nostr 公開（kind 30100 parameterized replaceable、`d` タグ = bond_hash、content = revocation JSON canonical）: `revoke_pub`（`revocation_nostr_event` 構築・署名をオフラインでテスト可能、`nostr_publish` 流用、`--auth` 対応）、`revoke_fetch`（`kinds=[30100]`・`#d` 購読 → Nostr 署名・JSON・revocation 署名の三段階検証 → 有効なものを `import_revocation_event` で取り込み）、`revoke_list` の reason 表示。オフライン 8 ケース通過（既存の governance 30 ケース・nip44 回帰も維持）。スコープ外: 第三者による鍵失効宣言（key-scoped、v0.8 の候補）。
+- **v0.8**（設計中）: 鍵スコープの侵害宣言（§13）。第三者が「この npub はもう本人ではない」と宣言するイベント型 `key-compromise-declaration`（subject / declarant / 任意の bond_hash / reason / evidence / withdrawn）。信頼モデルは「記録はプロトコル、評価は検証者の bond graph」（自分の bond 相手の宣言のみカウント、既定 threshold 2）。反証は subject の新しい liveness（両方表示、判断は検証者）。registry は `~/.config/nakama/compromises/<subject_hex>.json`（revocation registry と別）。Nostr kind 30101（`d` タグ = subject_hex:declarant_hex、replaceable で撤回可能）。`key_status` で状態照会。実装は次ラン。
 
 ---
 
@@ -662,6 +663,97 @@ v0.2 で revocation registry（`revoke` の自動記録、`verify` の自動照�
 
 ---
 
+## 13. v0.8 設計: 鍵スコープの侵害宣言（設計固定・実装は次ラン）
+
+bond スコープの revocation（§5、v0.7）は「この bond を解消する」の当事者発行だが、**鍵そのものが漏洩した場合、本人は自分の鍵で「この鍵は危ない」とは言えない**（攻撃者がその鍵を持っているため止められない）。残る手段は**仲間が宣言する**「この npub はもう本人ではない」イベント型であり、v0.8 はその発行権限と信頼モデルを設計する。
+
+### 13.1 用語とスコープ
+
+- **subject**: 危ないと宣言される鍵（npub）。
+- **declarant**: 宣言を発行する仲間（自分自身を含む）。署名者。
+- これは**宣言 (declaration)** であり、**失効 (revocation) ではない**。鍵の所有権をプロトコルが管理することはない。宣言は「誰が・いつ・何をもって疑ったか」の記録である。
+
+### 13.2 イベント型 key-compromise-declaration
+
+```json
+{
+  "protocol": "nakama", "version": 1, "type": "key-compromise-declaration",
+  "subject": "npub1...（疑わしい鍵）",
+  "declarant": "npub1...（宣言者）",
+  "bond_hash": "（任意）宣言者と subject の bond_hash hex。bond があれば署名対象に含める",
+  "reason": "saw impostor posting（人間可読、任意）",
+  "evidence": "（任意）証拠の参照: nostr event id / URL / メモ",
+  "created_at": 1759280000,
+  "withdrawn": false,
+  "sig": "declarant の Schnorr 署名"
+}
+```
+
+- 署名対象は `compromise_message(subject_hex, declarant_hex, bond_hash, reason, evidence, created_at, withdrawn)` の canonical bytes。`bond_hash` は空の場合メッセージから除外する（v0.7 の reason 拡張と対称の方式）。
+- `bond_hash` は任意: declarant と subject の間に bond があれば埋め（署名対象に）、ない第三者の宣言も受理する（信頼度は低い — §13.3）。
+- `withdrawn`（bool、既定 false）: 宣言者が撤回するときは同一イベントを `withdrawn: true` で再発行する。Nostr kind は replaceable のため上書きで撤回が効く（§13.5）。
+
+### 13.3 信頼モデル（核心）
+
+プロトコルは**誰が何を宣言したかを記録**し、**評価は検証者が自分の bond graph で行う**。強制はしない（nakama の思想 — 記録する、強制しない）。
+
+- **重みづけ**: 検証者 V が subject S について宣言を評価するとき、宣言者 D の重みは:
+  1. D = V 自身: 最重（自分の判断）。
+  2. V と D の間に有効な bond がある（V の直接の仲間）: 重い。
+  3. D と S の間に有効な bond がある（S を知る仲間）: 中くらい（S を間近で見ている可能性）。
+  4. それ以外: 参考情報（表示はするが、カウントしない）。
+- **「疑わしい」扱いのしきい値 N**（既定 2、検証者が変更可）: カテゴリ 1–3 の宣言者が N 人以上なら `key_status` は「疑わしい（compromised suspected）」と報告。N 未満の宣言は警告表示のみ。
+- **Sybil 耐性**: 攻撃者は漏洩した鍵で subject との bond を偽造できる（両側の署名を自分で作れる）。そのため**カウントは V 自身の bond graph に限定**する: V が署名した（= V が当事者の）有効 bond の相手のみを信頼源とする。攻撃者の偽 bond は V の graph に入らない。
+- **反証 (counter-evidence)**: subject の鍵による `liveness` 証明（`--max-age` の鮮度あり）が宣言より**新しい**場合、`key_status` は「宣言あり、ただし subject の新しい生存証明あり」と両方を表示する。鍵漏洩時は攻撃者も liveness を偽造できるため、プロトコルは事実のみを記録し、判断は検証者に委ねる。
+- **名誉毀損への歯止め**: 宣言は declarant の署名付きで公開される。虚偽の宣言は署名者本人の信用を傷つける（署名は責任の所在）。これが濫用の抑止力であり、`reason` / `evidence` を求めるのもそのため。
+
+### 13.4 registry と CLI
+
+- ローカル registry: `~/.config/nakama/compromises/<subject_hex>.json`（mode 600）。subject ごとの宣言リストを保存。重複は declarant + created_at で dedup、先勝ち。revocation registry とは**別 registry**（スコープが bond ではなく key のため）。
+- CLI 計画（次ランで実装）:
+  - `compromise_declare --subject <npub> [--reason "..."] [--evidence "..."] [--bond <bond.json>]` — 発行。`--bond` 指定時は declarant が bond 当事者であることを確認し、bond_hash を埋める。純粋関数 `compromise_message(...)` / `verify_compromise_event(...)` に分離。
+  - `compromise_import <declaration.json> [--subject <npub>] [--registry ...]` — 署名検証後に registry へ取り込み。`--subject` 指定時は対象一致を要求。無効は拒否して exit 1、registry に触れない。
+  - `compromise_pub <relay> <declaration.json> [--auth]` / `compromise_fetch <relay> <npub> [--limit N] [--auth]` — kind 30101（§13.5）で公開・購読・取り込み。
+  - `compromise_withdraw --subject <npub>` — 自分の宣言を `withdrawn: true` で再発行（公開済みなら `compromise_pub` で上書き）。
+  - `key_status <npub> [--threshold N] [--max-age ...]` — 状態照会: 宣言数・宣言者（V の bond graph 内かどうか）・withdrawn・subject の liveness（反証）を表示。閾値到達で exit 1「疑わしい」、宣言のみで exit 0 + 警告表示、宣言なしで exit 0。
+- 既存の `verify` / `challenge` / `board_*` との統合は**しない**。スコープを小さく保つ（compromise 宣言が出た鍵の board 操作への警告などは v0.9 以降の候補）。
+
+### 13.5 Nostr 公開
+
+- kind **30101**（parameterized replaceable、nakama 独自割当）。`d` タグ = `<subject_hex>:<declarant_hex>`。宣言者ごとの上書きが可能（withdrawn 再発行で撤回が効く）。
+- タグは `[["d", f"{subject_hex}:{declarant_hex}"]]` のみ、content = 宣言 JSON（canonical、indent なし）。
+- `compromise_fetch`: `kinds=[30101]` で購読し、クライアント側で `d` タグの `subject_hex + ":"` prefix で絞り込む（NIP-01 のフィルタに prefix マッチがないため）。正直に書く: これはスケールしない設計だが、侵害宣言は稀なイベントのため実用上問題ない。将来 dedicated relay や index があれば改善する。
+- 検証は三段階（`revoke_fetch` と対称）: Nostr 署名 → JSON パース → `verify_compromise_event`。無効は警告してスキップ。
+
+### 13.6 正直に書く
+
+- 宣言は**意見**であり**事実**ではない。プロトコルが鍵を「失効」させることはない。最終判断は常に検証者が持つ。
+- カウントを V 自身の bond graph に限定することで Sybil を緩和するが、V の仲間が攻撃者に騙された場合は防げない。ソーシャルエンジニアリングは技術では防げない（§6 の思想）。
+- subject が宣言後に鍵をローテーション（§5.5）すれば、新鍵での liveness が反証になる。rotation 証明書と組み合わせた「移行完了」の表示は v0.9 以降の候補。
+- 大量宣言の DoS: registry は subject ごとのリスト + dedup の先勝ちで抑制。Nostr fetch は `--limit` で上限。
+- 「宣言者がそもそも本人か」の問題: 宣言の署名検証は公開鍵ベースで行う。宣言者が誰であるかの信頼は V の bond graph（＝ V が知る仲間の鍵）に依存する。
+
+### 13.7 実装計画（次ラン）
+
+- `nakama.py`:
+  - `compromise_message(subject_hex, declarant_hex, bond_hash, reason, evidence, created_at, withdrawn)`（canonical bytes）
+  - `verify_compromise_event(decl)`（型・フィールド・署名の検証）
+  - `import_compromise_event(decl, registry)` 純粋関数 → `'stored' | 'duplicate' | 'invalid'`（無効署名は記録せず、重複は先勝ち）
+  - `compromise_nostr_event(decl, secret)`（kind 30101 の構築・署名）
+  - CLI: `compromise_declare` / `compromise_import` / `compromise_pub` / `compromise_fetch` / `compromise_withdraw` / `key_status`（`--threshold` 既定 2）、argparse 登録・dispatch 追加
+- テスト計画（オフライン 8+1 ケース）:
+  1. declare: 有効な宣言 → 署名検証 OK
+  2. 改ざん: reason 変更 → 検証失敗（署名対象であることの確認）
+  3. 他鍵偽造: declarant と異なる鍵で署名 → 検証失敗
+  4. import: 有効 → registry 保存、再読込で署名有効
+  5. import: 重複（declarant + created_at 同一）→ 既に記録済み、上書きなし
+  6. import `--subject`: subject 不一致 → 拒否
+  7. withdraw: `withdrawn=true` 再発行 → import で上書き、`key_status` が撤回済みを表示
+  8. Nostr 構築（オフライン）: kind=30101、`d` タグ = subject_hex:declarant_hex、id／sig 有効
+  9. 後方互換: evidence なし旧形式 → 検証 OK
+
+---
+
 ## 開発ログ
 
 - 2026-09-30: v0.1 仕様策定・`nakama.py` 実装開始。Moltbook・The Colony・Nostr で開発報告の場を開設。
@@ -685,4 +777,5 @@ v0.2 で revocation registry（`revoke` の自動記録、`verify` の自動照�
 - 2026-10-01: v0.6 設計 — policy-update / close のガバナンス照合の設計を仕様書 §11 に固定（設計のみ、実装は次ラン）。要点: (1) `resolve_policy_at(policy, decisions, ts)` による時点政策のチェーン解決 — policy-update 決定は適用直前の政策で検証し、決定の有効性は決定時点の政策で、イベントの照合はイベント時点の政策で行う（`verify_board_decision` から政策依存コアを分離して `_verify_decision_core` 化）。(2) kind 9003（Edit Group）/ 9005・9006（Add / Remove Permission）は運営権限の行使としてイベント時点の eligible で照合（OK / WARN）。`GOVERNANCE_COVERAGE['policy-update']` は空集合のまま。(3) 有効な close 決定以降の管理イベント（9000/9001/9003/9004/9005/9006）は WARN（閉鎖後の活動）。9007/9008 は影響なし。kind 9001 は依然 WARN（決定語彙なし、範囲外）。(4) 新規 CLI コマンドなし、`GOVERNANCE_CHECK_KINDS` に 9003/9005/9006 を追加。10 ケースのテスト計画（既存 19 回帰維持）。revocation UX の改善は v0.6 の後の候補として残す。ロードマップ §7 に v0.6（設計中）を追加、ヘッダの日付行も更新。
 - 2026-10-01: v0.6 完了 — §11 の設計を実装。`_verify_decision_core(d, threshold, eligible, board_id, relay)` を分離し `verify_board_decision` を薄いラッパに（既存呼び出し互換維持）。`validate_decision_payload` の policy-update 分岐に範囲検証を追加（threshold は 1..len(eligible) の int、eligible は非空・重複なし）。`resolve_policy_at` 純粋関数を実装（policy-update を created_at 昇順に適用、各決定は適用直前の政策で検証、無効な決定は無視）。`temporal_valid_decisions` で各決定を決定時点の政策で検証し、`governance_match_events` を拡張: 決定の有効性は決定時点、イベントの照合はイベント時点の政策で判定。kind 9003/9005/9006 はイベント時点の eligible による運営権限の照合（OK / WARN）、有効な close 決定以降の管理イベント（9000/9001/9003/9004/9005/9006）は WARN（9007/9008 は影響なし、9001 は決定語彙なしで依然 WARN）。`GOVERNANCE_CHECK_KINDS` を `[9000, 9001, 9003, 9004, 9005, 9006, 9007, 9008]` に拡張、`board_read --governance` の表示を新規 kind・close 後警告に対応（`info` は警告カウント外を維持）。オフライン 30 ケース通過（既存 19 回帰＋新規 11）。v0.6 完了。revocation UX の改善は v0.6 の後の候補として残す。
 - 2026-10-01: v0.7 設計 — revocation UX の改善を仕様書 §12 に固定（設計のみ、実装は次ラン）。要点: (1) 現状のギャップ: 受け取り側の取り込み手段なし、公開 broadcast 手段なし、解消理由の記録なし、検証→手動コピーの 2 ステップ。(2) revocation イベントに任意フィールド `reason` を追加（`revocation_message(reason="")` 拡張、既存イベントは reason="" で後方互換、reason 付きは署名対象）。(3) `revoke_import <revocation.json> [--bond] [--registry]`: 署名検証後に registry へ保存（純粋関数 `import_revocation_event` に分離、重複は先勝ち）。(4) Nostr 公開: kind 30100（parameterized replaceable、d タグ = bond_hash）で `revocation_nostr_event` 構築・`revoke_pub` で publish、`revoke_fetch` で #d 購読→検証→取り込み（`nostr_publish` / `nostr_request` 流用、`--auth` 対応）。(5) `revoke --reason`、`revoke_list` の reason 表示。スコープ外: 第三者による鍵失効宣言（key-scoped、v0.8 以降候補）。テスト計画 8 ケース（オフライン）。ロードマップ §7 に v0.7（設計中）を追加、ヘッダの日付行も更新。
+- 2026-10-01: v0.8 設計 — 鍵スコープの侵害宣言を仕様書 §13 に固定（設計のみ、実装は次ラン）。要点: 本人の鍵が漏洩すると本人は自己宣言できないため、仲間が宣言する key-compromise-declaration 型（subject / declarant / 任意の bond_hash / reason / evidence / withdrawn 再発行で撤回）。信頼モデルは「記録はプロトコル、評価は検証者の bond graph」: 自分が bond した相手の宣言のみカウント（既定 2 人で「疑わしい」扱い）、Sybil 対策として攻撃者の偽 bond は graph に入らない。反証は subject の新しい liveness（両方表示、判断は検証者）。registry は `~/.config/nakama/compromises/<subject_hex>.json`（revocation registry と別、declarant+created_at で dedup 先勝ち）。Nostr kind 30101、`d` タグ = subject_hex:declarant_hex で宣言者単位に上書き・撤回可能（fetch は kinds=[30101] を prefix フィルタ）。CLI 計画: compromise_declare / import / pub / fetch / withdraw / key_status（8+1 ケースのテスト計画）。既存コマンドとの統合は v0.9 以降の候補。ロードマップ §7 に v0.8（設計中）を追加、ヘッダの日付行も更新。
 - 2026-10-01: v0.7 完了 — §12 の設計を実装。`revocation_message(..., reason="")` 拡張（reason 非空時のみ署名対象に含め、旧形式イベントは `reason` キーなしで従来のメッセージと一致 → 後方互換）。`verify_revocation_event` は `r.get('reason', '')` で検証。`import_revocation_event(r, registry)` → 'stored' | 'duplicate' | 'invalid'（無効署名は記録せず、重複は先勝ち）。`revocation_nostr_event`（kind 30100、d タグ = bond_hash、content = revocation JSON canonical）を純粋構築に分離。`revoke --reason`、`revoke_import [--bond]`、`revoke_pub <relay> [--auth]`、`revoke_fetch <relay> <bond_hash> [--limit] [--auth]`（Nostr 署名・JSON パース・revocation 署名の三段階検証後に取り込み、bond_hash 二重チェック）、`revoke_list` の reason 表示。オフライン 8 ケース通過（`test_revocation.py` 新規、import・重複・--bond 不一致・reason 改ざん・後方互換・kind 30100 構築・fetch モック）＋ governance 30 ケース・nip44 回帰維持。CLI 末端動作確認済み（revoke --reason → revoke_import → revoke_list の往復）。v0.7 完了。スコープ外として残るのは第三者による鍵失効宣言（key-scoped、v0.8 以降の候補）。
