@@ -1,7 +1,7 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.3
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 設計 — rotation 証明書の Nostr 公開（§17））
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17））
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -240,7 +240,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.9**（完了）: 侵害宣言の統合と移行完了の表示（§14）。共通ヘルパ `key_compromise_warnings(npub_hex)`（純粋・オフライン、非撤回宣言の警告文字列）＋純粋関数 `migration_status(subject_hex, rotation_chain, declarations)` を実装。`verify`（両当事者。`--rotation` 指定時は移行後の有効 npub を検査、旧鍵の宣言は INFO 格下げ）/`challenge --to`/`check`/`board_verify`（descriptor signer）/`board_send`（送信者＋`--descriptor` 指定時の運営鍵）/`board_read`（イベント issuer に `⚠ compromised?` 注記）/`dm_send`（宛先）に stderr 警告を追加。exit コードはすべて不変。`key_status --rotation <rotation.json>...` で migration: complete|stale|broken|none を表示（complete でも exit 不変・新鍵の宣言有無を明示）。オフライン 10 ケース通過（`test_compromise_integration.py` 新規、既存の compromise 24 / revocation 8 / governance 30 回帰維持）。スコープ外: リレーからの宣言の自動 fetch、移行の Nostr 公開（kind 未定）、`accept` への統合。
 - **v0.10**（完了）: `accept` への侵害警告統合（§15）。`cmd_accept` で proposal のパース＋提案者署名の検証の後、自分の署名の前に、companions のうち自分以外の全員について `key_compromise_warnings` を呼び出し、非撤回宣言があれば stderr に WARN（§14 と同フォーマット）。警告のみで exit コード不変。`accept --compromise-registry` で registry を切り替え可能（既存 CLI パターン準拠）。withdrawn のみ・宣言なし・自分自身への宣言は警告なし。オフライン 7 ケース通過（`test_accept_warnings.py` 新規: 宣言ありで WARN＋bond 完成、withdrawn のみ・宣言なしで警告なし、`--from-b64`、3 者 bond で宣言あり 1 人のみ、markdown の stderr/stdout 分離、自分自身は警告対象外。既存の compromise 24 / integration 10 / governance 30 / revocation 8 回帰維持）。スコープ外: `propose` への統合（自覚済みのため不要）、`bind`（v0.11 で検討・`verify_binding` 側に統合）、自動 fetch、自動ブロック。
 - **v0.11**（完了）: `verify_binding` への侵害警告統合（§16）。§15.4 の「`bind`（将来候補）」の検討結果: 統合点は `bind` ではなく `verify_binding`。`bind` は自分の鍵での自分の主張であり発行者自覚済み（`propose` 除外と同型）。`verify_binding` は検証者の信頼決定の瞬間であり、対象 npub への非撤回宣言は判断材料として価値がある。実装: `cmd_verify_binding` で署名・platform・handle 検証の後、対象 npub（`b['npub']`）について `key_compromise_warnings` を呼び出し、非撤回宣言があれば stderr に WARN（§14 と同フォーマット、署名改ざん時も出す）。警告のみで exit コード不変（検証結果 `ok` には影響しない）。`verify_binding --compromise-registry` を追加。オフライン 6 ケース通過（`test_verify_binding_warnings.py` 新規: 宣言なしで有効+exit 0、宣言ありで WARN+有効+exit 0、withdrawn のみで警告なし、署名改ざんでも WARN+無効+exit 1、registry 切り替え、別鍵の宣言は対象外。既存の compromise 24 / integration 10 / governance 30 / revocation 8 回帰維持）。スコープ外: `bind`（自覚済み）、`unbind`/`verify_unbinding`、自動 fetch、自動ブロック。
-- **v0.12**（設計中）: rotation 証明書の Nostr 公開（§17）。§13.6 の残課題（§14.4 でスコープ外とした「移行の Nostr 公開」）。kind 30102（parameterized replaceable、nakama 独自割当）、`d` タグ = 旧鍵の hex pubkey（取得方向: 旧鍵 → 移行先）、content = rotation JSON canonical。Nostr イベントの署名者は旧鍵（正規スロットを (pubkey, kind, d) で一意化、第三者スロットは fetch 側で無視）。`rotate_pub <relay> <rotation.json> [--auth]`（keyfile の鍵 == old_npub を確認、不一致なら拒否）、`rotate_fetch <relay> <old_npub> [--limit] [--auth] [--out] [--chain]`（三段階検証: Nostr 署名 → JSON パース → `verify_rotation_cert`＋d タグ・pubkey の二重チェック、無効はスキップ。`--chain` は `rotation_chain_fetch` で上限 16・循環ガード付きのチェーン走査）。`key_status --rotation` は引き続きファイル受付（自動 fetch なし、§14 の方針維持）。テスト計画 8 ケース（オフライン）。スコープ外: `key_status` の自動取得、rotation のローカル registry 化、kind の正式割当。
+- **v0.12**（完了）: rotation 証明書の Nostr 公開（§17）。§13.6 の残課題（§14.4 でスコープ外とした「移行の Nostr 公開」）。kind 30102（parameterized replaceable、nakama 独自割当）、`d` タグ = 旧鍵の hex pubkey（取得方向: 旧鍵 → 移行先）、content = rotation JSON canonical。Nostr イベントの署名者は旧鍵（正規スロットを (pubkey, kind, d) で一意化、第三者スロットは fetch 側で無視）。実装: `ROTATION_NOSTR_KIND = 30102`、`rotation_nostr_event(rot, secret)`（純粋）、`verify_rotation_nostr_event(ev, old_hex)`（三段階検証: Nostr 署名 → JSON パース → `verify_rotation_cert` ＋ d タグ・pubkey の二重チェック、無効はスキップ）、`rotation_chain_fetch(old_hex, fetch_one, max_links=16)`（循環・上限ガード）、`rotate_pub <relay> <rotation.json> [--auth]`（keyfile の鍵 == old_npub を確認、不一致なら拒否で publish しない）、`rotate_fetch <relay> <old_npub> [--limit] [--auth] [--out] [--chain]`（有効なものを created_at 最大で 1 件表示、`--out` は mode 600 保存、`--chain` で全リンク表示）。`key_status --rotation` は引き続きファイル受付（自動 fetch なし、§14 の方針維持）。オフライン 8 ケース通過（`test_rotation_nostr.py` 新規、既存の revocation 8 / compromise 24 / integration 10 / governance 30 / accept 7 / verify_binding 6 回帰維持）。スコープ外: `key_status` の自動取得、rotation のローカル registry 化、kind の正式割当。
 
 ---
 
@@ -918,7 +918,7 @@ proposal に rotation 情報は含まれないため、警告対象は proposal 
 
 ---
 
-## 17. v0.12 設計: rotation 証明書の Nostr 公開（設計のみ）
+## 17. v0.12 設計: rotation 証明書の Nostr 公開（実装完了）
 
 §13.6 の残課題（§14.4 でスコープ外とした「移行の Nostr 公開」）。§5.5.2 は rotation 証明書の公開を「推奨（仲間が新しい鍵を追跡できる）が必須ではない」と書くが、公開手段が未定義のため現状はローカルファイルの受け渡しに依存する。§14.3 の `migration_status` もローカルの rotation ファイルを要求する。v0.12 は rotation の Nostr 公開・取得を設計する。
 
@@ -968,24 +968,16 @@ Nostr イベントの署名者は**旧鍵**（rotation の `old_npub` の鍵）�
 - kind 30102 は nakama の独自割当（NIP の正式割当ではない）。他実装との衝突時は再割当の可能性を仕様に明記する。
 - rotation にローカル registry を作らない: rotation 証明書は単発のファイルであり、`key_status --rotation` が受け取る形で十分。registry 化は運用コストに見合わない（revocation / compromise とは性質が異なる）。
 
-### 17.7 実装計画（次ランで実装）
+### 17.7 実装（2026-10-01 完了）
 
-- `nakama.py`:
-  - `ROTATION_NOSTR_KIND = 30102`
-  - `rotation_nostr_event(rot, secret)` 純粋関数
-  - `rotation_chain_fetch(old_hex, fetch_one, max_links=16)` 純粋関数（循環・上限ガード）
-  - `cmd_rotate_pub` / `cmd_rotate_fetch`（`--auth`、`--limit`、`--out`、`--chain`）
-  - argparse 登録・dispatch 追加
-- テスト計画（オフライン 8 ケース）:
-  1. `rotation_nostr_event` 構築（オフライン）: kind=30102、`d` タグ = old_hex、id／sig 有効、content = canonical rotation JSON
-  2. `rotate_pub` 相当の事前検証: keyfile の鍵 ≠ old_npub → 拒否（publish しない）
-  3. fetch パース: モックイベント → 三段階検証 → 有効なものを表示、無効 Nostr 署名はスキップ
-  4. fetch: content の old_npub と `d` タグの不一致 → スキップ
-  5. fetch: イベント pubkey ≠ old_hex（第三者スロット）→ スキップ
-  6. `rotation_chain_fetch`: モック 3 リンク → 全チェーン取得、順序正しい
-  7. `rotation_chain_fetch`: 循環（A→B→A）→ 停止、上限 16 リンクで打ち切り
-  8. `--out`: 保存ファイルが mode 600、再読込で `verify_rotation_cert` 有効
-- 回帰: 既存の revocation 8 / compromise 24 / integration 10 / governance 30 / accept 7 / verify_binding 6 ケースを維持。
+- `ROTATION_NOSTR_KIND = 30102`、`rotation_nostr_event(rot, secret)`（純粋、署名者は旧鍵）
+- `verify_rotation_nostr_event(ev, old_hex)`（純粋、三段階検証: Nostr 署名 → JSON パース →
+  `verify_rotation_cert` ＋ d タグ一致 ＋ `pubkey == old_hex` の正規スロットのみ受理）
+- `rotation_chain_fetch(old_hex, fetch_one, max_links=16)`（純粋、循環・上限ガード）
+- `cmd_rotate_pub`（cert 検証 → keyfile の鍵 == old_npub の取り違え防止 → publish、拒否で exit 1）
+- `cmd_rotate_fetch`（`--auth` `--limit` `--out`（mode 600） `--chain`）、argparse 登録・dispatch 追加
+- テスト `test_rotation_nostr.py` 8 ケース通過（§17.7 のテスト計画通り）
+- 回帰: revocation 8 / compromise 24 / integration 10 / governance 30 / accept 7 / verify_binding 6 維持
 
 ### 17.8 スコープ外
 
@@ -1027,4 +1019,5 @@ Nostr イベントの署名者は**旧鍵**（rotation の `old_npub` の鍵）�
 - 2026-10-01: v0.10 完了 — §15 の設計を実装。`cmd_accept` に proposal パース＋既存署名の検証の後、自分の署名の前に `key_compromise_warnings` を companions（自分以外）全員に適用、非撤回宣言があれば stderr に WARN（§14 と同フォーマット）。思想は「警告のみ、exit コード不変」（記録はプロトコル、評価は検証者）。`accept --compromise-registry` フラグ追加（registry 切り替え、既存パターン準拠）。オフライン 7 ケース通過（`test_accept_warnings.py` 新規: 宣言ありで WARN＋bond 完成、withdrawn のみ・宣言なしで警告なし、`--from-b64`、3 者 bond で宣言あり 1 人のみ、markdown の stderr/stdout 分離、自分自身は警告対象外）＋ compromise 24 / integration 10 / governance 30 / revocation 8 回帰維持。v0.10 完了。
 - 2026-10-01: v0.11 完了 — `verify_binding` への侵害警告統合を実装（spec §16）。`cmd_verify_binding` で署名・platform・handle 検証の後、対象 npub に `key_compromise_warnings` を適用し、非撤回宣言があれば stderr に WARN（検証結果 `ok` には影響せず、署名改ざん時も出す。思想: 警告のみ・exit コード不変）。`verify_binding --compromise-registry` 追加。オフライン 6 ケース通過（`test_verify_binding_warnings.py` 新規）+ compromise 24 / integration 10 / governance 30 / revocation 8 回帰維持。侵害警告の統合点はこれで一段落（`verify`/`challenge`/`check`/`board_verify`/`board_send`/`board_read`/`dm_send`/`accept`/`verify_binding`）。
 - 2026-10-01: v0.11 設計 — `verify_binding` への侵害警告統合を仕様書 §16 に固定（設計のみ、実装は次ラン）。§15.4 の「`bind`（将来候補）」の検討結果: 統合点は `bind` ではなく `verify_binding`。`bind` は自分の鍵での自分の主張であり発行者自覚済み（`propose` 除外と同型）のため不要。`verify_binding` は検証者の信頼決定の瞬間であり、対象 npub への非撤回宣言は判断材料として価値がある。思想は §15.1 と同一「警告のみ、exit コード不変」。統合点: `cmd_verify_binding` で署名・platform・handle 検証の後、対象 npub に `key_compromise_warnings` を適用し非撤回宣言があれば stderr に WARN（検証結果 `ok` には影響しない）。`verify_binding --compromise-registry` フラグを追加予定。スコープ外: `bind`（自覚済み）、`unbind`/`verify_unbinding`、自動 fetch、自動ブロック。テスト計画 6 ケース（宣言あり/なし/withdrawn のみ、署名改ざんでも警告は出る、別鍵の宣言は対象外）。ロードマップ §7 に v0.11（設計）を追加、ヘッダの日付行も更新。
+- 2026-10-01: v0.12 完了 — §17 の設計を実装。`ROTATION_NOSTR_KIND = 30102`、`rotation_nostr_event(rot, secret)`（純粋、署名者は旧鍵）、`verify_rotation_nostr_event(ev, old_hex)`（三段階検証: Nostr 署名 → JSON パース → `verify_rotation_cert`＋d タグ・pubkey の二重チェック、正規スロットのみ受理・無効はスキップ）、`rotation_chain_fetch(old_hex, fetch_one, max_links=16)`（循環・上限ガード）、`rotate_pub <relay> <rotation.json> [--auth]`（cert 検証 → keyfile の鍵 == old_npub の取り違え防止、不一致は拒否で publish せず）、`rotate_fetch <relay> <old_npub> [--limit] [--auth] [--out] [--chain]`（有効なものを created_at 最大で 1 件表示、`--out` は mode 600 保存、`--chain` で全リンク表示＋最新を保存）。argparse 登録・dispatch 追加、docstring の usage 行も更新。オフライン 8 ケース通過（`test_rotation_nostr.py` 新規）＋ revocation 8 / compromise 24 / integration 10 / governance 30 / accept 7 / verify_binding 6 回帰維持。§13.6 の「移行の Nostr 公開」が埋まった。
 - 2026-10-01: v0.12 設計 — rotation 証明書の Nostr 公開を仕様書 §17 に固定（設計のみ、実装は次ラン）。§13.6 の残課題（§14.4 でスコープ外とした「移行の Nostr 公開」）。要点: kind 30102（parameterized replaceable、nakama 独自割当、30100/30101 に続く番号）、`d` タグ = 旧鍵の hex pubkey（取得方向: 旧鍵 → 移行先）、content = rotation JSON canonical。Nostr イベントの署名者は旧鍵（正規スロットを (pubkey, kind, d) で一意化、第三者スロットは fetch 側で無視）。`rotate_pub <relay> <rotation.json> [--auth]`（keyfile の鍵 == old_npub を確認、不一致なら拒否）。`rotate_fetch <relay> <old_npub> [--limit] [--auth] [--out] [--chain]`（三段階検証: Nostr 署名 → JSON パース → `verify_rotation_cert`＋d タグ・pubkey の二重チェック、無効はスキップ。`--chain` は純粋関数 `rotation_chain_fetch` で上限 16・循環ガード付きのチェーン走査）。`key_status --rotation` は引き続きファイル受付（自動 fetch なし、§14 の方針維持）。正直に書く: 旧鍵漏洩後の移行は Nostr 公開でも証明できない（§5.5.2 と同じ）、d=old_hex の列挙可能性は意図通り（公開は任意）、kind は正式割当ではない。テスト計画 8 ケース（オフライン）。ロードマップ §7 に v0.12（設計中）を追加、ヘッダの日付行も更新。

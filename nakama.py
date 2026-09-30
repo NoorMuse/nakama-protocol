@@ -15,6 +15,9 @@
   nakama.py check <npub> <nonce-hex> <sig-hex>       署名を検証（対手の侵害宣言を警告 §14.2）
   nakama.py rotate --gen|--to-hex HEX [--to-keyfile P]  鍵ローテーション: 旧鍵が新鍵に署名した rotation 証明書を発行
   nakama.py verify_rotation <rotation.json>          rotation 証明書を検証
+  nakama.py rotate_pub <relay> <rotation.json> [--auth]  rotation 証明書を Nostr に公開（kind 30102、d タグ = old_hex）
+  nakama.py rotate_fetch <relay> <old_npub> [--limit N] [--auth] [--out FILE] [--chain]
+      公開された rotation 証明書を購読・追跡（--chain: new→old のチェーン全体をたどる）
   nakama.py revoke <bond.json> [--reason 理由]        bond の解消 (revocation イベント) を署名して発行
   nakama.py verify_revocation <revocation.json> --bond <bond.json>  解消イベントを検証
   nakama.py revoke_import <revocation.json> [--bond <bond.json>]  受け取った revocation を検証して registry に取り込む
@@ -367,6 +370,155 @@ def cmd_verify_rotation(args):
     else:
         print('rotation は無効です')
         sys.exit(1)
+
+
+# --- v0.12: rotation 証明書の Nostr 公開（spec §17） ---
+# §12 の revoke_pub パターン（kind 30100）を流用。Nostr の既存リレーヘルパ
+# （nostr_publish / nostr_request / --auth）をそのまま使い、kind 30102 を定義する。
+
+ROTATION_NOSTR_KIND = 30102
+
+
+def rotation_nostr_event(rot: dict, secret: bytes) -> dict:
+    """rotation 証明書を Nostr 公開用イベント (kind 30102) として構築・署名する（純粋）。
+
+    kind 30102 は parameterized replaceable: d タグ = old_hex。イベントの署名者は
+    旧鍵（正規スロット (pubkey, kind, d) を一つに定める。§17.3）。
+    """
+    content = json.dumps(rot, sort_keys=True, separators=(',', ':'))
+    old_hex = npub_to_hex(rot['old_npub'])
+    return sign_event(secret, int(time.time()), ROTATION_NOSTR_KIND,
+                      [['d', old_hex]], content)
+
+
+def verify_rotation_nostr_event(ev: dict, old_hex: str) -> dict | None:
+    """Nostr イベントから rotation 証明書を取り出す三段階検証（純粋）。
+
+    1. Nostr イベント署名の検証
+    2. content の JSON パース
+    3. verify_rotation_cert（旧鍵署名）＋ d タグ / cert の old_hex の一致
+       ＋イベント pubkey == old_hex（正規スロットのみ受理、第三者スロットは無視）
+    受理なら rotation dict、無効なら None。"""
+    if not verify_event_sig(ev):
+        return None
+    try:
+        r = json.loads(ev['content'])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(r, dict):
+        return None
+    try:
+        content_old_hex = npub_to_hex(r['old_npub'])
+    except Exception:
+        return None
+    if content_old_hex != old_hex:
+        return None  # 指定の旧鍵と関係ない証明書（リレーのフィルタが緩い場合の二重チェック）
+    dtags = [t[1] for t in ev.get('tags', []) if len(t) >= 2 and t[0] == 'd']
+    if old_hex not in dtags:
+        return None  # d タグと content の old_hex の不一致
+    if ev.get('pubkey') != old_hex:
+        return None  # 正規スロットのみ受理
+    if not verify_rotation_cert(r):
+        return None
+    return r
+
+
+def rotation_chain_fetch(old_hex: str, fetch_one, max_links: int = 16) -> list:
+    """rotation チェーンをたどる（純粋、I/O なし）。
+
+    fetch_one(hex) -> rotation dict | None（その old_hex に対する最新の有効証明書）。
+    戻り値は古い順の rotation list。循環検出と上限 max_links で停止する。
+    """
+    chain = []
+    seen = {old_hex}
+    cur = old_hex
+    for _ in range(max_links):
+        r = fetch_one(cur)
+        if r is None:
+            break
+        try:
+            new_hex = npub_to_hex(r['new_npub'])
+        except Exception:
+            break
+        if new_hex in seen:
+            break  # 循環（自己ループ含む）
+        chain.append(r)
+        seen.add(new_hex)
+        cur = new_hex
+    return chain
+
+
+def cmd_rotate_pub(args):
+    """rotation 証明書を Nostr リレーに publish (kind 30102, d タグ = old_hex)。署名者は旧鍵。"""
+    secret = load_key(args.keyfile)
+    with open(args.rotation) as f:
+        rot = json.load(f)
+    assert rot.get('protocol') == 'nakama' and rot.get('version') == 1 and rot.get('type') == 'rotation', \
+        'nakama v1 の rotation ではありません'
+    if not verify_rotation_cert(rot):
+        print('rotation は無効です（publish しません）', file=sys.stderr)
+        sys.exit(1)
+    me = npub_of(secret)
+    if me != rot['old_npub']:
+        print('keyfile の鍵は rotation の old_npub と一致しません（鍵の取り違え防止のため publish しません）',
+              file=sys.stderr)
+        sys.exit(1)
+    ev = rotation_nostr_event(rot, secret)
+    accepted, reason = nostr_publish(args.relay, ev, auth_secret=secret if args.auth else None)
+    print(f'publish: {"受理" if accepted else "拒否"} ({reason}) id={ev["id"]}')
+    sys.exit(0 if accepted else 1)
+
+
+def cmd_rotate_fetch(args):
+    """old_npub に対する rotation 公開イベント (kind 30102, #d=old_hex) を購読し、有効なものを表示する。"""
+    secret = load_key(args.keyfile)
+    try:
+        old_hex = npub_to_hex(args.old_npub)
+    except Exception:
+        print('npub は有効ではありません', file=sys.stderr)
+        sys.exit(1)
+
+    def fetch_one(target_hex):
+        filt = {'kinds': [ROTATION_NOSTR_KIND], '#d': [target_hex], 'limit': args.limit}
+        sub_id = secrets.token_hex(8)
+        events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=secret if args.auth else None)
+        best = None
+        skipped = 0
+        for ev in events:
+            r = verify_rotation_nostr_event(ev, target_hex)
+            if r is None:
+                skipped += 1
+            elif best is None or r['created_at'] > best['created_at']:
+                best = r
+        return best, skipped, len(events)
+
+    if args.chain:
+        chain = rotation_chain_fetch(old_hex, lambda h: fetch_one(h)[0])
+        if not chain:
+            print('rotation 公開イベントは見つかりませんでした')
+            return
+        for i, r in enumerate(chain):
+            print(f'[{i}] {r["old_npub"][:16]}... → {r["new_npub"][:16]}...'
+                  f' (created_at {time.strftime("%Y-%m-%d", time.localtime(r["created_at"]))})')
+        if args.out:
+            with open(args.out, 'w') as f:
+                json.dump(chain[-1], f, indent=2)
+            os.chmod(args.out, 0o600)
+            print(f'最新の rotation を {args.out} に保存しました（mode 600）')
+        return
+
+    best, skipped, total = fetch_one(old_hex)
+    if best is None:
+        print(f'{total} 件のイベントを取得: 有効な rotation 公開はありませんでした（{skipped} 件をスキップ）')
+        return
+    print(f'rotation 公開: {best["old_npub"][:16]}... → {best["new_npub"][:16]}...'
+          f' (created_at {time.strftime("%Y-%m-%d", time.localtime(best["created_at"]))})')
+    print(f'{total} 件のイベントを取得: 有効 1 件、スキップ {skipped} 件')
+    if args.out:
+        with open(args.out, 'w') as f:
+            json.dump(best, f, indent=2)
+        os.chmod(args.out, 0o600)
+        print(f'rotation を {args.out} に保存しました（mode 600）')
 
 
 def bond_hash(b: dict) -> str:
@@ -2403,6 +2555,13 @@ def main():
     s.add_argument('--to-keyfile', default=os.path.expanduser('~/.config/nakama/identity.json.rotated'))
     s.add_argument('--out')
     s = sub.add_parser('verify_rotation'); s.add_argument('rotation')
+    s = sub.add_parser('rotate_pub'); s.add_argument('relay'); s.add_argument('rotation')
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s = sub.add_parser('rotate_fetch'); s.add_argument('relay'); s.add_argument('old_npub')
+    s.add_argument('--limit', type=int, default=20)
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s.add_argument('--out', default=None, help='rotation JSON を mode 600 で保存（key_status --rotation に渡せる）')
+    s.add_argument('--chain', action='store_true', help='new_npub を次の old としてチェーン全体をたどる')
     s = sub.add_parser('revoke'); s.add_argument('bond'); s.add_argument('--out')
     s.add_argument('--reason', default='', help='解消理由（署名付きで記録、任意）')
     s.add_argument('--registry', default=None, help='revocation registry ディレクトリ (既定: ~/.config/nakama/revocations)')
@@ -2512,7 +2671,8 @@ def main():
      'accept': cmd_accept, 'verify': cmd_verify, 'renew': cmd_renew,
     'challenge': cmd_challenge,
      'respond': cmd_respond, 'check': cmd_check, 'rotate': cmd_rotate,
-     'verify_rotation': cmd_verify_rotation, 'revoke': cmd_revoke,
+     'verify_rotation': cmd_verify_rotation, 'rotate_pub': cmd_rotate_pub,
+     'rotate_fetch': cmd_rotate_fetch, 'revoke': cmd_revoke,
      'verify_revocation': cmd_verify_revocation, 'revoke_list': cmd_revoke_list,
      'revoke_import': cmd_revoke_import, 'revoke_pub': cmd_revoke_pub,
      'revoke_fetch': cmd_revoke_fetch,
