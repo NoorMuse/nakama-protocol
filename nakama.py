@@ -70,6 +70,8 @@
       決定前の草案を Nostr に公開（kind 30104、d タグ = コアハッシュ。署名者は publisher。各承認者が自分のスロットに再公開する方式 B）
   nakama.py board_draft_fetch <relay> <board_id> [--limit N] [--auth] [--out DIR] [--policy POLICY]
       公開された草案を購読・検証・マージして表示（--out: <core_hash>.json で保存 — board_cosign にそのまま渡せる、--policy: 草案の threshold 充足・不足の表示）
+  nakama.py board_fetch_all <relay> <board_id> [--limit N] [--auth] [--out DIR] [--policy POLICY]
+      30103+30104 を 1 回の REQ で購読し同一コアの草案・完成を統合表示（--out: 内部マーカーを剥がした <core_hash>.json、--policy: 成立済みは時点解決・草案は現行政策のみで threshold 表示）
 """
 import argparse, base64, hashlib, json, os, re, secrets, sys, time
 
@@ -2577,6 +2579,103 @@ def cmd_board_draft_fetch(args):
               '（board_cosign で追記 → board_draft_pub にそのまま渡せます）')
 
 
+def cmd_board_fetch_all(args):
+    """board の決定公開イベントを kind 横断 (30103+30104) で 1 回の REQ で購読し、
+    同一コアの草案・完成を統合表示する（spec §22）。
+
+    board_decide_fetch / board_draft_fetch は残し、これは統合ビュー。検証は
+    verify_board_decision_nostr_event(ev, board_id, expect_kind=ev['kind']) で
+    kind ホワイトリスト {30103, 30104} のみ受理。検証済み決定のコピーに
+    nostr_kind を付与して merge_decision_approvals に渡し（新規純粋関数なし）、
+    merged レコードに finalized（30103 を含むか）を付記する。
+    --policy: 成立済みは fetch 集合内の 30103 決定で時点解決（§20.2）、
+    草案は現行政策のみ（§21.5）。--out は内部マーカーを剥がしたプレーン決定
+    JSON を <core_hash>.json で保存（board_cosign / board_read --governance
+    --decisions 互換。fetch 時点のスナップショット）。
+    """
+    secret = load_key(args.keyfile)
+    policy = None
+    if getattr(args, 'policy', None):
+        try:
+            with open(args.policy) as f:
+                policy = json.load(f)
+        except Exception as e:
+            print(f'policy ファイルの読み込みに失敗しました: {e}', file=sys.stderr)
+            sys.exit(1)
+        if not verify_board_policy_cert(policy):
+            print('policy の検証に失敗しました（n-of-n 署名が無効）', file=sys.stderr)
+            sys.exit(1)
+        if policy.get('board_id') != args.board_id:
+            print('policy の board_id が取得対象の board_id と一致しません',
+                  file=sys.stderr)
+            sys.exit(1)
+    kinds = [DECISION_NOSTR_KIND, DRAFT_NOSTR_KIND]
+    filt = {'kinds': kinds, '#h': [args.board_id], 'limit': args.limit}
+    sub_id = secrets.token_hex(8)
+    events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=secret if args.auth else None)
+    valid, skipped = [], 0
+    for ev in events:
+        if ev.get('kind') not in (DECISION_NOSTR_KIND, DRAFT_NOSTR_KIND):
+            skipped += 1
+            continue
+        d = verify_board_decision_nostr_event(ev, args.board_id,
+                                              expect_kind=ev['kind'])
+        if d is None:
+            skipped += 1
+        else:
+            dc = dict(d)  # 入力の破壊なし
+            dc['nostr_kind'] = ev['kind']
+            valid.append(dc)
+    # kind 横断マージ: merge_decision_approvals は余分なキーを無視して
+    # コアハッシュ単位で approvals を npub dedup 統合する（§19.4）。
+    kinds_by_core = {}
+    for dc in valid:
+        kinds_by_core.setdefault(decision_core_hash(dc), set()).add(dc['nostr_kind'])
+    merged = merge_decision_approvals(valid)
+    for rec in merged:
+        rec['finalized'] = DECISION_NOSTR_KIND in kinds_by_core[decision_core_hash(rec)]
+    if not merged:
+        print(f'{len(events)} 件のイベントを取得: 有効な決定（30103/30104）はありませんでした（{skipped} 件をスキップ）')
+        return
+    if policy is not None:
+        print('threshold 表示は取得できた決定に基づく暫定です'
+              '（権威ある判定は board_read --governance）')
+        if any(not r.get('finalized') for r in merged):
+            print('草案（回覧中）の threshold 表示は取得できた草案に基づく暫定です'
+                  '（草案は成立の証拠ではありません — 成立の公開宣言は kind 30103）')
+    finalized_only = [r for r in merged if r.get('finalized')]
+    for rec in merged:
+        ca = time.strftime('%Y-%m-%d', time.localtime(rec['created_at']))
+        core = decision_core_hash(rec)
+        tag = '成立済み' if rec['finalized'] else '草案（回覧中）'
+        if policy is None:
+            print(f'[{tag} {core}] {rec["decision"]}'
+                  f' (created_at {ca}, approvals {len(rec.get("approvals", []))} つ)')
+        elif rec['finalized']:
+            ok, n, m = fetch_threshold_status(rec, policy, finalized_only)
+            status = '充足' if ok else '不足'
+            print(f'[{tag} {core}] {rec["decision"]}'
+                  f' (created_at {ca}, approvals {n} つ, threshold {n}/{m} {status})')
+        else:
+            ok, n, m = fetch_threshold_status(rec, policy, [])
+            status = '充足（成立可能 — board_decide_pub で成立公開）' if ok else '不足'
+            print(f'[{tag} {core}] {rec["decision"]}'
+                  f' (created_at {ca}, approvals {n} つ, 草案: threshold {n}/{m} {status})')
+    print(f'{len(events)} 件のイベントを取得: 有効 {len(valid)} 件、スキップ {skipped} 件、'
+          f'マージ後 {len(merged)} 件')
+    if args.out:
+        os.makedirs(args.out, exist_ok=True)
+        for rec in merged:
+            plain = {k: v for k, v in rec.items()
+                     if k not in ('nostr_kind', 'finalized')}
+            path = os.path.join(args.out, f'{decision_core_hash(plain)}.json')
+            with open(path, 'w') as f:
+                json.dump(plain, f, indent=2, ensure_ascii=False)
+        print(f'{len(merged)} 件の決定を {args.out}/ に保存しました'
+              '（board_read --governance --decisions / board_cosign にそのまま渡せます。'
+              'fetch 時点のスナップショット — 草案の approvals は増える可能性があります）')
+
+
 # --- v0.4: ガバナンス照合 (spec §9.4: board_read --governance) ---
 
 # 決定種別 → その決定が正当化できる NIP-29 管理イベントの kind。
@@ -3049,6 +3148,11 @@ def main():
     s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
     s.add_argument('--out', default=None, help='草案 JSON を <core_hash>.json で保存（board_cosign にそのまま渡せる）')
     s.add_argument('--policy', default=None, help='運営規約 JSON（指定時のみ各草案の threshold 充足・不足を「草案」マーカーつきで表示）')
+    s = sub.add_parser('board_fetch_all'); s.add_argument('relay'); s.add_argument('board_id')
+    s.add_argument('--limit', type=int, default=20)
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s.add_argument('--out', default=None, help='決定 JSON を <core_hash>.json で保存（内部マーカーを剥がしたプレーン決定 — board_read --governance --decisions / board_cosign に渡せる）')
+    s.add_argument('--policy', default=None, help='運営規約 JSON（指定時のみ各決定の threshold 充足・不足を表示。成立済みは時点解決、草案は現行政策のみ）')
 
     args = ap.parse_args()
     {'init': cmd_init, 'whoami': cmd_whoami, 'propose': cmd_propose,
@@ -3077,7 +3181,8 @@ def main():
      'board_decide_pub': cmd_board_decide_pub,
      'board_decide_fetch': cmd_board_decide_fetch,
      'board_draft_pub': cmd_board_draft_pub,
-     'board_draft_fetch': cmd_board_draft_fetch}[args.cmd](args)
+     'board_draft_fetch': cmd_board_draft_fetch,
+     'board_fetch_all': cmd_board_fetch_all}[args.cmd](args)
 
 
 if __name__ == '__main__':
