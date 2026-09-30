@@ -1,7 +1,7 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.3
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21）。v0.17 完了 — 30103+30104 横断 fetch の統合（§22）。v0.18 完了 — fetch 時点の政策スナップショットの保存（§23））
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21）。v0.17 完了 — 30103+30104 横断 fetch の統合（§22）。v0.18 完了 — fetch 時点の政策スナップショットの保存（§23））。v0.19 設計中 — 草案の期限（§24）
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -247,6 +247,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.16**（完了）: cosign 回覧（決定前）の Nostr 化（§21）。kind 30104（parameterized replaceable、nakama 独自割当）、`d` タグ = `decision_core_hash(d)`（30103 と同一コアで草案→完成を対応付け）、`h` タグ = board_id。方式 B: 各承認者が cosign した版を自分の (publisher, 30104, d) スロットに再公開し、fetch 側で `merge_decision_approvals` が統合（approvals の出所保持・last-writer-wins 競合なし）。`board_decision_nostr_event` を kind パラメータ化（`decision_nostr_event(d, secret, kind)`、既定値で互換維持。旧名は薄いラッパー）、`verify_board_decision_nostr_event(ev, board_id, expect_kind)` に kind チェック追加。`board_draft_pub` / `board_draft_fetch [--policy]`（30104、threshold 表示は §20 と同一ロジック＋「草案（回覧中）」マーカー。草案の時点解決は現行政策のみ — policy-update 決定の草案化は対象外）。承認フローは既存コマンドの組み合わせ（fetch --out → board_cosign → board_draft_pub、新規 cosign コマンドなし）。成立の公開宣言は kind 30103 の publish。オフライン 8 ケース通過（`test_draft_nostr.py` 新規）＋ governance 30 / revocation 8 / compromise 24 / integration 10 / accept 7 / verify_binding 6 / rotation 8 / remove 10 / board_decision_nostr 10 / board_decision_fetch_policy 8 回帰維持。スコープ外: fetch 統合、自動通知、草案の期限、kind の正式割当、policy-update 決定の草案化。
 - **v0.17**（完了）: 30103+30104 横断 fetch の統合（§22）。§21.8 のスコープ外項目を昇格: 新規コマンド `board_fetch_all <relay> <board_id> [--limit] [--auth] [--policy] [--out]` が 1 回の REQ で kinds=[30103, 30104] を #h=[board_id] 購読し、kind 横断で approvals をマージ（npub dedup、§19 と同一意味論）、30103 含むコアは「成立済み」・30104 のみは「草案（回覧中）」と状態表示。検証は `expect_kind=ev['kind']`（kind ホワイトリスト {30103, 30104} 以外はスキップ）。--policy の threshold 表示は成立済み（fetch 集合内の 30103 決定で時点解決）と草案（現行政策のみ、§21.5）で意味論を分離。--out は内部マーカー（nostr_kind / finalized）を剥がしたプレーン決定 JSON で board_cosign / board_read --governance 互換（fetch 時点のスナップショットの正直な注記つき）。既存の 2 fetch コマンドは維持（単目的ツールとして置き換えない）。新規純粋関数なし。オフライン 8 ケース通過（`test_fetch_all.py` 新規: 混在 fetch＋他 kind スキップ＋単一 REQ、横断マージ、finalized 判定、--policy 表示、草案→成立統合、expect_kind チェック、--out プリーン保存、無効イベントスキップ）＋全回帰維持。スコープ外: 2 fetch の廃止、自動通知、草案の期限、kind 正式割当、政策スナップショットの保存。
 - **v0.18**（完了）: fetch 時点の政策スナップショットの保存（§23）。§22.7 のスコープ外項目を昇格。`save_policy_snapshot(out_dir, policy)` ヘルパを追加し、`board_decide_fetch` / `board_draft_fetch` / `board_fetch_all` の 3 コマンドで `--out` と `--policy` の両指定時のみ、検証済みの board-policy を `policy-snapshot-<unixts>.json` としてコピー保存（決定ファイル `<core_hash>.json` とは prefix で区別、board_cosign / board_read --governance --decisions 運用と共存）。検証者はこのファイルを `--policy` に再指定して fetch 時点の threshold 判定を再現できる（§20.2 の時点解決も同一ファイルから再実行で同一結果）。スコープ外（残る）: 草案の期限、草案への自動通知（DM 連携）、kind 30103 / 30104 の正式割当申請。オフライン 12 ケース通過（`test_policy_snapshot.py` 新規）＋全回帰維持。
+- **v0.19**（設計中）: 草案の期限（§24）。§22.7 のスコープ外項目を昇格: 決定 payload の任意フィールド `expires_at`（unix 時刻、署名対象 — 期限の異なる再発行は別コア＝別 d スロット）。3 層の強制: `board_cosign` は期限切れ草案への署名を拒否（exit 1、ゾンビ草案対策の主軸）、`board_draft_pub` は期限切れ草案の publish を拒否（exit 1）、`board_draft_fetch` / `board_fetch_all` は期限切れ草案に `[期限切れ]` マーカー（表示のみ、exit 不変）。期限は草案（30104）のみ — 成立済み（30103）は §20 の不変性ルールの下で恒久的、`board_read --governance` は期限を見ない。期限判定は純粋関数 `draft_is_expired(d, now)` に分離。期限なし草案は従来通り無期限（後方互換）。正直に書く: 期限は自己申告（正直な運用者のための仕組み、攻撃者の制約ではない）、期限切れスロットはリレー上に残る（削除はしない）。テスト計画 11 ケース（オフライン）、回帰維持。スコープ外: 自動通知、kind 正式割当、bond/rotation/revocation への期限、期限切れスロットの自動削除。
 
 ---
 
@@ -1355,7 +1356,7 @@ nakama.py board_fetch_all <relay> <board_id> [--limit N] [--auth] [--policy <pol
 
 - 既存 2 fetch コマンドの廃止（単目的ツールとして維持）。
 - 草案への自動通知（DM 連携）— 将来候補（§21.8 から据え置き）。
-- 草案の期限（expiry）— 将来候補。
+- ~~草案の期限（expiry）— 将来候補。~~→ v0.19 で設計（§24）。
 - kind 30103 / 30104 の正式割当申請。
 - ~~fetch 時点の政策スナップショットの保存（--policy の検証者入手前提は維持）。~~→ v0.18 で設計＋実装（§23）。
 
@@ -1378,6 +1379,58 @@ nakama.py board_fetch_all <relay> <board_id> [--limit N] [--auth] [--policy <pol
 - `nakama.py`: `save_policy_snapshot` ヘルパ追加。各 fetch コマンドの `if args.out:` ブロック内で決定保存の後に `if policy is not None:` で呼び出し＋保存通知を表示（stderr ではなく stdout、exit コード不変）。3 コマンドの docstring・usage の説明行も更新。
 - `test_policy_snapshot.py` 新規 12 ケース通過（3 コマンド × --out+--policy で保存・内容同一、再指定で threshold 判定再現、--out のみ/--policy のみでは保存なし、prefix による決定ファイルとの区別、ヘルパ単体）。
 - 回帰: 既存全スイート維持（accept / fetch_policy 8 / decision_nostr 10 / compromise 24+10 / draft 8 / governance 30 / remove 10 / revocation 8 / rotation 8 / verify_binding 6）。
+
+---
+
+## 24. v0.19 設計: 草案の期限（設計固定・実装は次ラン）
+
+§22.7 のスコープ外「草案の期限（expiry）」を昇格。草案（kind 30104）の回覧は現在、誰かが明示的に破棄しない限り無限に続く。古い草案に後から cosign が集まり、意図しないタイミングで threshold を満たして 30103 として publish される可能性がある（「ゾンビ草案」）。期限は草案の発行者の宣言であり、回覧の寿命を明示する。
+
+### 24.1 形式
+
+- 決定 payload の**任意フィールド** `expires_at`: unix timestamp（int）。署名対象（canonical payload に含まれる — §19 の `decision_core_hash` は payload を含むため、期限の異なる再発行は別コア＝別 d スロット。意図的な設計）。
+- `board_decide --expires-in <秒>` / `--expires-at <unix時刻>`: 両指定時は `--expires-at` を優先。`--expires-in` は `created_at + 秒` で換算。
+- `validate_decision_payload`: `expires_at` が存在する場合は int であることを要求（非 int は拒否で exit 1）。期限なし（キーなし）は引き続き有効 — 後方互換。
+- `board_decide` は `expires_at <= created_at` を拒否（exit 1、clean fail）。生まれてすぐ死ぬ草案は作らせない。ただし過去時刻の草案 JSON を手で書くことは防げない（検証側の表示で対処 — §24.2）。
+
+### 24.2 強制の所在（3 層）
+
+1. **cosign 側（正直な運用者向けの安全弁）**: `board_cosign` は `expires_at <= now` の決定への署名を拒否（exit 1）。期限切れ草案に新しい承認を集めさせない。これがゾンビ草案対策の主軸。
+2. **publish 側**: `board_draft_pub` は `expires_at <= now` の草案の publish を拒否（exit 1）。期限切れのものをリレーに置かない。
+3. **fetch 側（表示のみ）**: `board_draft_fetch` / `board_fetch_all` は期限切れの草案に `[期限切れ]` マーカーを表示。threshold 表示は維持（情報表示）。exit コード不変。
+
+設計判断の記録:
+- **期限は草案（30104）のみ。成立済み（30103）には適用しない**。成立は `§20` の不変性ルール（決定の撤回・無効化なし）の下で恒久的。`board_decide_pub` は期限を検査しない — 期限は「この草案への追加承認は expires_at まで」という回覧の寿命の宣言であり、成立後の決定の有効期限ではない。fetch_all で同一コアに期限切れ 30104 と 30103 が混在した場合は「成立済み」表示が優先（期限は草案フェーズを殺しただけ）。
+- **期限切れ草案の再発行は新規草案**。`expires_at` を延ばしたければ `board_decide` で作り直し（別コア・別 d スロット）。古いスロットは parameterized replaceable の仕組みで上書き**しない**（d が異なるため別スロット）— 期限切れスロットはリレー上に残るが、fetch 側の `[期限切れ]` マーカーで死んでいることが可視化される。リレー側の削除は行わない（正直に書く: リレーは保持ポリシーに従う）。
+- **`board_read --governance` は期限を見ない**。ガバナンス照合は 30103 の成立済み決定のみが対象であり、草案は管轄外（§19 と同じ境界）。
+- 時計のずれ: `now` は実行ホストの時刻。数分のずれで拒否される可能性があることを注記（NTP 前提）。テストでは `time.time()` をモック可能にするため、期限判定は純粋関数 `draft_is_expired(d, now)` に分離。
+
+### 24.3 意味論の正直な注記
+
+- 期限は**自己申告**である。悪意ある発行者は期限を付けないか、遠い未来を付ける。期限は「正直な運用者がゾンビ草案を作らない」ための仕組みであり、攻撃者の制約ではない（§14 の「警告のみ」思想と同型 — 記録はプロトコル、強制はしない）。
+- 期限切れ後の cosign 拒否も CLI の誠実な振る舞いにすぎず、JSON を手で署名すれば回避できる。検証者側は fetch の `[期限切れ]` マーカーで判断する。
+- 期限なし草案は従来通り無期限（後方互換）。期限の導入は既存の運用を壊さない。
+
+### 24.4 スコープ外
+
+- 草案への自動通知（DM 連携）— 依然として将来候補。
+- kind 30103 / 30104 の正式割当申請 — 依然として将来候補。
+- bond・rotation・revocation への期限（草案のみの機能）。
+- 期限切れスロットの自動削除・リレーへの削除要求。
+
+### 24.5 テスト計画（オフライン、実装ランで実行）
+
+1. `board_decide --expires-in 3600` → payload に `expires_at = created_at + 3600`。
+2. `board_decide --expires-at <ts>` → そのまま記録。両指定時は `--expires-at` 優先。
+3. `expires_at` が非 int（文字列）→ `board_decide` が拒否（exit 1）。
+4. `expires_at <= created_at` → `board_decide` が拒否（exit 1）。
+5. 期限なし草案 → 従来通り作成・cosign・fetch 可（後方互換）。
+6. 期限切れ草案への `board_cosign` → 拒否（exit 1）、署名が追加されない。
+7. 期限内草案への `board_cosign` → 正常（回帰）。
+8. 期限切れ草案の `board_draft_pub` → 拒否（exit 1、publish せず）。
+9. `board_draft_fetch` / `board_fetch_all` で期限切れ草案に `[期限切れ]` マーカー（nostr_request モック）。
+10. `board_fetch_all` で同一コアに期限切れ 30104 ＋ 30103 混在 → 「成立済み」表示が優先。
+11. 既存全スイートの回帰維持（純粋関数 `draft_is_expired` の分離により `board_cosign` の既存呼び出しに影響なし）。
 
 ---
 
@@ -1425,3 +1478,4 @@ nakama.py board_fetch_all <relay> <board_id> [--limit N] [--auth] [--policy <pol
 - 2026-10-01: v0.17 設計 — 30103+30104 横断 fetch の統合を仕様書 §22 に固定（設計のみ、実装は次ラン）。§21.8 のスコープ外項目を昇格: 新規コマンド `board_fetch_all <relay> <board_id> [--limit] [--auth] [--policy <policy.json>] [--out <dir>]` が 1 回の REQ で kinds=[30103, 30104]・#h=[board_id] を購読。検証は `verify_board_decision_nostr_event(ev, board_id, expect_kind=ev['kind'])`（kind ホワイトリスト {30103, 30104}）。検証済み決定のコピーに nostr_kind を付与して `merge_decision_approvals` に渡し（純粋関数新規なし）、30103 を含むコアは「成立済み」・30104 のみは「草案（回覧中）」と状態表示。--policy の threshold 表示は成立済み（§20 と同一の時点解決）と草案（現行政策のみ、§21.5）で意味論を分離。--out は内部マーカーを剥がしたプレーン決定 JSON（board_cosign / board_read --governance --decisions 互換）。既存の 2 fetch コマンドは維持（単目的ツールとして置き換えない）。テスト計画 8 ケース（オフライン・nostr_request モック）、既存回帰は不変。ロードマップ §7 に v0.17（設計中）を追加、ヘッダの日付行も更新。
 - 2026-10-01: v0.17 実装 — §22 の設計をコード化。新規コマンド `board_fetch_all <relay> <board_id> [--limit] [--auth] [--policy <policy.json>] [--out <dir>]`。1 回の REQ で kinds=[30103, 30104]・#h=[board_id] を購読。イベントごとに kind ホワイトリスト {30103, 30104} 以外はスキップし、`verify_board_decision_nostr_event(ev, board_id, expect_kind=ev['kind'])` で三段階検証（新規純粋関数なし）。検証済み決定のコピーに `nostr_kind` を付与して `merge_decision_approvals` に渡し（余分なキーは無視される）、コアごとの kind 集合から `finalized`（30103 含むか）を付記。表示は created_at 昇順のまま `[成立済み <core_hash>]` / `[草案（回覧中） <core_hash>]` の状態タグ（2 fetch の書式と互換）。--policy: 成立済みは fetch 集合内の 30103 決定で `resolve_policy_at`（§20.2 と同一）、草案は現行政策のみ（`fetch_threshold_status(d, policy, [])`、§21.5 の「草案: threshold n/m」文言を流用）。--out は内部マーカー（nostr_kind / finalized）を剥がしたプレーン決定 JSON を `<core_hash>.json` で保存（board_cosign / board_read --governance --decisions 互換＋fetch 時点スナップショットの正直な注記）。既存 2 fetch コマンドは不変（単目的ツールとして維持）。`test_fetch_all.py` 新規 8 ケース通過（混在 fetch＋他 kind スキップ＋単一 REQ のフィルタ検証、横断マージ npub dedup、finalized 判定、--policy 表示、草案→成立統合で二重表示なし、expect_kind チェック、--out プリーン保存、無効イベントスキップ）、既存全スイートの回帰維持。ロードマップ §7 に v0.17（完了）、ヘッダの日付行も更新。
 - 2026-10-01: v0.18 完了 — fetch 時点の政策スナップショットの保存（§23）。§22.7 のスコープ外項目を昇格。`save_policy_snapshot(out_dir, policy)` ヘルパを追加し、`board_decide_fetch` / `board_draft_fetch` / `board_fetch_all` の 3 コマンドで `--out` と `--policy` の両指定時のみ検証済み政策を `policy-snapshot-<unixts>.json` としてコピー保存（決定ファイル `<core_hash>.json` との prefix 区別）。検証者はこのファイルを `--policy` に再指定して fetch 時点の threshold 判定を再現できる。`test_policy_snapshot.py` 新規 12 ケース通過（3 コマンド × 保存・内容同一、再指定で判定再現、--out のみ/--policy のみでは保存なし、ファイル名区別、ヘルパ単体）＋既存全スイートの回帰維持。ロードマップ §7 に v0.18（完了）、ヘッダの日付行も更新。
+- 2026-10-01: v0.19 設計 — 草案の期限を仕様書 §24 に固定（設計のみ、実装は次ラン）。§22.7 のスコープ外「草案の期限（expiry）」を昇格。設計の要点: (1) 決定 payload の任意フィールド `expires_at`（unix 時刻 int、署名対象 — 期限の異なる再発行は別コア＝別 d スロット）。`board_decide --expires-in <秒>` / `--expires-at <unix時刻>`（両指定時は後者優先）。(2) 3 層の強制: `board_cosign` は期限切れ草案への署名を拒否（exit 1、ゾンビ草案対策の主軸）、`board_draft_pub` は期限切れ草案の publish を拒否（exit 1）、`board_draft_fetch` / `board_fetch_all` は期限切れ草案に `[期限切れ]` マーカー（表示のみ）。(3) 期限は草案（30104）のみ — 成立済み（30103）は §20 の不変性ルールの下で恒久的、`board_read --governance` は期限を見ない。期限切れ後の再発行は新規草案（期限切れスロットはリレー上に残るがマーカーで可視化、削除はしない）。(4) 期限判定は純粋関数 `draft_is_expired(d, now)` に分離。期限なし草案は無期限（後方互換）。正直に書く: 期限は自己申告（正直な運用者のための仕組み、攻撃者の制約ではない）。テスト計画 11 ケース（オフライン）。ロードマップ §7 に v0.19（設計中）を追加、ヘッダの日付行も更新。
