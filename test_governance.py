@@ -55,11 +55,26 @@ def main():
     admit_D_outsider = make_decision(BOARD, RELAY, 'admit', {'candidate': D[1]}, [A, E])
     admit_D_wrongboard = make_decision('other-board', RELAY, 'admit', {'candidate': D[1]}, [A, B])
 
+    # v0.5 (§10): handover 決定。A が旧運営、D が新運営候補、E は部外者。
+    handover = make_decision(BOARD, RELAY, 'handover',
+                             {'new_moderators': [D[1]], 'old_moderators': [A[1]]},
+                             [A, B])
+    handover_no_old = make_decision(BOARD, RELAY, 'handover',
+                                    {'new_moderators': [D[1]]}, [A, B])
+
     ev_add_D = n.sign_event(A[0], TS, 9000, [['h', BOARD], ['p', D[2]]], '')
     ev_add_E = n.sign_event(A[0], TS, 9000, [['h', BOARD], ['p', E[2]]], '')
     ev_rm_D = n.sign_event(A[0], TS, 9001, [['h', BOARD], ['p', D[2]]], '')
     ev_tampered = n.sign_event(A[0], TS, 9000, [['h', BOARD], ['p', D[2]]], '')
     ev_tampered['content'] = 'tampered'
+
+    ev_del_old = n.sign_event(A[0], TS + 100, 9004, [['h', BOARD]], '')
+    ev_del_out = n.sign_event(E[0], TS + 100, 9004, [['h', BOARD]], '')
+    ev_del_new = n.sign_event(D[0], TS + 100, 9004, [['h', BOARD]], '')
+    ev_del_before = n.sign_event(A[0], TS - 100, 9004, [['h', BOARD]], '')
+    ev_join_D = n.sign_event(D[0], TS + 100, 9007, [['h', BOARD]], '')
+    ev_join_E = n.sign_event(E[0], TS + 100, 9007, [['h', BOARD]], '')
+    ev_leave = n.sign_event(D[0], TS + 100, 9008, [['h', BOARD]], '')
 
     cases = [
         # (名前, イベント, decisions, 期待 status)
@@ -74,6 +89,17 @@ def main():
         ('署名改ざん→invalid-sig', [ev_tampered], [admit_D], 'invalid-sig'),
         ('複合: ok1+warn2', [ev_add_D, ev_add_E, ev_rm_D], [admit_D],
          ['ok', 'warn', 'warn']),
+        # v0.5 (§10): 9004 / 9007 / 9008 の照合
+        ('9004+旧運営(決定後)→ok', [ev_del_old], [handover], 'ok'),
+        ('9004+決定なし→warn', [ev_del_old], [], 'warn'),
+        ('9004+部外者→warn', [ev_del_out], [handover], 'warn'),
+        ('9004+新運営(旧運営に非ず)→warn', [ev_del_new], [handover], 'warn'),
+        ('9004+決定より前→warn', [ev_del_before], [handover], 'warn'),
+        ('9004+old_moderators省略→policy.eligibleフォールバックok',
+         [ev_del_old], [handover_no_old], 'ok'),
+        ('9007+admitあり→info(承認済み)', [ev_join_D], [admit_D], 'info'),
+        ('9007+決定なし→info(未承認、警告なし)', [ev_join_E], [], 'info'),
+        ('9008→ok(退会は自由)', [ev_leave], [], 'ok'),
     ]
 
     failed = 0

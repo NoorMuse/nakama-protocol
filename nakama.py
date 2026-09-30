@@ -1137,9 +1137,16 @@ def validate_decision_payload(decision: str, payload: dict) -> bool:
     if decision == 'admit':
         return set(payload.keys()) == {'candidate'}
     if decision == 'handover':
-        return (set(payload.keys()) == {'new_moderators'}
-                and isinstance(payload['new_moderators'], list)
-                and all(isinstance(n, str) for n in payload['new_moderators']))
+        keys = set(payload.keys())
+        if keys not in ({'new_moderators'}, {'new_moderators', 'old_moderators'}):
+            return False
+        if not (isinstance(payload['new_moderators'], list)
+                and all(isinstance(n, str) for n in payload['new_moderators'])):
+            return False
+        if 'old_moderators' in payload:
+            return (isinstance(payload['old_moderators'], list)
+                    and all(isinstance(n, str) for n in payload['old_moderators']))
+        return True
     if decision == 'policy-update':
         return set(payload.keys()) == {'threshold', 'eligible'}
     if decision == 'close':
@@ -1267,6 +1274,11 @@ def cmd_board_decide(args):
     except Exception as e:
         print(f'payload の JSON 解析に失敗: {e}', file=sys.stderr)
         sys.exit(1)
+    # v0.5 (spec §10.2): handover の旧運営リストを --old-moderators で明示できる。
+    # payload の JSON よりコマンドラインが優先（指定時のみ上書き）。
+    if args.decision == 'handover' and args.old_moderators is not None:
+        payload = dict(payload)
+        payload['old_moderators'] = list(args.old_moderators)
     if not validate_decision_payload(args.decision, payload):
         print(f"payload の形式が decision '{args.decision}' に適合しません", file=sys.stderr)
         sys.exit(1)
@@ -1338,15 +1350,16 @@ def cmd_verify_board_decision(args):
 
 # 決定種別 → その決定が正当化できる NIP-29 管理イベントの kind。
 # admit は kind 9000 (Add User) を対象にする。policy-update / close は
-# リレー上のイベントに対応しない内部決定。handover は kind 9002/9004
-# (moderator 変更) を将来対象にするための予約。
+# リレー上のイベントに対応しない内部決定。handover は kind 9004
+# (Delete Group) のみを照合する (spec §10.1: kind 9002 Create Group は
+# board_verify の管轄であり governance の対象外)。
 GOVERNANCE_COVERAGE = {
     'admit': {9000},
-    'handover': {9002, 9004},
+    'handover': {9004},
     'policy-update': set(),
     'close': set(),
 }
-GOVERNANCE_CHECK_KINDS = [9000, 9001]
+GOVERNANCE_CHECK_KINDS = [9000, 9001, 9004, 9007, 9008]
 
 
 def npub_to_hex(npub: str) -> str | None:
@@ -1358,11 +1371,12 @@ def npub_to_hex(npub: str) -> str | None:
 
 
 def governance_match_events(events: list, policy: dict, decisions: list) -> list:
-    """管理イベントごとに仲間内の合意の有無を判定する純粋関数 (spec §9.4)。
+    """管理イベントごとに仲間内の合意の有無を判定する純粋関数 (spec §9.4 / §10.3)。
 
     各イベントについて dict(status, event, detail) を返す。
     status: 'ok'（対応する有効な board-decision あり）
           | 'warn'（対応する決定なし — 合意の証拠なし）
+          | 'info'（警告なしの情報表示 — kind 9007 Join Request）
           | 'invalid-sig'（イベント署名が無効で帰属を特定できない）
     """
     valid = []  # (decision, 承認署名数, threshold)
@@ -1403,6 +1417,51 @@ def governance_match_events(events: list, policy: dict, decisions: list) -> list
             # remove に対応する決定種別は規約の語彙にない → 常に警告
             results.append({'status': 'warn', 'event': ev,
                             'detail': 'remove に対応する決定種別は規約にない（合意の証拠なし）'})
+        elif kind == 9004:
+            # handover 決定後の旧運営による Delete Group は正当な運用 (spec §10.3)。
+            # 新運営・部外者・決定前の一方的な削除は警告。
+            issuer = ev.get('pubkey')
+            cover = None
+            for d, n, m in valid:
+                if d['decision'] != 'handover':
+                    continue
+                if kind not in GOVERNANCE_COVERAGE['handover']:
+                    continue
+                if ev.get('created_at', 0) < d['created_at']:
+                    continue
+                old = d['payload'].get('old_moderators') or list(policy['eligible'])
+                old_hex = {h for h in (npub_to_hex(x) for x in old) if h}
+                if issuer and issuer in old_hex:
+                    cover = (d, n, m)
+                    break
+            if cover:
+                d, n, m = cover
+                results.append({'status': 'ok', 'event': ev,
+                                'detail': f'handover 決定後の旧運営による削除（承認 {n}/{m}、決定時刻 '
+                                          f'{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d["created_at"]))}）'})
+            else:
+                results.append({'status': 'warn', 'event': ev,
+                                'detail': '対応する handover 決定なし（合意なしの削除、部外者・新運営による削除、'
+                                          '決定より前の削除）'})
+        elif kind == 9007:
+            # Join Request は admit 照合の情報源として扱う。申請自体は害がないため
+            # 警告にはしない（承認済みか未承認かを表示するだけ）。spec §10.3。
+            issuer = ev.get('pubkey')
+            admitted = False
+            for d, n, m in valid:
+                if d['decision'] != 'admit':
+                    continue
+                cand_hex = npub_to_hex(d['payload']['candidate'])
+                if cand_hex and issuer and cand_hex == issuer:
+                    admitted = True
+                    break
+            results.append({'status': 'info', 'event': ev,
+                            'detail': '承認済みの申請（対応する admit 決定あり）' if admitted
+                            else '未承認の申請（対応する admit 決定なし）'})
+        elif kind == 9008:
+            # 退会は本人の自由。常に OK。
+            results.append({'status': 'ok', 'event': ev,
+                            'detail': 'Leave Group は本人の自由な退会'})
         else:
             results.append({'status': 'warn', 'event': ev,
                             'detail': f'kind {kind} は照合対象外（未対応の管理イベント）'})
@@ -1428,7 +1487,7 @@ def load_decisions(paths) -> list:
 
 
 def cmd_board_governance(args):
-    """board_read --governance: 管理イベント (kind 9000/9001) と board-decision の合意照合。
+    """board_read --governance: 管理イベント (kind 9000/9001/9004/9007/9008) と board-decision の合意照合。
 
     リレーは管理イベントを発行者の鍵だけで受け付けるため、仲間内の合意は
     強制できない。合意を無視した管理イベントを警告表示することで社会的に
@@ -1458,14 +1517,16 @@ def cmd_board_governance(args):
     warns = 0
     for r in results:
         ev = r['event']
-        kind_name = {9000: 'Add User', 9001: 'Remove User'}.get(ev.get('kind'), f'kind {ev.get("kind")}')
+        kind_name = {9000: 'Add User', 9001: 'Remove User',
+                     9004: 'Delete Group', 9007: 'Join Request',
+                     9008: 'Leave Group'}.get(ev.get('kind'), f'kind {ev.get("kind")}')
         ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ev.get('created_at', 0)))
         subject = next((t[1] for t in ev.get('tags', []) if t and t[0] == 'p'), '?')
-        mark = 'OK' if r['status'] == 'ok' else ('署名無効' if r['status'] == 'invalid-sig' else '警告')
+        mark = {'ok': 'OK', 'info': '情報', 'invalid-sig': '署名無効'}.get(r['status'], '警告')
         print(f'--- [{ts}] kind {ev.get("kind")} ({kind_name}) 発行: {ev.get("pubkey", "?")[:16]}... '
               f'対象: {subject[:16] if subject != "?" else "?"}... [{mark}]')
         print(f'    {r["detail"]}')
-        if r['status'] != 'ok':
+        if r['status'] not in ('ok', 'info'):
             warns += 1
     print(f'管理イベント {len(results)} 件中、要確認 {warns} 件')
     sys.exit(1 if warns else 0)
@@ -1561,6 +1622,8 @@ def main():
     s.add_argument('--relay', required=True)
     s.add_argument('--decision', required=True, choices=list(BOARD_DECISION_TYPES))
     s.add_argument('--payload', required=True, help="決定内容の JSON（例: '{\"candidate\": \"<npub>\"}'）")
+    s.add_argument('--old-moderators', nargs='*', default=None,
+                   help="handover 専用: 旧運営の npub 一覧（省略時は policy.eligible をフォールバック、spec §10.2）")
     s.add_argument('--out')
     s = sub.add_parser('board_cosign'); s.add_argument('decision'); s.add_argument('--out')
     s = sub.add_parser('verify_board_decision'); s.add_argument('decision'); s.add_argument('--policy', required=True)
