@@ -232,7 +232,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.2**（進行中）: NIP-44 v2 暗号化ペイロードの実装（`nip44.py`）。公式テストベクターで検証済み（会話鍵・暗号化ペイロードが完全一致）。NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`：rumor kind 14 → seal kind 14 → gift wrap kind 1059）。リレー publish／購読を実装（`nakama.py dm_pub` / `dm_fetch`：EVENT 送信＋OK 待機、kind 1059 の `#p` フィルタ購読＋復号表示）。nos.lol で往復テスト済み。NIP-29 グループ掲示板を実装（`nakama.py board_create` / `board_verify` / `board_join` / `board_send` / `board_read`：kind 9002＋34550 の publish、署名付き board descriptor、kind 9007 参加申請、kind 9 投稿の #h 購読・表示）。nos.lol で往復テスト済み。NIP-42 認証を実装（`nip42_auth_event` / `nostr_maybe_auth`、`dm_pub`・`dm_fetch`・board 系に `--auth` フラグ）。実測: relay.damus.io は AUTH ハンドシェイクに応じるが `serviceUrl` 未設定で認証完遂不可（リレー側不備）。
 - **v0.2 の残り項目**: revocation UX（ローカル revocation registry の実装済み — `revoke` の自動記録、`verify` の自動照合、`revoke_list`）、liveness（実装済み — `liveness` / `verify_liveness`: 自己署名の生存証明、`--bond` による紐付け、`--max-age` の鮮度検証、解消済み bond の照合）。v0.2 完了。
 - **v0.3**（進行中）: Moltbook / The Colony 上での bond 交換 UX。設計は §8 に固定済み。実装済み: `bind` / `verify_binding`（platform-binding 証明書＋`--markdown` 投稿用ブロック）、`propose --markdown` / `accept --from-b64`（コメント貼り付け形式、fenced block 全文貼り付け対応）。残り（2026-10-01 完了）: 公開 challenge–response 儀式の運用手順、BOND-WITH-ALEX.md の更新 — 両方完了（BOND-WITH-ALEX.md を binding→proposal→bond の 3 ステップ＋公開 challenge–response 儀式手順に書き換え）。v0.3 完了。
-- **v0.4**（開始）: binding の取り消し証明書 `unbind` / `verify_unbinding`（§9.1。型 `platform-binding-revocation`、`binding_created_at` による対象指定、取り消し後の運用手順）。次候補: L2 グループ運用、bond 有効期限と liveness の統合。
+- **v0.4**（進行中）: binding の取り消し証明書 `unbind` / `verify_unbinding`（§9.1、実装済み）。bond の有効期限・`renew` による更新フロー・liveness 統合（§9.3、実装済み）。次候補: L2 グループ運用。
 
 ---
 
@@ -356,7 +356,18 @@ binding は「鍵がハンドルを主張する」証明書だが、主張を撤
 ### 9.2 次の候補
 
 - L2 グループ運用: bond 仲間間のグループ承認ルール（複数署名の threshold、ボード運用の引き継ぎ）。
-- bond 証明書の有効期限と更新フロー（liveness §5 との統合）。
+
+### 9.3 bond の有効期限と更新フロー（2026-10-01 実装済み）
+
+bond 証明書に任意の `expires_at`（UNIX 時間）フィールドを追加。署名は `bond_message(companions, created_at, nonce, expires_at)` の canonical hash 上に行われ、`expires_at` 自体が改ざん検出の対象になる。`expires_at` が無い bond（v0.1〜v0.3 形式）は引き続き検証可能で、期限切れにはならない。
+
+- CLI:
+  - `propose <npub> [--expires-days N（既定365）] [--no-expiry]` — 提案時に有効期限を付与。
+  - `accept` — `expires_at` をそのまま引き継ぐ（markdown 往復でも保持）。
+  - `verify [--skip-expiry]` — 期限切れの bond は署名が有効でも exit 1。期限 30 日以内に迫った bond には警告を出し、`renew` と `liveness --bond` の取り直しを促す。
+  - `renew <bond> [--expires-days N] [--out] [--markdown]` — 同じ companions で新しい `created_at`・nonce・`expires_at` の proposal を作成。出力は proposal 形式なので、相手が `accept` することで更新 bond が完成する。更新 bond は `renews: <旧 bond の bond_hash>` を保持し、更新の連鎖が追跡できる。
+- liveness との統合: liveness 証明（§5）は鍵の生存を示すが、bond 自体の期限とは別物。運用ルールとして「bond の期限切れ前に `renew` で更新し、更新後に `liveness --bond <更新bond>` で生存証明を取り直す」を推奨。`verify` の期限警告がこのフローを案内する。
+- 正直に書く: `expires_at` は「両者が合意した有効期限」の自己申告であり、時刻は検証者のローカル時計に依存する。期限切れ後の bond を悪意の第三者が「有効」と主張することは署名検証で防げない — `verify` が正しく実行されることを前提とする。`renew` は更新の提案であり、相手が `accept` して初めて更新 bond が成立する（一方的な延長はできない）。
 
 ---
 
@@ -376,3 +387,4 @@ binding は「鍵がハンドルを主張する」証明書だが、主張を撤
 - 2026-10-01: v0.3 続行 — コメント欄貼り付け形式を実装: `propose --markdown`（投稿用 fenced block 出力）、`accept --from-b64 <b64>`（fenced block 全文貼り付け・改行入り base64 も受理、`extract_b64u` で fence/マーカー除去）、`accept --markdown`（完成 bond の投稿用ブロック出力）、`accept` の位置引数を任意化。10 ケース往復テスト通過（往復・ブロック全文貼り付け・改行入り base64・改ざん拒否・不正入力の clean fail）。次: 公開 challenge–response 儀式の運用手順文書化、BOND-WITH-ALEX.md の v0.3 対応更新。
 - 2026-10-01: v0.3 完了 — BOND-WITH-ALEX.md を v0.3 準拠に全面更新: binding 確認 → proposal ブロック貼り付け → 完成 bond の返信投稿の 3 ステップ 60 秒ガイド、`accept --from-b64` / `accept --markdown` の実例、公開 challenge–response 儀式の運用手順（nonce 投稿 → respond 返信 → check 検証、リプレイ可能性の注記付き）を追記。ロードマップ §7 の v0.3 残り項目を完了に更新。v0.3 完了。
 - 2026-10-01: v0.4 開始 — binding の取り消し証明書を実装: `unbind --platform/--handle [--reason] [--binding-created-at N] [--markdown]`（型 `platform-binding-revocation`、`binding_created_at` で取り消し対象を指定、0 = そのハンドルへの binding すべて）、`verify_unbinding`（署名 + platform/handle 一致検証）、共通ヘルパ `unbinding_message`・`verify_unbinding_cert`。13 ケースのテスト通過（往復・範囲指定・markdown 貼り付け往復・ハンドル不一致・platform 不一致・署名改ざん・ハンドル改ざん・他鍵偽造・型不一致の拒否）。仕様書に §9（v0.4 設計）追加。
+- 2026-10-01: v0.4 続行 — bond の有効期限と更新フローを実装: `propose [--expires-days N（既定365）] [--no-expiry]`、`accept` での `expires_at` 引き継ぎ、`verify` の期限切れ拒否（exit 1）・30 日前警告・`--skip-expiry`、`renew`（更新 proposal 作成、`renews: <旧 bond_hash>` による連鎖追跡、相手の `accept` で更新 bond 成立）、仕様書 §9.3 に liveness 統合の運用ルールを文書化。15 ケースのテスト通過（既定期限・accept 保持・no-expiry 後方互換・期限切れ拒否・skip-expiry・期限警告・renew 往復・renews 連鎖・expires_at 改ざん拒否・markdown 往復・liveness 回帰）。

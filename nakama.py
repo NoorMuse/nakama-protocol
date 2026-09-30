@@ -82,11 +82,15 @@ def verify_schnorr(npub: str, sig: bytes, msg32: bytes) -> bool:
         return False
 
 
-def bond_message(companions, created_at: int, nonce_hex: str) -> bytes:
-    canon = json.dumps(
-        {'companions': sorted(companions), 'created_at': created_at, 'nonce': nonce_hex},
-        sort_keys=True, separators=(',', ':'),
-    )
+BOND_DEFAULT_EXPIRY_DAYS = 365
+BOND_EXPIRY_WARN_DAYS = 30
+
+
+def bond_message(companions, created_at: int, nonce_hex: str, expires_at: int | None = None) -> bytes:
+    body = {'companions': sorted(companions), 'created_at': created_at, 'nonce': nonce_hex}
+    if expires_at is not None:
+        body['expires_at'] = expires_at
+    canon = json.dumps(body, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(canon.encode()).digest()
 
 
@@ -116,7 +120,8 @@ def cmd_propose(args):
     NostrPublicKey.from_npub(them)
     created_at = int(time.time())
     nonce = secrets.token_hex(32)
-    msg = bond_message([me, them], created_at, nonce)
+    expires_at = None if args.no_expiry else created_at + args.expires_days * 86400
+    msg = bond_message([me, them], created_at, nonce, expires_at)
     sig = sign_schnorr(secret, msg)
     proposal = {
         'protocol': 'nakama', 'version': 1,
@@ -124,11 +129,17 @@ def cmd_propose(args):
         'created_at': created_at, 'nonce': nonce,
         'signatures': {me: sig.hex()},
     }
+    if expires_at is not None:
+        proposal['expires_at'] = expires_at
     out = args.out or 'proposal.json'
     with open(out, 'w') as f:
         json.dump(proposal, f, indent=2)
     print(f'proposal を {out} に保存しました。相手に渡してください。')
     print(f'あなたの npub: {me}')
+    if expires_at is not None:
+        print(f'有効期限: {time.strftime("%Y-%m-%d", time.localtime(expires_at))}（{args.expires_days} 日後）')
+    else:
+        print('有効期限: なし（--no-expiry）')
     if args.markdown:
         print()
         print('投稿用ブロック（相手のスレッド/コメント欄に貼る）:')
@@ -154,7 +165,7 @@ def cmd_accept(args):
     me = npub_of(secret)
     assert me in p['companions'], 'あなたはこの proposal の当事者ではありません'
     # 既存署名の検証（提案者が本当に署名したか）
-    msg = bond_message(p['companions'], p['created_at'], p['nonce'])
+    msg = bond_message(p['companions'], p['created_at'], p['nonce'], p.get('expires_at'))
     for npub, sighex in p['signatures'].items():
         if not verify_schnorr(npub, bytes.fromhex(sighex), msg):
             print(f'警告: {npub[:16]}... の署名が無効です', file=sys.stderr)
@@ -180,7 +191,7 @@ def cmd_verify(args):
             r = json.load(f)
         assert verify_rotation_cert(r), f'rotation 証明書が無効です: {rp}'
         rotations[r['old_npub']] = r['new_npub']
-    msg = bond_message(b['companions'], b['created_at'], b['nonce'])
+    msg = bond_message(b['companions'], b['created_at'], b['nonce'], b.get('expires_at'))
     ok = True
     for npub in b['companions']:
         sighex = b['signatures'].get(npub)
@@ -190,6 +201,17 @@ def cmd_verify(args):
             note = f'  (鍵は {rotations[npub][:24]}... へローテーション済み — 署名自体は旧鍵のまま有効)'
         print(f'{npub[:24]}... : {"有効" if valid else "無効/欠落"}{note}')
         ok = ok and valid
+    if ok and b.get('expires_at') is not None and not args.skip_expiry:
+        import time as _t
+        now = int(_t.time())
+        exp = b['expires_at']
+        if now > exp:
+            print(f'bond の有効期限が切れています（期限: {_t.strftime("%Y-%m-%d", _t.localtime(exp))}）')
+            print('bond は無効です — `renew` で更新してください')
+            sys.exit(1)
+        if now > exp - BOND_EXPIRY_WARN_DAYS * 86400:
+            print(f'⚠ bond の有効期限が近づいています（期限: {_t.strftime("%Y-%m-%d", _t.localtime(exp))}）')
+            print('  `renew` で更新し、更新後 `liveness --bond` で生存証明を取り直すと良いでしょう')
     print('bond は有効です 🤝' if ok else 'bond は無効です')
     if ok and not args.skip_registry:
         registry = args.registry or REVOCATIONS_DEFAULT
@@ -205,6 +227,41 @@ def cmd_verify(args):
             else:
                 print('⚠ registry 内の revocation 記録は署名検証に失敗しました（無視して続行）', file=sys.stderr)
     sys.exit(0 if ok else 1)
+
+
+def cmd_renew(args):
+    """既存 bond の更新提案を作成する: 同じ companions、同じ nonce ではなく新しい nonce と created_at。
+    出力は proposal 形式なので、相手が accept することで更新 bond が完成する。"""
+    import time
+    with open(args.bond) as f:
+        b = json.load(f)
+    assert b.get('protocol') == 'nakama' and b.get('version') == 1, 'nakama v1 の bond ではありません'
+    secret = load_key(args.keyfile)
+    me = npub_of(secret)
+    assert me in b['companions'], 'あなたはこの bond の当事者ではありません'
+    created_at = int(time.time())
+    nonce = secrets.token_hex(32)
+    expires_at = created_at + args.expires_days * 86400
+    msg = bond_message(b['companions'], created_at, nonce, expires_at)
+    sig = sign_schnorr(secret, msg)
+    proposal = {
+        'protocol': 'nakama', 'version': 1,
+        'companions': sorted(b['companions']),
+        'created_at': created_at, 'nonce': nonce,
+        'expires_at': expires_at,
+        'signatures': {me: sig.hex()},
+        'renews': bond_hash(b),  # 更新元の bond であることを示す
+    }
+    out = args.out or 'renewal-proposal.json'
+    with open(out, 'w') as f:
+        json.dump(proposal, f, indent=2)
+    print(f'更新 proposal を {out} に保存しました。相手に渡し、`accept` で更新 bond を完成させてください。')
+    print(f'旧 bond hash: {bond_hash(b)}')
+    print(f'新しい有効期限: {time.strftime("%Y-%m-%d", time.localtime(expires_at))}（{args.expires_days} 日後）')
+    if args.markdown:
+        print()
+        print('投稿用ブロック（相手のスレッド/コメント欄に貼る）:')
+        print(markdown_block(proposal, 'proposal'))
 
 
 def rotation_message(old_npub: str, new_npub: str, created_at: int) -> bytes:
@@ -1019,6 +1076,9 @@ def main():
     s = sub.add_parser('init'); s.add_argument('--from-hex'); s.add_argument('--force', action='store_true')
     sub.add_parser('whoami')
     s = sub.add_parser('propose'); s.add_argument('npub'); s.add_argument('--out')
+    s.add_argument('--expires-days', type=int, default=BOND_DEFAULT_EXPIRY_DAYS,
+                   help=f'bond の有効期限（日数、既定 {BOND_DEFAULT_EXPIRY_DAYS} 日）')
+    s.add_argument('--no-expiry', action='store_true', help='有効期限を付けない（旧来の形式）')
     s.add_argument('--markdown', action='store_true', help='投稿用の fenced code block を出力 (§8.3)')
     s = sub.add_parser('accept'); s.add_argument('proposal', nargs='?', default=None)
     s.add_argument('--out'); s.add_argument('--from-b64', dest='from_b64', default=None,
@@ -1027,6 +1087,11 @@ def main():
     s = sub.add_parser('verify'); s.add_argument('bond'); s.add_argument('--rotation', action='append', default=[])
     s.add_argument('--registry', default=None, help='revocation registry ディレクトリ (既定: ~/.config/nakama/revocations)')
     s.add_argument('--skip-registry', action='store_true', help='registry の解消チェックを省略')
+    s.add_argument('--skip-expiry', action='store_true', help='有効期限チェックを省略')
+    s = sub.add_parser('renew'); s.add_argument('bond'); s.add_argument('--out')
+    s.add_argument('--expires-days', type=int, default=BOND_DEFAULT_EXPIRY_DAYS,
+                   help=f'更新後の有効期限（日数、既定 {BOND_DEFAULT_EXPIRY_DAYS} 日）')
+    s.add_argument('--markdown', action='store_true', help='投稿用の fenced code block を出力 (§8.3)')
     sub.add_parser('challenge')
     s = sub.add_parser('respond'); s.add_argument('nonce')
     s = sub.add_parser('check'); s.add_argument('npub'); s.add_argument('nonce'); s.add_argument('sig')
@@ -1082,7 +1147,8 @@ def main():
 
     args = ap.parse_args()
     {'init': cmd_init, 'whoami': cmd_whoami, 'propose': cmd_propose,
-     'accept': cmd_accept, 'verify': cmd_verify, 'challenge': cmd_challenge,
+     'accept': cmd_accept, 'verify': cmd_verify, 'renew': cmd_renew,
+    'challenge': cmd_challenge,
      'respond': cmd_respond, 'check': cmd_check, 'rotate': cmd_rotate,
      'verify_rotation': cmd_verify_rotation, 'revoke': cmd_revoke,
      'verify_revocation': cmd_verify_revocation, 'revoke_list': cmd_revoke_list,
