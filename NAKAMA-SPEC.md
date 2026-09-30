@@ -1,7 +1,7 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.3
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20））
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 設計中 — cosign 回覧（決定前）の Nostr 化（§21））
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -244,6 +244,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.13**（完了）: `remove` 決定種別の追加 — kind 9001 Remove User のガバナンス照合（§18。`BOARD_DECISION_TYPES` + payload 検証 + `GOVERNANCE_COVERAGE['remove']={9001}` + 照合ルール置換、test_remove.py 10 ケース通過、全回帰維持）。
 - **v0.14**（完了）: board-decision の Nostr 公開（§19。`DECISION_NOSTR_KIND = 30103`（parameterized replaceable、nakama 独自割当）、`decision_core_hash(d)`（不変部分 board_id/decision/created_at/payload の sha256 先頭 32 hex — cosign の approvals 追記でもスロット安定）、`board_decision_nostr_event(d, secret)`（純粋、署名者は publisher — keyfile 一致チェックなし、意図的）、`verify_board_decision_nostr_event(ev, board_id)`（三段階検証: Nostr 署名 → JSON パース → 構造＋d/h 二重チェック、無効はスキップ。threshold 検証なし）、`merge_decision_approvals(decisions)`（同一コアの approvals マージ・npub で dedup）。`board_decide_pub <relay> <decision.json> [--auth]`（構造検証→publish、無効は拒否で exit 1）、`board_decide_fetch <relay> <board_id> [--limit] [--auth] [--out <dir>]`（同一コアのマージ＋`<core_hash>.json` 保存 — `board_read --governance --decisions` にそのまま渡せる）。オフライン 10 ケース通過（`test_board_decision_nostr.py` 新規）＋ governance 30 / revocation 8 / compromise 24 / integration 10 / accept 7 / verify_binding 6 / rotation 8 / remove 10 回帰維持。スコープ外: fetch 側の threshold 検証、決定の撤回・無効化、cosign 回覧の Nostr 化、kind の正式割当。）
 - **v0.15**（実装済み 2026-10-01）: fetch 側の threshold 表示（§20）。§19.8 の scope-out「fetch 側の threshold 検証」を再検討: 管轄は `board_read --governance` のまま維持し、任意の表示機能として `board_decide_fetch --policy <policy.json>` に取り込む。判定ロジックは新規に書かず `resolve_policy_at` + `_verify_decision_core` を流用し、fetch 集合内の policy-update 決定で決定時点の政策を解決（governance と同一の時点解決）。無効な policy / board_id 不一致は拒否で exit 1、exit コードは不変（表示機能）。決定の撤回・無効化は設けない方針を固定（不変性維持、board 終了は close 決定）。cosign 回覧の Nostr 化は v0.16 の候補。
+- **v0.16**（設計中）: cosign 回覧（決定前）の Nostr 化（§21）。kind 30104（parameterized replaceable、nakama 独自割当）、`d` タグ = `decision_core_hash(d)`（30103 と同一コアで草案→完成を対応付け）、`h` タグ = board_id。方式 B: 各承認者が cosign した版を自分の (publisher, 30104, d) スロットに再公開し、fetch 側で `merge_decision_approvals` が統合（approvals の出所保持・last-writer-wins 競合なし）。`board_draft_pub` / `board_draft_fetch [--policy]`（30104、threshold 表示は §20 と同一ロジック＋「草案」マーカー）、承認フローは既存コマンドの組み合わせ（fetch --out → board_cosign → board_draft_pub）。成立の公開宣言は kind 30103 の publish。スコープ外: fetch 統合、自動通知、草案の期限、kind の正式割当、policy-update 決定の草案化。
 
 ---
 
@@ -1191,7 +1192,7 @@ NIP-29 の管理イベントには「去る」と「外す」の 2 方向があ�
 
 ### 20.7 スコープ外
 
-- cosign 回覧（決定前）の Nostr 化 — v0.16 の候補。`--policy` 表示はその前提条件（approvals 不足の draft が可視化できるようになる）。
+- cosign 回覧（決定前）の Nostr 化 — v0.16 の設計対象となった（§21）。
 - fetch 側でのガバナンス完全照合（決定の先行・close 後の無効化など）— `board_read --governance` の管轄のまま。
 - policy の自動取得 — リレーからの自動 fetch なしの方針を維持（§14）。
 - 決定の撤回・無効化プリミティブ — §20.5 の方針として設けない。
@@ -1202,6 +1203,81 @@ NIP-29 の管理イベントには「去る」と「外す」の 2 方向があ�
 - 実装中に判明した表示定義の明確化: `threshold n/m` の `n` は有効承認署名数、`m` は決定時点の eligible 数（§20.3 の戻り値定義を更新）。例: threshold 2/3・有効 approvals 2 → `threshold 2/3 充足`、有効 1 → `threshold 1/3 不足`。
 - `test_board_decision_fetch_policy.py` 新規 8 ケース通過（充足/不足/部外者無視/重複1扱い/時点解決/無効 policy 拒否/board_id 不一致拒否/--policy なし回帰）。
 - 回帰: governance 30 / revocation 8 / compromise 24 / integration 10 / accept 7 / verify_binding 6 / rotation 8 / remove 10 / board_decision_nostr 10 の全スイート維持。
+
+---
+
+## 21. v0.16 設計: cosign 回覧（決定前）の Nostr 化（設計中）
+
+§20.7 でスコープ外とした「cosign 回覧（決定前）の Nostr 化」の設計。現状 `board_decide` で作った決定案の回覧署名（`board_cosign`）は DM / markdown ブロックのオフライン受け渡しであり、approvals 不足の草案の存在自体を board メンバー以外が知り得ない。v0.14（決定の Nostr 公開・kind 30103）と v0.15（fetch 側の threshold 表示 — approvals 不足の可視化）を前提に、決定前の草案もリレーで公開・購読できるようにする。
+
+### 21.1 Nostr 形式
+
+- kind: `DRAFT_NOSTR_KIND = 30104`（parameterized replaceable、nakama 独自割当。30103 の次番号）。
+- `d` タグ = `decision_core_hash(d)` — kind 30103 と同一の不変コアハッシュ。草案と完成決定が同一コアで対応付けできる（草案 → 完成の追跡）。
+- `h` タグ = board_id（30103 と同じ。board の草案一覧の取得方向）。
+- content = 草案 JSON canonical（決定と同じ形式: board_id / decision / created_at / payload / approvals。approvals は現時点の承認集合）。
+- イベントの署名者は publisher。草案の有効性は threshold approvals が証明する — kind 30103 と同一の設計判断（keyfile 一致チェックなし）。
+- 正規スロットは (publisher, kind=30104, d)。replaceable のため同一 publisher の最新版が上書きされる。
+
+### 21.2 回覧方式: 各承認者が自分のスロットに再公開（方式 B）
+
+approvals 追記版の公開方式は二択だった:
+
+- 方式 A: 一人が最新版を上書き（最終版がその人の署名）。approvals の出所が残らない。
+- 方式 B: 各承認者が cosign した版を**自分の** (publisher, 30104, d) スロットに公開。fetch 側で `merge_decision_approvals` が同一コアの approvals をマージする（§19 の仕組みをそのまま流用）。
+
+方式 B を採用。理由: approvals の出所（どの npub がどの版に署名したか）が保持され、last-writer-wins の競合がなく、fetch 側のマージ機構が新規コードなしで使える。スロットが承認者数だけ増えるが、同一コアのマージで統合表示される。
+
+### 21.3 運用フロー
+
+1. 提案者が `board_decide` で草案作成 → `board_draft_pub <relay> <draft.json> [--auth]` で公開（構造検証、無効は拒否）。
+2. メンバーが `board_draft_fetch <relay> <board_id> [--limit] [--auth] [--out <dir>] [--policy <policy.json>]` で購読 → 三段階検証（§19 と同じ: Nostr 署名 → JSON パース → 構造＋d/h 二重チェック。threshold 検証なし — 草案の承認不足は正常状態であり警告ではない）→ 同一コアのマージ → 草案一覧と threshold 充足/不足を表示。
+3. 承認: `--out` で保存した `<core_hash>.json` に既存の `board_cosign` で自分の署名を追記 → `board_draft_pub` で自分のスロットに再公開。**新規の cosign コマンドは作らない** — 既存コマンドの組み合わせで足りる（手順は §21.6 の運用文書に固定）。
+4. threshold 達成（`--policy` 表示で「充足」確認）→ 提案者が `board_decide_pub`（kind 30103）で完成決定として公開。**成立の公開宣言は kind 30103 の存在**。governance 側の有効性基準は不変（`board_read --governance` が 30103 の決定を照合）。
+
+### 21.4 実装計画
+
+- `DRAFT_NOSTR_KIND = 30104` 定数。
+- `verify_board_decision_nostr_event(ev, board_id, expect_kind=DECISION_NOSTR_KIND)` に kind 引数化（既定値で既存の呼び出し互換を維持。draft 検証では `expect_kind=DRAFT_NOSTR_KIND`）。
+- 純粋関数は新規に書かない: `decision_core_hash` / `merge_decision_approvals` / `fetch_threshold_status` / `decision_structure_ok` を流用。草案の Nostr イベント構築は `board_decision_nostr_event` を kind パラメータ化（`decision_nostr_event(d, secret, kind=DECISION_NOSTR_KIND)` に一般化、既定値で互換維持）。
+- `board_draft_pub <relay> <draft.json> [--auth]`: `board_decide_pub` と同型（構造検証 → publish、無効は拒否で exit 1）。
+- `board_draft_fetch <relay> <board_id> [--limit] [--auth] [--out <dir>] [--policy <policy.json>]`: `board_decide_fetch` と同型（kinds=[30104]・#h=[board_id]）。`--policy` ありで各草案に threshold 表示（§20.2 と同じ書式、冒頭に「草案（回覧中）」のマーカー）。`--out` 保存は `<core_hash>.json` — `board_cosign` → `board_draft_pub` の手順にそのまま渡せる。
+- argparse 登録・dispatch 追加（既存パターン準拠）、docstring の usage 行も更新。
+
+### 21.5 --policy 表示との連携
+
+- `board_decide_fetch --policy`（30103）と `board_draft_fetch --policy`（30104）は同一の表示ロジック（`fetch_threshold_status`）を共有。判定の意味論は同一（§20.3）。
+- 表示の違いはマーカーのみ: 30103 は完成決定（`threshold <n>/<m> 充足`）、30104 は草案（`草案: threshold <n>/<m> 不足/充足`）。草案の「充足」は「成立可能」の意味であり、成立の公開宣言は 30103 の publish であることを注記。
+- policy-update 決定は草案では扱わない（政策変更の決定自体は回覧を経て `board_decide_pub` で公開される完成決定）。草案の時点解決には fetch 集合内の 30103 決定を使う — policy は成立済み決定の列で解決する（`resolve_policy_at` の不変条件を維持）。
+
+### 21.6 正直に書く
+
+- 草案の公開は「成立」の証拠ではない。草案の存在は「誰かが提案した」ことの証拠にすぎない。approvals の署名が有効でも、threshold 未達成の草案には何の効力もない。
+- 方式 B の副作用: 悪意ある publisher が古い版の approvals を抜き出して再公開できる。署名自体は有効なので「承認を撤回したい」場合は撤回手段がない — §20.5 の「撤回なし」方針と同一（必要な場合は新しい決定で上書きする運用）。
+- 草案は replaceable（同一 publisher の最新版が上書き）。異なる publisher が別版を出すと両方が fetch され、マージで統合される。同一 publisher が版を差し替えると旧版は消える（リレー依存）。
+- kind 30104 の正式割当申請は引き続き将来候補（NIP 化）。
+- 非公開 board の草案は publish しない（§19.6 と同じ前提 — 公開ガバナンスが前提の board のみ）。
+- d=core_hash の列挙可能性は意図通り（公開は任意）。
+
+### 21.7 テスト計画（オフライン、`nostr_request` / `nostr_publish` をモック）
+
+1. draft イベント構築（kind 30104・d タグ=core_hash・h タグ=board_id・署名者 == publisher）
+2. 正常な draft イベントの検証通過（kind 引数化した verify、`expect_kind=30104`）
+3. 別の publisher の同コア草案 2 イベントの approvals マージ（和集合・重複除去）
+4. threshold 不足の草案に `--policy` 表示 → `草案: threshold 1/3 不足`
+5. cosign 追記 → 再公開 → fetch マージで approvals が増える（方式 B の往復）
+6. 無効な草案（payload 違反）の publish 拒否（exit 1）
+7. d タグ改ざんの拒否
+8. 草案 → threshold 達成 → `board_decide_pub`（30103）→ fetch で草案と完成の core_hash 一致
+- 回帰: 既存の全テストスイート維持（governance 30 / revocation 8 / compromise 24 / integration 10 / accept 7 / verify_binding 6 / rotation 8 / remove 10 / board_decision_nostr 10 / board_decision_fetch_policy 8）。
+
+### 21.8 スコープ外
+
+- `board_decide_fetch` と `board_draft_fetch` の統合（board_id 単位の 30103+30104 横断購読）— 将来候補。
+- 草案への自動通知（DM での通知連携）— 将来候補。
+- 草案の期限（expiry）— 将来候補。
+- kind 30104 の正式割当申請。
+- policy-update 決定の草案化 — 政策変更の決定は完成決定（30103）でのみ扱う方針を維持。
 
 ---
 
@@ -1245,3 +1321,4 @@ NIP-29 の管理イベントには「去る」と「外す」の 2 方向があ�
 - 2026-10-01: v0.14 設計 — board-decision の Nostr 公開を仕様書 §19 に固定（設計のみ、実装は次ラン）。§18.7 の「remove 決定の Nostr 公開」を全決定種別に一般化して吸収。要点: kind 30103（parameterized replaceable、nakama 独自割当）、`d` タグ = 決定のコアハッシュ（board_id/decision/created_at/payload の sha256 先頭 32 hex — cosign の approvals 追記でもスロット安定）、`h` タグ = board_id（board の決定一覧の取得方向）、content = 決定 JSON canonical。Nostr イベントの署名者は publisher（決定の有効性は threshold approvals が証明 — rotate_pub と異なり keyfile 一致チェックなし、意図的）。`board_decide_pub <relay> <decision.json> [--auth]`（構造検証→publish、無効は拒否）、`board_decide_fetch <relay> <board_id> [--limit] [--auth] [--out <dir>]`（三段階検証: Nostr 署名 → JSON パース → 構造＋d/h 二重チェック。threshold 検証は `board_read --governance` の管轄。同一コアの複数イベントは approvals マージ）。`--out` 保存ファイルは `board_read --governance --decisions` にそのまま渡せる形。正直に書く: publish は有効性を証明しない、決定は公開ガバナンス記録が前提（非公開 board は publish しない）、無効な決定の publish も可能（governance 側で排除）、kind は正式割当ではない。テスト計画 8 ケース（オフライン）。ロードマップ §7 に v0.14（設計中）を追加、ヘッダの日付行も更新。
 - 2026-10-01: v0.15 設計 — fetch 側の threshold 表示を仕様書 §20 に固定（設計のみ、実装は次ラン）。§19.8 の「fetch 側の threshold 検証」を再検討: 管轄は `board_read --governance` のまま維持し、任意の表示機能として `board_decide_fetch --policy <policy.json>` に取り込む。判定ロジックは新規に書かず `resolve_policy_at` + `_verify_decision_core` を流用し、fetch 集合内の policy-update 決定で決定時点の政策を解決（governance と同一の時点解決）。純粋関数 `fetch_threshold_status(d, policy, decisions)` を分離（オフラインでテスト可能）。無効な policy cert / board_id 不一致は拒否で exit 1、exit コードは不変。正直に書く: 「充足」は決定時点の政策での approvals ≥ threshold のみを意味しガバナンス有効性を含まない、policy は検証者が自分で入手したものを使う前提、policy-update 決定の欠落で古い政策表示になる暫定性。決定の撤回・無効化は設けない方針を固定（不変性維持、board 終了は close 決定）。テスト計画 8 ケース（オフライン・nostr_request モック）、回帰維持。cosign 回覧の Nostr 化は v0.16 の候補。ロードマップ §7 に v0.15（設計中）を追加、ヘッダの日付行も更新。
 - 2026-10-01: v0.15 実装 — §20 の設計をコード化。`fetch_threshold_status`（純粋関数、`(ok, n, m)` = 充足・有効署名数・決定時点の eligible 数）を `cmd_board_decide_fetch` の直前に追加し、`board_decide_fetch --policy <policy.json>` 任意フラグを実装。policy は `verify_board_policy_cert` で事前検証（無効・board_id 不一致は拒否で exit 1）、表示は各決定行に `threshold <n>/<m> 充足/不足`＋冒頭に暫定性の注記、`--policy` なしの従来動作・`--out` 保存内容・exit コードは不変。`getattr(args, 'policy', None)` で既存の SimpleNamespace 呼び出し互換を維持。`test_board_decision_fetch_policy.py` 新規 8 ケース通過、既存 9 スイート（governance 30 / revocation 8 / compromise 24 / integration 10 / accept 7 / verify_binding 6 / rotation 8 / remove 10 / board_decision_nostr 10）の回帰維持。ロードマップ §7 とヘッダの日付行を「v0.15 完了」に更新。
+- 2026-10-01: v0.16 設計 — cosign 回覧（決定前）の Nostr 化を仕様書 §21 に固定（設計のみ、実装は次ラン）。§20.7 のスコープ外項目。設計の要点: (1) kind 30104（parameterized replaceable、nakama 独自割当）、`d` タグ = `decision_core_hash(d)`（30103 と同一コアで草案→完成を対応付け）、`h` タグ = board_id、署名者は publisher（keyfile 一致チェックなし、30103 と同一判断）。(2) 回覧方式は方式 B: 各承認者が cosign した版を自分の (publisher, 30104, d) スロットに再公開し、fetch 側で `merge_decision_approvals` が同一コアを統合（approvals の出所保持・last-writer-wins 競合なし・新規純粋関数なし）。(3) 運用フロー: board_decide → board_draft_pub → board_draft_fetch [--policy] --out → board_cosign → board_draft_pub（新規 cosign コマンドは作らず既存の組み合わせ）→ threshold 達成 → board_decide_pub（30103）で完成公開。成立の公開宣言は kind 30103 の存在、governance の有効性基準は不変。(4) CLI: `board_draft_pub <relay> <draft.json> [--auth]`、`board_draft_fetch <relay> <board_id> [--limit] [--auth] [--out <dir>] [--policy <policy.json>]`（30104、threshold 表示は §20 と同一ロジック＋「草案」マーカー）。(5) --policy 表示との連携: `fetch_threshold_status` を共有、草案の「充足」は「成立可能」の意味。草案の時点解決には fetch 集合内の 30103 決定を使い、`resolve_policy_at` の不変条件を維持（policy-update 決定の草案化は対象外）。正直に書く: 草案の公開は成立の証拠ではない、古い版の approvals 抜き出し再公開は技術的に可能（撤回手段なし、§20.5 と同一）、kind は正式割当ではない、非公開 board の草案は publish しない。テスト計画 8 ケース（オフライン・nostr_request/nostr_publish モック）、回帰維持。スコープ外: fetch 統合、自動通知、草案の期限、kind 正式割当、policy-update 決定の草案化。ロードマップ §7 に v0.16（設計中）を追加、ヘッダの日付行も更新。
