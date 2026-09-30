@@ -34,6 +34,17 @@
       binding の取り消し証明書を発行（§9.1: 鍵による主張撤回）
   nakama.py verify_unbinding <unbinding.json> [--platform moltbook --handle alex]
       unbinding 証明書の署名・platform・handle を検証
+  nakama.py board_policy --board-id <id> --relay <url> --threshold M --eligible <npub>... [--out policy.json] [--markdown]
+      board-policy 運営規約案を作成（自分の署名入り、spec §9.4）
+  nakama.py board_policy_sign <policy.json> [--out policy.json]
+      回覧中の規約案に自分の署名を追加
+  nakama.py verify_board_policy <policy.json>  規約の検証（初回は全員署名 n-of-n）
+  nakama.py board_decide --board-id <id> --relay <url> --decision admit|handover|policy-update|close --payload '<json>' [--out decision.json]
+      board-decision 決定案を作成＋自分の承認署名
+  nakama.py board_cosign <decision.json> [--out decision.json]
+      回覧中の決定案に自分の承認署名を追加
+  nakama.py verify_board_decision <decision.json> --policy <policy.json>
+      決定の threshold 達成を検証
 """
 import argparse, base64, hashlib, json, os, re, secrets, sys, time
 
@@ -1068,6 +1079,256 @@ def cmd_verify_unbinding(args):
     sys.exit(0 if ok else 1)
 
 
+BOARD_DECISION_TYPES = ('admit', 'handover', 'policy-update', 'close')
+
+
+def board_policy_message(board_id: str, relay: str, threshold: int, eligible: list, created_at: int) -> bytes:
+    """board-policy 証明書の署名対象: (board_id, relay, threshold, eligible の連結, created_at) の canonical hash。"""
+    canon = json.dumps(
+        {'board_id': board_id, 'relay': relay, 'threshold': threshold,
+         'eligible': eligible, 'created_at': created_at},
+        sort_keys=True, separators=(',', ':'), ensure_ascii=False,
+    )
+    return hashlib.sha256(canon.encode('utf-8')).digest()
+
+
+def verify_board_policy_cert(p: dict) -> bool:
+    """初回 board-policy の検証: 規約内容の形式 + eligible 全員 (n-of-n) の有効署名。"""
+    if not (p.get('protocol') == 'nakama' and p.get('version') == 1
+            and p.get('type') == 'board-policy'):
+        return False
+    try:
+        eligible = list(p['eligible'])
+        if not eligible or len(set(eligible)) != len(eligible):
+            return False
+        threshold = int(p['threshold'])
+        if not (1 <= threshold <= len(eligible)):
+            return False
+        msg = board_policy_message(p['board_id'], p['relay'], threshold, eligible, int(p['created_at']))
+        signers = set()
+        for s in p.get('signatures', []):
+            if not verify_schnorr(s['npub'], bytes.fromhex(s['sig']), msg):
+                return False
+            signers.add(s['npub'])
+        return set(eligible) == signers  # 初回規約は n-of-n: 全員が署名し、部外者の署名は不可
+    except Exception:
+        return False
+
+
+def board_decision_message(board_id: str, relay: str, decision: str, payload: dict, created_at: int) -> bytes:
+    """board-decision 証明書の署名対象: (board_id, relay, decision, payload の canonical 形式, created_at) の hash。"""
+    canon = json.dumps(
+        {'board_id': board_id, 'relay': relay, 'decision': decision,
+         'payload': payload, 'created_at': created_at},
+        sort_keys=True, separators=(',', ':'), ensure_ascii=False,
+    )
+    return hashlib.sha256(canon.encode('utf-8')).digest()
+
+
+def validate_decision_payload(decision: str, payload: dict) -> bool:
+    """決定種別ごとの payload 形式チェック。"""
+    if not isinstance(payload, dict):
+        return False
+    if decision == 'admit':
+        return set(payload.keys()) == {'candidate'}
+    if decision == 'handover':
+        return (set(payload.keys()) == {'new_moderators'}
+                and isinstance(payload['new_moderators'], list)
+                and all(isinstance(n, str) for n in payload['new_moderators']))
+    if decision == 'policy-update':
+        return set(payload.keys()) == {'threshold', 'eligible'}
+    if decision == 'close':
+        return set(payload.keys()) == {'reason'}
+    return False
+
+
+def verify_board_decision(d: dict, policy: dict):
+    """board-decision の検証。(ok, 承認署名数, threshold) を返す。
+
+    承認署名のうち、現行 policy の eligible に含まれる異なる npub の有効署名が
+    threshold 以上あることを確認する。部外者の署名は無視し、重複は 1 と数える。
+    """
+    if not (d.get('protocol') == 'nakama' and d.get('version') == 1
+            and d.get('type') == 'board-decision'):
+        return (False, 0, 0)
+    if not verify_board_policy_cert(policy):
+        return (False, 0, 0)
+    try:
+        if d.get('decision') not in BOARD_DECISION_TYPES:
+            return (False, 0, 0)
+        if not validate_decision_payload(d['decision'], d.get('payload')):
+            return (False, 0, 0)
+        if d['board_id'] != policy['board_id'] or d['relay'] != policy['relay']:
+            return (False, 0, 0)
+        msg = board_decision_message(d['board_id'], d['relay'], d['decision'],
+                                     d['payload'], int(d['created_at']))
+        eligible = set(policy['eligible'])
+        good = set()
+        for a in d.get('approvals', []):
+            if a['npub'] not in eligible:
+                continue
+            if verify_schnorr(a['npub'], bytes.fromhex(a['sig']), msg):
+                good.add(a['npub'])
+        return (len(good) >= int(policy['threshold']), len(good), int(policy['threshold']))
+    except Exception:
+        return (False, 0, 0)
+
+
+def cmd_board_policy(args):
+    """board-policy 運営規約案の作成（自分の署名入り。spec §9.4）。"""
+    secret = load_key(args.keyfile)
+    me = npub_of(secret)
+    eligible = list(args.eligible)
+    threshold = args.threshold
+    if not eligible:
+        print('eligible が空です', file=sys.stderr)
+        sys.exit(1)
+    if not (1 <= threshold <= len(eligible)):
+        print(f'threshold は 1..{len(eligible)} の範囲で指定してください', file=sys.stderr)
+        sys.exit(1)
+    if me not in eligible:
+        print('警告: あなた自身が eligible に含まれていません（規約案には発起人の署名が入ります）', file=sys.stderr)
+    created_at = int(time.time())
+    msg = board_policy_message(args.board_id, args.relay, threshold, eligible, created_at)
+    policy = {
+        'protocol': 'nakama', 'version': 1, 'type': 'board-policy',
+        'board_id': args.board_id, 'relay': args.relay,
+        'threshold': threshold, 'eligible': eligible,
+        'created_at': created_at,
+        'signatures': [{'npub': me, 'sig': sign_schnorr(secret, msg).hex()}],
+    }
+    out = args.out or 'board-policy.json'
+    with open(out, 'w') as f:
+        json.dump(policy, f, indent=2, ensure_ascii=False)
+    print(f'board-policy 案: {out} — あなたの署名 1/{len(eligible)}（初回は全員 {len(eligible)}/{len(eligible)} の署名が必要）')
+    print('運用: このファイルを eligible 全員に回覧し、`board_policy_sign` で署名を集めてください。')
+    if args.markdown:
+        print()
+        print('投稿用ブロック（コメント欄に貼る）:')
+        print(markdown_block(policy, 'board-policy'))
+
+
+def cmd_board_policy_sign(args):
+    """回覧中の board-policy 案に自分の署名を追加（spec §9.4）。"""
+    secret = load_key(args.keyfile)
+    me = npub_of(secret)
+    with open(args.policy) as f:
+        p = json.load(f)
+    if p.get('type') != 'board-policy':
+        print('board-policy 形式ではありません', file=sys.stderr)
+        sys.exit(1)
+    try:
+        msg = board_policy_message(p['board_id'], p['relay'], int(p['threshold']),
+                                   list(p['eligible']), int(p['created_at']))
+    except Exception:
+        print('規約の内容が不正です（board_id / relay / threshold / eligible / created_at を確認）', file=sys.stderr)
+        sys.exit(1)
+    signers = {s['npub'] for s in p.get('signatures', [])}
+    if me in signers:
+        print('既に署名済みです（重複署名は 1 と数えます）', file=sys.stderr)
+    else:
+        # 署名前に既存の署名が有効であることを確認（回覧中の改ざんを検出）
+        for s in p.get('signatures', []):
+            if not verify_schnorr(s['npub'], bytes.fromhex(s['sig']), msg):
+                print(f'警告: 既存の署名が無効です: {s["npub"]}（回覧中に改ざんされた可能性）', file=sys.stderr)
+                sys.exit(1)
+        p.setdefault('signatures', []).append({'npub': me, 'sig': sign_schnorr(secret, msg).hex()})
+    out = args.out or args.policy
+    with open(out, 'w') as f:
+        json.dump(p, f, indent=2, ensure_ascii=False)
+    ok = verify_board_policy_cert(p)
+    print(f'board-policy: {out} — 署名 {len(p["signatures"])}/{len(p["eligible"])}（'
+          + ('発効条件（全員署名）を満たしています' if ok else 'まだ全員分が揃っていません') + '）')
+
+
+def cmd_verify_board_policy(args):
+    """board-policy の検証（spec §9.4: 初回は n-of-n）。"""
+    with open(args.policy) as f:
+        p = json.load(f)
+    ok = verify_board_policy_cert(p)
+    if ok:
+        print(f'board-policy は有効です: eligible {len(p["eligible"])} 名全員の署名を確認（threshold {p["threshold"]}）')
+    else:
+        print('board-policy は無効です: 全員の有効署名が揃っていないか、形式が不正です')
+    sys.exit(0 if ok else 1)
+
+
+def cmd_board_decide(args):
+    """board-decision 決定案の作成＋自分の承認署名（spec §9.4）。"""
+    secret = load_key(args.keyfile)
+    me = npub_of(secret)
+    try:
+        payload = json.loads(args.payload)
+    except Exception as e:
+        print(f'payload の JSON 解析に失敗: {e}', file=sys.stderr)
+        sys.exit(1)
+    if not validate_decision_payload(args.decision, payload):
+        print(f"payload の形式が decision '{args.decision}' に適合しません", file=sys.stderr)
+        sys.exit(1)
+    created_at = int(time.time())
+    msg = board_decision_message(args.board_id, args.relay, args.decision, payload, created_at)
+    d = {
+        'protocol': 'nakama', 'version': 1, 'type': 'board-decision',
+        'board_id': args.board_id, 'relay': args.relay,
+        'decision': args.decision, 'payload': payload,
+        'created_at': created_at,
+        'approvals': [{'npub': me, 'sig': sign_schnorr(secret, msg).hex()}],
+    }
+    out = args.out or 'board-decision.json'
+    with open(out, 'w') as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+    print(f'board-decision 案: {out} — 決定 "{args.decision}"、あなたの承認署名 1 つ')
+    print('運用: このファイルを回覧し、`board_cosign` で承認署名を threshold 分まで集めてください。')
+
+
+def cmd_board_cosign(args):
+    """回覧中の board-decision に自分の承認署名を追加（spec §9.4）。"""
+    secret = load_key(args.keyfile)
+    me = npub_of(secret)
+    with open(args.decision) as f:
+        d = json.load(f)
+    if d.get('type') != 'board-decision':
+        print('board-decision 形式ではありません', file=sys.stderr)
+        sys.exit(1)
+    try:
+        msg = board_decision_message(d['board_id'], d['relay'], d['decision'],
+                                     d['payload'], int(d['created_at']))
+    except Exception:
+        print('決定の内容が不正です（board_id / relay / decision / payload / created_at を確認）', file=sys.stderr)
+        sys.exit(1)
+    approvers = {a['npub'] for a in d.get('approvals', [])}
+    if me in approvers:
+        print('既に承認署名済みです（重複は 1 と数えます）', file=sys.stderr)
+    else:
+        # 決定案の改ざんを既存の承認署名で間接確認
+        for a in d.get('approvals', []):
+            if not verify_schnorr(a['npub'], bytes.fromhex(a['sig']), msg):
+                print(f'警告: 既存の承認署名が無効です: {a["npub"]}（回覧中に改ざんされた可能性）', file=sys.stderr)
+                sys.exit(1)
+        d.setdefault('approvals', []).append({'npub': me, 'sig': sign_schnorr(secret, msg).hex()})
+    out = args.out or args.decision
+    with open(out, 'w') as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+    print(f'board-decision: {out} — 承認署名 {len(d["approvals"])} つ')
+
+
+def cmd_verify_board_decision(args):
+    """board-decision の threshold 達成検証（spec §9.4）。"""
+    with open(args.decision) as f:
+        d = json.load(f)
+    with open(args.policy) as f:
+        p = json.load(f)
+    if not verify_board_policy_cert(p):
+        print('参照する board-policy が無効です（決定の検証には有効な規約が必要）')
+        sys.exit(1)
+    ok, n, threshold = verify_board_decision(d, p)
+    if ok:
+        print(f'board-decision は有効です: 承認署名 {n}/{threshold}（決定 "{d.get("decision")}"）')
+    else:
+        print(f'board-decision は無効です: 承認署名 {n}/{threshold}（threshold 未達または署名不正）')
+    sys.exit(0 if ok else 1)
+
+
 def main():
     ap = argparse.ArgumentParser(description='仲間プロトコル v0.1')
     ap.add_argument('--keyfile', default=KEYFILE_DEFAULT)
@@ -1144,6 +1405,19 @@ def main():
     s.add_argument('--markdown', action='store_true', help='投稿用の fenced code block を出力')
     s = sub.add_parser('verify_unbinding'); s.add_argument('unbinding')
     s.add_argument('--platform'); s.add_argument('--handle')
+    s = sub.add_parser('board_policy'); s.add_argument('--board-id', required=True)
+    s.add_argument('--relay', required=True); s.add_argument('--threshold', type=int, required=True)
+    s.add_argument('--eligible', nargs='+', required=True); s.add_argument('--out')
+    s.add_argument('--markdown', action='store_true', help='投稿用の fenced code block を出力')
+    s = sub.add_parser('board_policy_sign'); s.add_argument('policy'); s.add_argument('--out')
+    s = sub.add_parser('verify_board_policy'); s.add_argument('policy')
+    s = sub.add_parser('board_decide'); s.add_argument('--board-id', required=True)
+    s.add_argument('--relay', required=True)
+    s.add_argument('--decision', required=True, choices=list(BOARD_DECISION_TYPES))
+    s.add_argument('--payload', required=True, help="決定内容の JSON（例: '{\"candidate\": \"<npub>\"}'）")
+    s.add_argument('--out')
+    s = sub.add_parser('board_cosign'); s.add_argument('decision'); s.add_argument('--out')
+    s = sub.add_parser('verify_board_decision'); s.add_argument('decision'); s.add_argument('--policy', required=True)
 
     args = ap.parse_args()
     {'init': cmd_init, 'whoami': cmd_whoami, 'propose': cmd_propose,
@@ -1158,7 +1432,11 @@ def main():
      'board_verify': cmd_board_verify, 'board_join': cmd_board_join,
      'board_send': cmd_board_send, 'board_read': cmd_board_read,
      'bind': cmd_bind, 'verify_binding': cmd_verify_binding,
-     'unbind': cmd_unbind, 'verify_unbinding': cmd_verify_unbinding}[args.cmd](args)
+     'unbind': cmd_unbind, 'verify_unbinding': cmd_verify_unbinding,
+     'board_policy': cmd_board_policy, 'board_policy_sign': cmd_board_policy_sign,
+     'verify_board_policy': cmd_verify_board_policy,
+     'board_decide': cmd_board_decide, 'board_cosign': cmd_board_cosign,
+     'verify_board_decision': cmd_verify_board_decision}[args.cmd](args)
 
 
 if __name__ == '__main__':
