@@ -195,6 +195,14 @@ def cmd_accept(args):
         if not verify_schnorr(npub, bytes.fromhex(sighex), msg):
             print(f'警告: {npub[:16]}... の署名が無効です', file=sys.stderr)
             sys.exit(1)
+    # §15: accept 時の侵害警告 — proposal 検証の後・自分の署名前。
+    # 自分以外の当事者に非撤回宣言があれば stderr に WARN（advisory、exit コード不変）。
+    creg = getattr(args, 'compromise_registry', None) or COMPROMISES_DEFAULT
+    for npub in p['companions']:
+        if npub == me:
+            continue
+        for w in key_compromise_warnings(npub, creg):
+            print(w, file=sys.stderr)
     p['signatures'][me] = sign_schnorr(secret, msg).hex()
     out = args.out or 'bond.json'
     with open(out, 'w') as f:
@@ -2365,6 +2373,7 @@ def main():
     s.add_argument('--out'); s.add_argument('--from-b64', dest='from_b64', default=None,
         help='base64url/fenced block の proposal を直接受理 (§8.3)')
     s.add_argument('--markdown', action='store_true', help='完成 bond を投稿用ブロックで出力 (§8.3)')
+    s.add_argument('--compromise-registry', default=None, help='compromise registry ディレクトリ (既定: ~/.config/nakama/compromises)')
     s = sub.add_parser('verify'); s.add_argument('bond'); s.add_argument('--rotation', action='append', default=[])
     s.add_argument('--registry', default=None, help='revocation registry ディレクトリ (既定: ~/.config/nakama/revocations)')
     s.add_argument('--skip-registry', action='store_true', help='registry の解消チェックを省略')
