@@ -26,6 +26,8 @@
   nakama.py board_join <relay> <board_id>         広場に参加申請（kind 9007 を publish）
   nakama.py board_send <relay> <board_id> "MSG"   広場に投稿（kind 9 平文を publish）
   nakama.py board_read <relay> <board_id> [--since TS] [--limit N]  広場の投稿を購読・表示
+  nakama.py board_read <relay> <board_id> --governance <policy.json> [--decisions <file|dir>...]
+      管理イベント (kind 9000/9001) と board-decision の合意照合（spec §9.4）
   nakama.py bind --platform moltbook --handle alex [--out binding.json] [--markdown]
       platform-binding 証明書を発行（§8.2: 鍵がハンドルを主張）
   nakama.py verify_binding <binding.json> [--platform moltbook --handle alex]
@@ -883,6 +885,9 @@ def cmd_board_send(args):
 
 def cmd_board_read(args):
     """広場の投稿を購読・表示: kind 9 + #h フィルタ。署名の無効なイベントは無視する。"""
+    if args.governance:
+        cmd_board_governance(args)
+        return
     sub_id = secrets.token_hex(8)
     filt = {'kinds': [9], '#h': [args.board_id], 'limit': args.limit}
     if args.since:
@@ -1329,6 +1334,143 @@ def cmd_verify_board_decision(args):
     sys.exit(0 if ok else 1)
 
 
+# --- v0.4: ガバナンス照合 (spec §9.4: board_read --governance) ---
+
+# 決定種別 → その決定が正当化できる NIP-29 管理イベントの kind。
+# admit は kind 9000 (Add User) を対象にする。policy-update / close は
+# リレー上のイベントに対応しない内部決定。handover は kind 9002/9004
+# (moderator 変更) を将来対象にするための予約。
+GOVERNANCE_COVERAGE = {
+    'admit': {9000},
+    'handover': {9002, 9004},
+    'policy-update': set(),
+    'close': set(),
+}
+GOVERNANCE_CHECK_KINDS = [9000, 9001]
+
+
+def npub_to_hex(npub: str) -> str | None:
+    """npub → 64 hex pubkey。変換不能なら None。"""
+    try:
+        return NostrPublicKey.from_npub(npub).hex()
+    except Exception:
+        return None
+
+
+def governance_match_events(events: list, policy: dict, decisions: list) -> list:
+    """管理イベントごとに仲間内の合意の有無を判定する純粋関数 (spec §9.4)。
+
+    各イベントについて dict(status, event, detail) を返す。
+    status: 'ok'（対応する有効な board-decision あり）
+          | 'warn'（対応する決定なし — 合意の証拠なし）
+          | 'invalid-sig'（イベント署名が無効で帰属を特定できない）
+    """
+    valid = []  # (decision, 承認署名数, threshold)
+    for d in decisions:
+        ok, n, m = verify_board_decision(d, policy)
+        if ok:
+            valid.append((d, n, m))
+    results = []
+    for ev in sorted(events, key=lambda e: e.get('created_at', 0)):
+        kind = ev.get('kind')
+        if not verify_event_sig(ev):
+            results.append({'status': 'invalid-sig', 'event': ev,
+                            'detail': 'イベント署名が無効（帰属を特定できないため照合対象外）'})
+            continue
+        subject = next((t[1] for t in ev.get('tags', []) if t and t[0] == 'p'),
+                       None)
+        cover = None
+        if kind == 9000:
+            # admit 決定の payload.candidate がイベントの対象 (p タグ) と一致するか
+            for d, n, m in valid:
+                if d['decision'] != 'admit':
+                    continue
+                if kind not in GOVERNANCE_COVERAGE['admit']:
+                    continue
+                cand_hex = npub_to_hex(d['payload']['candidate'])
+                if cand_hex and subject and cand_hex == subject:
+                    cover = (d, n, m)
+                    break
+            if cover:
+                d, n, m = cover
+                results.append({'status': 'ok', 'event': ev,
+                                'detail': f'admit 決定が対応（承認 {n}/{m}、決定時刻 '
+                                          f'{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d["created_at"]))}）'})
+            else:
+                results.append({'status': 'warn', 'event': ev,
+                                'detail': '対応する admit 決定なし（仲間内の合意なしの参加追加）'})
+        elif kind == 9001:
+            # remove に対応する決定種別は規約の語彙にない → 常に警告
+            results.append({'status': 'warn', 'event': ev,
+                            'detail': 'remove に対応する決定種別は規約にない（合意の証拠なし）'})
+        else:
+            results.append({'status': 'warn', 'event': ev,
+                            'detail': f'kind {kind} は照合対象外（未対応の管理イベント）'})
+    return results
+
+
+def load_decisions(paths) -> list:
+    """--decisions のパス（ファイル or ディレクトリ）から board-decision を読み込む。"""
+    decs = []
+    for p in paths or []:
+        if os.path.isdir(p):
+            files = [os.path.join(p, f) for f in sorted(os.listdir(p))
+                     if f.endswith('.json')]
+        else:
+            files = [p]
+        for f in files:
+            try:
+                with open(f) as fh:
+                    decs.append(json.load(fh))
+            except Exception as e:
+                print(f'警告: 決定ファイルの読み込みに失敗: {f} ({e})', file=sys.stderr)
+    return decs
+
+
+def cmd_board_governance(args):
+    """board_read --governance: 管理イベント (kind 9000/9001) と board-decision の合意照合。
+
+    リレーは管理イベントを発行者の鍵だけで受け付けるため、仲間内の合意は
+    強制できない。合意を無視した管理イベントを警告表示することで社会的に
+    抑止するのがこのコマンドの役割（spec §9.4「正直に書く」）。
+    """
+    with open(args.governance) as f:
+        policy = json.load(f)
+    if not verify_board_policy_cert(policy):
+        print('board-policy が無効です（発効条件 n-of-n を満たしていません）', file=sys.stderr)
+        sys.exit(1)
+    decisions = load_decisions(args.decisions)
+    for d in decisions:
+        if not verify_board_decision(d, policy)[0]:
+            print(f'注: 無効な board-decision を照合対象から除外: '
+                  f'{d.get("decision", "?")} (created_at {d.get("created_at", "?")})',
+                  file=sys.stderr)
+    filt = {'kinds': GOVERNANCE_CHECK_KINDS, '#h': [args.board_id], 'limit': args.limit}
+    if args.since:
+        filt['since'] = args.since
+    auth_secret = load_key(args.keyfile) if args.auth else None
+    events = nostr_request(args.relay, ['REQ', secrets.token_hex(8), filt],
+                           auth_secret=auth_secret)
+    results = governance_match_events(events, policy, decisions)
+    print(f'ガバナンス照合: {args.board_id} @ {args.relay}')
+    print(f'規約: eligible {len(policy["eligible"])} 名、threshold {policy["threshold"]}'
+          f'、決定 {len(decisions)} 件を読み込み')
+    warns = 0
+    for r in results:
+        ev = r['event']
+        kind_name = {9000: 'Add User', 9001: 'Remove User'}.get(ev.get('kind'), f'kind {ev.get("kind")}')
+        ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ev.get('created_at', 0)))
+        subject = next((t[1] for t in ev.get('tags', []) if t and t[0] == 'p'), '?')
+        mark = 'OK' if r['status'] == 'ok' else ('署名無効' if r['status'] == 'invalid-sig' else '警告')
+        print(f'--- [{ts}] kind {ev.get("kind")} ({kind_name}) 発行: {ev.get("pubkey", "?")[:16]}... '
+              f'対象: {subject[:16] if subject != "?" else "?"}... [{mark}]')
+        print(f'    {r["detail"]}')
+        if r['status'] != 'ok':
+            warns += 1
+    print(f'管理イベント {len(results)} 件中、要確認 {warns} 件')
+    sys.exit(1 if warns else 0)
+
+
 def main():
     ap = argparse.ArgumentParser(description='仲間プロトコル v0.1')
     ap.add_argument('--keyfile', default=KEYFILE_DEFAULT)
@@ -1393,6 +1535,10 @@ def main():
     s = sub.add_parser('board_read'); s.add_argument('relay'); s.add_argument('board_id')
     s.add_argument('--since', type=int); s.add_argument('--limit', type=int, default=20)
     s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s.add_argument('--governance', metavar='POLICY',
+                   help='ガバナンス照合モード: board-policy を読み込み、管理イベント (kind 9000/9001) と board-decision の合意を照合する (spec §9.4)')
+    s.add_argument('--decisions', nargs='*', metavar='PATH',
+                   help='board-decision のファイルまたはディレクトリ（--governance と併用）')
     s = sub.add_parser('bind'); s.add_argument('--platform', required=True)
     s.add_argument('--handle', required=True); s.add_argument('--out')
     s.add_argument('--markdown', action='store_true', help='投稿用の fenced code block を出力')
