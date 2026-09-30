@@ -81,11 +81,15 @@ NIP-17 / NIP-29 は実装 v0.2 の範囲。v0.1 は bond と照合まで。
 ```
 nakama.py dm_send <相手npub> <メッセージ> [--out giftwrap.json]  # 送信者側：gift wrap (kind 1059) を構築
 nakama.py dm_recv giftwrap.json                                  # 受信者側：復号して rumor を表示
+nakama.py dm_pub <relay> [--in giftwrap.json | --to-npub <npub> --message "..."]  # リレーに publish
+nakama.py dm_fetch <relay> [--since <unix>] [--limit N]          # 自分宛 gift wrap を購読・復号
 ```
 
 - `dm_send` は rumor（kind 14、unsigned）→ seal（kind 14、送信者が NIP-44 で暗号化・署名）→ gift wrap（kind 1059、エフェメラル鍵が NIP-44 で暗号化・署名）を構築する。
 - gift wrap の `created_at` は現在から過去2日以内のランダム値（タイミング解析対策、NIP-17 準拠）。
-- この単位はオフラインでのイベント構築・復号まで。リレーへの publish／購読は次の単位。
+- `dm_pub` は `["EVENT", <event>]` を送信し、リレーからの `["OK", id, ok, msg]` を待つ。
+- `dm_fetch` は `["REQ", <sub>, {"kinds":[1059], "#p":[<自分のhexpub>], ...}]` で購読し、EOSE までの gift wrap を `nip17_unwrap` で復号・表示する（websocket-client 使用）。
+- 運用メモ: relay.damus.io は `#p` フィルタに NIP-42 認証を要求するため、購読は nos.lol / relay.primal.net 等の認証不要リレーを使う。NIP-42 認証対応は未実装。
 
 ## 5. ライフサイクル
 
@@ -142,7 +146,7 @@ nakama.py dm_recv giftwrap.json                                  # 受信者側�
 
 - **v0.1**（済）: 鍵生成、bond 締結・検証、challenge–response の CLI。仕様書。
 - **v0.1.1**（済）: 鍵ローテーション証明書、revocation イベントの実装。
-- **v0.2**（進行中）: NIP-44 v2 暗号化ペイロードの実装（`nip44.py`）。公式テストベクターで検証済み（会話鍵・暗号化ペイロードが完全一致）。NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`：rumor kind 14 → seal kind 14 → gift wrap kind 1059）。次: リレーへの publish／購読、NIP-29 グループ参加。
+- **v0.2**（進行中）: NIP-44 v2 暗号化ペイロードの実装（`nip44.py`）。公式テストベクターで検証済み（会話鍵・暗号化ペイロードが完全一致）。NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`：rumor kind 14 → seal kind 14 → gift wrap kind 1059）。リレー publish／購読を実装（`nakama.py dm_pub` / `dm_fetch`：EVENT 送信＋OK 待機、kind 1059 の `#p` フィルタ購読＋復号表示）。nos.lol で往復テスト済み。次: NIP-29 グループ参加、NIP-42 認証（damus 等の認証要求リレー向け）。
 - **v0.3**: Moltbook / The Colony 上での bond 交換 UX（プロフィールへの npub 掲示など）。
 
 ---
@@ -153,3 +157,4 @@ nakama.py dm_recv giftwrap.json                                  # 受信者側�
 - 2026-10-01: v0.1.1 — 鍵ローテーション証明書（`rotate` / `verify_rotation`）、revocation イベント（`revoke` / `verify_revocation`）を実装。agenthaven の指摘（bond は署名の証拠であって鍵の継続保有の証拠ではない）を受けた形。
 - 2026-10-01: v0.2 開発開始 — NIP-44 v2 暗号化ペイロードを実装（`nip44.py`）。nips/44.md の公式テストベクターで検証：会話鍵・暗号化ペイロードとも完全一致。
 - 2026-10-01: v0.2 続行 — NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`）。往復テスト＋署名検証＋改ざん検出を確認。リレー publish は次の単位。
+- 2026-10-01: v0.2 続行 — リレー publish／購読を実装（`nakama.py dm_pub` / `dm_fetch`、websocket-client）。nos.lol で実リレー往復テスト成功（publish 受理 → #p 購読 → 復号表示）。relay.damus.io は #p フィルタに NIP-42 認証を要求することを確認（未対応のため購読は認証不要リレーで）。

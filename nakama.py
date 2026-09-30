@@ -16,6 +16,10 @@
   nakama.py verify_rotation <rotation.json>          rotation 証明書を検証
   nakama.py revoke <bond.json>                       bond の解消 (revocation イベント) を署名して発行
   nakama.py verify_revocation <revocation.json> --bond <bond.json>  解消イベントを検証
+  nakama.py dm_send <相手npub> <メッセージ> [--out FILE]  gift wrap (kind 1059) を構築
+  nakama.py dm_recv <giftwrap.json>                    gift wrap を復号して rumor を表示
+  nakama.py dm_pub <relay> [--in FILE|--to-npub NPUB --message MSG]  gift wrap をリレーに publish
+  nakama.py dm_fetch <relay> [--since TS] [--limit N]  自分宛 gift wrap を購読・復号
 """
 import argparse, hashlib, json, os, secrets, sys, time
 
@@ -362,6 +366,119 @@ def nip17_unwrap(gift_wrap: dict, my_secret: bytes) -> dict:
     return rumor
 
 
+def nostr_relay_ws(url: str, timeout: int = 15):
+    """Nostr リレーへの websocket 接続（websocket-client を使用、遅延 import）。"""
+    try:
+        from websocket import create_connection
+    except ImportError:
+        print('websocket-client が必要です: pip install websocket-client'); sys.exit(1)
+    try:
+        return create_connection(url, timeout=timeout)
+    except Exception as e:
+        print(f'リレー {url} への接続に失敗しました: {e}'); sys.exit(1)
+
+
+def nostr_request(url: str, request: list, timeout: int = 15) -> list:
+    """REQ を投げ、EOSE までイベントを収集して返す（短い余裕時間つき）。"""
+    ws = nostr_relay_ws(url, timeout)
+    try:
+        ws.send(json.dumps(request))
+        events, eose = [], False
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                msg = json.loads(ws.recv())
+            except Exception:
+                break
+            if not isinstance(msg, list) or len(msg) < 2:
+                continue
+            kind = msg[0]
+            if kind == 'EVENT':
+                events.append(msg[2] if len(msg) > 2 else msg[-1])
+            elif kind == 'EOSE':
+                eose = True
+                break
+            elif kind == 'CLOSED':
+                break
+        # EOSE 後の余裕: 直前に届いた EVENT を拾い漏らさないよう少し待つ
+        ws.settimeout(2)
+        try:
+            while True:
+                msg = json.loads(ws.recv())
+                if isinstance(msg, list) and msg and msg[0] == 'EVENT':
+                    events.append(msg[2] if len(msg) > 2 else msg[-1])
+        except Exception:
+            pass
+        ws.send(json.dumps(['CLOSE', request[1]]))
+        return events
+    finally:
+        ws.close()
+
+
+def cmd_dm_pub(args):
+    """gift wrap を Nostr リレーに publish: ["EVENT", <event>] → ["OK", id, ok, msg]。"""
+    secret = load_key(args.keyfile)
+    if args.in_file:
+        with open(args.in_file) as f:
+            wrap = json.load(f)
+    else:
+        if not args.to_npub or not args.message:
+            print('--in か (--to-npub + --message) のどちらかが必要です'); sys.exit(1)
+        try:
+            recipient_hexpub = NostrPublicKey.from_npub(args.to_npub).hex()
+        except Exception:
+            print('npub の形式が不正です'); sys.exit(1)
+        seal = nip17_build_seal(secret, recipient_hexpub, args.message)
+        wrap = nip17_build_gift_wrap(seal, recipient_hexpub)
+    ws = nostr_relay_ws(args.relay)
+    try:
+        ws.send(json.dumps(['EVENT', wrap]))
+        ws.settimeout(15)
+        ok_result = None
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                msg = json.loads(ws.recv())
+            except Exception:
+                break
+            if isinstance(msg, list) and msg and msg[0] == 'OK' and len(msg) > 1 and msg[1] == wrap['id']:
+                ok_result = (bool(msg[2]), msg[3] if len(msg) > 3 else '')
+                break
+            if isinstance(msg, list) and msg and msg[0] in ('NOTICE', 'CLOSED'):
+                ok_result = (False, ' '.join(str(x) for x in msg[1:]))
+                break
+    finally:
+        ws.close()
+    if ok_result is None:
+        print('リレーからの OK 応答がありませんでした'); sys.exit(1)
+    accepted, reason = ok_result
+    print(f'publish: {"受理" if accepted else "拒否"} ({reason}) id={wrap["id"]}')
+    sys.exit(0 if accepted else 1)
+
+
+def cmd_dm_fetch(args):
+    """自分宛の gift wrap (kind 1059, #p 自分) を購読し、復号して rumor を表示。"""
+    secret = load_key(args.keyfile)
+    my_hexpub = hexpub_of(secret)
+    filt = {'kinds': [1059], '#p': [my_hexpub], 'limit': args.limit}
+    if args.since:
+        filt['since'] = args.since
+    sub_id = secrets.token_hex(8)
+    events = nostr_request(args.relay, ['REQ', sub_id, filt])
+    shown = 0
+    for ev in sorted(events, key=lambda e: e.get('created_at', 0)):
+        try:
+            rumor = nip17_unwrap(ev, secret)
+        except (ValueError, AssertionError, KeyError):
+            continue  # 自分向けに復号できない gift wrap は無視
+        shown += 1
+        ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(rumor.get('created_at', 0)))
+        print(f"--- [{ts}] from {rumor['pubkey'][:16]}...")
+        print(rumor['content'])
+    if not shown:
+        print('新しい DM はありませんでした')
+
+
 def cmd_dm_send(args):
     secret = load_key(args.keyfile)
     try:
@@ -431,6 +548,10 @@ def main():
     s = sub.add_parser('verify_revocation'); s.add_argument('revocation'); s.add_argument('--bond')
     s = sub.add_parser('dm_send'); s.add_argument('npub'); s.add_argument('message'); s.add_argument('--out')
     s = sub.add_parser('dm_recv'); s.add_argument('giftwrap')
+    s = sub.add_parser('dm_pub'); s.add_argument('relay'); s.add_argument('--in', dest='in_file')
+    s.add_argument('--to-npub'); s.add_argument('--message')
+    s = sub.add_parser('dm_fetch'); s.add_argument('relay'); s.add_argument('--since', type=int)
+    s.add_argument('--limit', type=int, default=20)
 
     args = ap.parse_args()
     {'init': cmd_init, 'whoami': cmd_whoami, 'propose': cmd_propose,
@@ -438,7 +559,8 @@ def main():
      'respond': cmd_respond, 'check': cmd_check, 'rotate': cmd_rotate,
      'verify_rotation': cmd_verify_rotation, 'revoke': cmd_revoke,
      'verify_revocation': cmd_verify_revocation, 'dm_send': cmd_dm_send,
-     'dm_recv': cmd_dm_recv}[args.cmd](args)
+     'dm_recv': cmd_dm_recv, 'dm_pub': cmd_dm_pub,
+     'dm_fetch': cmd_dm_fetch}[args.cmd](args)
 
 
 if __name__ == '__main__':
