@@ -1148,10 +1148,53 @@ def validate_decision_payload(decision: str, payload: dict) -> bool:
                     and all(isinstance(n, str) for n in payload['old_moderators']))
         return True
     if decision == 'policy-update':
-        return set(payload.keys()) == {'threshold', 'eligible'}
+        # v0.6 (spec §11.2): 範囲検証。threshold は 1..len(eligible) の int、
+        # eligible は空・重複なしの npub リスト。
+        if set(payload.keys()) != {'threshold', 'eligible'}:
+            return False
+        elig = payload['eligible']
+        if not (isinstance(elig, list) and elig
+                and all(isinstance(x, str) for x in elig)
+                and len(set(elig)) == len(elig)):
+            return False
+        th = payload['threshold']
+        return (isinstance(th, int) and not isinstance(th, bool)
+                and 1 <= th <= len(elig))
     if decision == 'close':
         return set(payload.keys()) == {'reason'}
     return False
+
+
+def _verify_decision_core(d: dict, threshold: int, eligible: list,
+                        board_id: str, relay: str):
+    """board-decision 検証の政策依存コア (spec §11.2)。
+
+    政策 (threshold, eligible) を外部から与えることで、決定時点の政策で
+    決定の有効性を判定できる（時点政策の解決）。規約 cert の有効性は
+    呼び出し側の前提とする。
+    """
+    if not (d.get('protocol') == 'nakama' and d.get('version') == 1
+            and d.get('type') == 'board-decision'):
+        return (False, 0, 0)
+    try:
+        if d.get('decision') not in BOARD_DECISION_TYPES:
+            return (False, 0, 0)
+        if not validate_decision_payload(d['decision'], d.get('payload')):
+            return (False, 0, 0)
+        if d['board_id'] != board_id or d['relay'] != relay:
+            return (False, 0, 0)
+        msg = board_decision_message(d['board_id'], d['relay'], d['decision'],
+                                     d['payload'], int(d['created_at']))
+        elig = set(eligible)
+        good = set()
+        for a in d.get('approvals', []):
+            if a['npub'] not in elig:
+                continue
+            if verify_schnorr(a['npub'], bytes.fromhex(a['sig']), msg):
+                good.add(a['npub'])
+        return (len(good) >= int(threshold), len(good), int(threshold))
+    except Exception:
+        return (False, 0, 0)
 
 
 def verify_board_decision(d: dict, policy: dict):
@@ -1159,31 +1202,13 @@ def verify_board_decision(d: dict, policy: dict):
 
     承認署名のうち、現行 policy の eligible に含まれる異なる npub の有効署名が
     threshold 以上あることを確認する。部外者の署名は無視し、重複は 1 と数える。
+    v0.6: _verify_decision_core の薄いラッパ（既存の呼び出し互換を維持）。
+    時点政策で検証したい場合は resolve_policy_at + _verify_decision_core を使う。
     """
-    if not (d.get('protocol') == 'nakama' and d.get('version') == 1
-            and d.get('type') == 'board-decision'):
-        return (False, 0, 0)
     if not verify_board_policy_cert(policy):
         return (False, 0, 0)
-    try:
-        if d.get('decision') not in BOARD_DECISION_TYPES:
-            return (False, 0, 0)
-        if not validate_decision_payload(d['decision'], d.get('payload')):
-            return (False, 0, 0)
-        if d['board_id'] != policy['board_id'] or d['relay'] != policy['relay']:
-            return (False, 0, 0)
-        msg = board_decision_message(d['board_id'], d['relay'], d['decision'],
-                                     d['payload'], int(d['created_at']))
-        eligible = set(policy['eligible'])
-        good = set()
-        for a in d.get('approvals', []):
-            if a['npub'] not in eligible:
-                continue
-            if verify_schnorr(a['npub'], bytes.fromhex(a['sig']), msg):
-                good.add(a['npub'])
-        return (len(good) >= int(policy['threshold']), len(good), int(policy['threshold']))
-    except Exception:
-        return (False, 0, 0)
+    return _verify_decision_core(d, int(policy['threshold']), policy['eligible'],
+                                 policy['board_id'], policy['relay'])
 
 
 def cmd_board_policy(args):
@@ -1359,7 +1384,7 @@ GOVERNANCE_COVERAGE = {
     'policy-update': set(),
     'close': set(),
 }
-GOVERNANCE_CHECK_KINDS = [9000, 9001, 9004, 9007, 9008]
+GOVERNANCE_CHECK_KINDS = [9000, 9001, 9003, 9004, 9005, 9006, 9007, 9008]
 
 
 def npub_to_hex(npub: str) -> str | None:
@@ -1370,20 +1395,68 @@ def npub_to_hex(npub: str) -> str | None:
         return None
 
 
+def resolve_policy_at(policy: dict, decisions: list, ts: int):
+    """ts 時点の有効な (threshold, eligible) を返す純粋関数 (spec §11.2)。
+
+    有効な policy-update 決定を created_at 昇順に適用し、政策のチェーンを
+    時点解決する。各 policy-update 決定の検証には適用直前の政策を使う。
+    無効な決定は無視する（政策は変わらない）。初回 policy は発効済みの
+    board-policy cert（n-of-n 検証済み）であることが前提。
+    """
+    threshold = int(policy['threshold'])
+    eligible = list(policy['eligible'])
+    board_id, relay = policy['board_id'], policy['relay']
+    chain = sorted(
+        (d for d in decisions
+         if d.get('decision') == 'policy-update'
+         and d.get('type') == 'board-decision'
+         and d.get('created_at', float('inf')) <= ts),
+        key=lambda d: d['created_at'])
+    for d in chain:
+        ok, _, _ = _verify_decision_core(d, threshold, eligible, board_id, relay)
+        if ok:
+            threshold = d['payload']['threshold']
+            eligible = list(d['payload']['eligible'])
+    return threshold, eligible
+
+
+def temporal_valid_decisions(policy: dict, decisions: list) -> list:
+    """各決定を決定時点の政策で検証し、有効な (decision, n, m) だけを返す (spec §11.2)。
+
+    policy-update が一度でも発効すると、旧来の verify_board_decision（現行政策で
+    一律検証）では政策変更前の決定が新政策で裁き直されて壊れる。決定 D の有効性は
+    D 自身を除いた政策チェーンを D の created_at まで解決した政策で判定する。
+    規約 cert が無効なら全決定を無効扱い（旧来の前提を維持）。
+    """
+    if not verify_board_policy_cert(policy):
+        return []
+    valid = []
+    for d in decisions:
+        others = [o for o in decisions if o is not d]
+        th, elig = resolve_policy_at(policy, others, d.get('created_at', 0))
+        ok, n, m = _verify_decision_core(d, th, elig,
+                                         policy['board_id'], policy['relay'])
+        if ok:
+            valid.append((d, n, m))
+    return valid
+
+
 def governance_match_events(events: list, policy: dict, decisions: list) -> list:
-    """管理イベントごとに仲間内の合意の有無を判定する純粋関数 (spec §9.4 / §10.3)。
+    """管理イベントごとに仲間内の合意の有無を判定する純粋関数 (spec §9.4 / §10.3 / §11.3)。
 
     各イベントについて dict(status, event, detail) を返す。
     status: 'ok'（対応する有効な board-decision あり）
           | 'warn'（対応する決定なし — 合意の証拠なし）
           | 'info'（警告なしの情報表示 — kind 9007 Join Request）
           | 'invalid-sig'（イベント署名が無効で帰属を特定できない）
+    政策の時間変化に対応する (spec §11.2): 各決定の有効性は決定時点の政策で、
+    各イベントの照合はイベント時点の政策で行う。
     """
-    valid = []  # (decision, 承認署名数, threshold)
-    for d in decisions:
-        ok, n, m = verify_board_decision(d, policy)
-        if ok:
-            valid.append((d, n, m))
+    valid = temporal_valid_decisions(policy, decisions)
+    # 有効な close 決定（決定時点の政策で検証済み）の無効化起点。
+    # 複数あれば最初の閉鎖以降をすべて閉鎖後扱いにする。
+    close_ts = min((d['created_at'] for d, _, _ in valid
+                    if d['decision'] == 'close'), default=None)
     results = []
     for ev in sorted(events, key=lambda e: e.get('created_at', 0)):
         kind = ev.get('kind')
@@ -1393,6 +1466,14 @@ def governance_match_events(events: list, policy: dict, decisions: list) -> list
             continue
         subject = next((t[1] for t in ev.get('tags', []) if t and t[0] == 'p'),
                        None)
+        # v0.6 (spec §11.3): 有効な close 決定以降の管理イベントは警告
+        # （閉鎖後の活動）。9007/9008 は影響なし。
+        if (close_ts is not None and kind in (9000, 9001, 9003, 9004, 9005, 9006)
+                and ev.get('created_at', 0) > close_ts):
+            results.append({'status': 'warn', 'event': ev,
+                            'detail': '閉鎖後の管理イベント（有効な close 決定より後の発行 — '
+                                      f'close 時刻 {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(close_ts))}）'})
+            continue
         cover = None
         if kind == 9000:
             # admit 決定の payload.candidate がイベントの対象 (p タグ) と一致するか
@@ -1422,6 +1503,8 @@ def governance_match_events(events: list, policy: dict, decisions: list) -> list
             # 新運営・部外者・決定前の一方的な削除は警告。
             issuer = ev.get('pubkey')
             cover = None
+            # v0.6 (spec §11.2): old_moderators 省略時のフォールバックはイベント時点の政策で解決。
+            _, ev_eligible = resolve_policy_at(policy, decisions, ev.get('created_at', 0))
             for d, n, m in valid:
                 if d['decision'] != 'handover':
                     continue
@@ -1429,7 +1512,7 @@ def governance_match_events(events: list, policy: dict, decisions: list) -> list
                     continue
                 if ev.get('created_at', 0) < d['created_at']:
                     continue
-                old = d['payload'].get('old_moderators') or list(policy['eligible'])
+                old = d['payload'].get('old_moderators') or list(ev_eligible)
                 old_hex = {h for h in (npub_to_hex(x) for x in old) if h}
                 if issuer and issuer in old_hex:
                     cover = (d, n, m)
@@ -1443,6 +1526,22 @@ def governance_match_events(events: list, policy: dict, decisions: list) -> list
                 results.append({'status': 'warn', 'event': ev,
                                 'detail': '対応する handover 決定なし（合意なしの削除、部外者・新運営による削除、'
                                           '決定より前の削除）'})
+        elif kind in (9003, 9005, 9006):
+            # v0.6 (spec §11.3): 運営権限の行使として扱う。発行者がイベント時点の
+            # eligible に含まれていれば OK、部外者・旧運営なら WARN。
+            # 特定の board-decision とは紐付けない。
+            _, ev_eligible = resolve_policy_at(policy, decisions, ev.get('created_at', 0))
+            elig_hex = {h for h in (npub_to_hex(x) for x in ev_eligible) if h}
+            issuer = ev.get('pubkey')
+            kind_name = {9003: 'Edit Group', 9005: 'Add Permission',
+                         9006: 'Remove Permission'}.get(kind, f'kind {kind}')
+            if issuer and issuer in elig_hex:
+                results.append({'status': 'ok', 'event': ev,
+                                'detail': f'{kind_name}: イベント時点の eligible による正当な運営行為'})
+            else:
+                results.append({'status': 'warn', 'event': ev,
+                                'detail': f'{kind_name}: イベント時点の eligible 外の発行者による権限行使'
+                                          '（部外者・旧運営 — 合意の証拠なし）'})
         elif kind == 9007:
             # Join Request は admit 照合の情報源として扱う。申請自体は害がないため
             # 警告にはしない（承認済みか未承認かを表示するだけ）。spec §10.3。
@@ -1487,11 +1586,14 @@ def load_decisions(paths) -> list:
 
 
 def cmd_board_governance(args):
-    """board_read --governance: 管理イベント (kind 9000/9001/9004/9007/9008) と board-decision の合意照合。
+    """board_read --governance: 管理イベント (kind 9000/9001/9003/9004/9005/9006/9007/9008)
+    と board-decision の合意照合。
 
     リレーは管理イベントを発行者の鍵だけで受け付けるため、仲間内の合意は
     強制できない。合意を無視した管理イベントを警告表示することで社会的に
     抑止するのがこのコマンドの役割（spec §9.4「正直に書く」）。
+    v0.6 (spec §11): 決定の有効性は決定時点の政策で、イベントの照合は
+    イベント時点の政策で行う。有効な close 決定以降の管理イベントは警告。
     """
     with open(args.governance) as f:
         policy = json.load(f)
@@ -1499,8 +1601,9 @@ def cmd_board_governance(args):
         print('board-policy が無効です（発効条件 n-of-n を満たしていません）', file=sys.stderr)
         sys.exit(1)
     decisions = load_decisions(args.decisions)
+    valid_ids = {id(d) for d, _, _ in temporal_valid_decisions(policy, decisions)}
     for d in decisions:
-        if not verify_board_decision(d, policy)[0]:
+        if id(d) not in valid_ids:
             print(f'注: 無効な board-decision を照合対象から除外: '
                   f'{d.get("decision", "?")} (created_at {d.get("created_at", "?")})',
                   file=sys.stderr)
@@ -1518,7 +1621,10 @@ def cmd_board_governance(args):
     for r in results:
         ev = r['event']
         kind_name = {9000: 'Add User', 9001: 'Remove User',
-                     9004: 'Delete Group', 9007: 'Join Request',
+                     9003: 'Edit Group',
+                     9004: 'Delete Group', 9005: 'Add Permission',
+                     9006: 'Remove Permission',
+                     9007: 'Join Request',
                      9008: 'Leave Group'}.get(ev.get('kind'), f'kind {ev.get("kind")}')
         ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ev.get('created_at', 0)))
         subject = next((t[1] for t in ev.get('tags', []) if t and t[0] == 'p'), '?')
