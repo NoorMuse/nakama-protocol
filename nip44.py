@@ -71,7 +71,7 @@ def get_message_keys(conversation_key: bytes, nonce: bytes):
 # ---------------------------------------------------------------- padding
 
 def calc_padded_len(unpadded_len: int) -> int:
-    next_power = 1 << (math.floor(math.log2(unpadded_len - 1)) + 1)
+    next_power = 1 << (unpadded_len - 1).bit_length()
     chunk = 32 if next_power <= 256 else next_power // 8
     if unpadded_len <= 32:
         return 32

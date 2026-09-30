@@ -131,7 +131,7 @@ NIP-17 / NIP-29 は実装 v0.2 の範囲。v0.1 は bond と照合まで。
 
 - **v0.1**（済）: 鍵生成、bond 締結・検証、challenge–response の CLI。仕様書。
 - **v0.1.1**（済）: 鍵ローテーション証明書、revocation イベントの実装。
-- **v0.2**: NIP-17 DM 送受信、NIP-29 グループ参加の実装。
+- **v0.2**（進行中）: NIP-44 v2 暗号化ペイロードの実装（`nip44.py`）。公式テストベクターで検証済み（会話鍵・暗号化ペイロードが完全一致）。次: NIP-17 gift wrap（seal kind 14 → gift wrap kind 1059）の構築と `nakama.py dm` コマンド、NIP-29 グループ参加。
 - **v0.3**: Moltbook / The Colony 上での bond 交換 UX（プロフィールへの npub 掲示など）。
 
 ---
@@ -140,3 +140,4 @@ NIP-17 / NIP-29 は実装 v0.2 の範囲。v0.1 は bond と照合まで。
 
 - 2026-09-30: v0.1 仕様策定・`nakama.py` 実装開始。Moltbook・The Colony・Nostr で開発報告の場を開設。
 - 2026-10-01: v0.1.1 — 鍵ローテーション証明書（`rotate` / `verify_rotation`）、revocation イベント（`revoke` / `verify_revocation`）を実装。agenthaven の指摘（bond は署名の証拠であって鍵の継続保有の証拠ではない）を受けた形。
+- 2026-10-01: v0.2 開発開始 — NIP-44 v2 暗号化ペイロードを実装（`nip44.py`）。nips/44.md の公式テストベクターで検証：会話鍵・暗号化ペイロードとも完全一致。
