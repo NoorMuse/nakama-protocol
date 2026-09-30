@@ -1,7 +1,7 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.3
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 設計 — `remove` 決定種別の追加（§18））
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18））
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -241,7 +241,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.10**（完了）: `accept` への侵害警告統合（§15）。`cmd_accept` で proposal のパース＋提案者署名の検証の後、自分の署名の前に、companions のうち自分以外の全員について `key_compromise_warnings` を呼び出し、非撤回宣言があれば stderr に WARN（§14 と同フォーマット）。警告のみで exit コード不変。`accept --compromise-registry` で registry を切り替え可能（既存 CLI パターン準拠）。withdrawn のみ・宣言なし・自分自身への宣言は警告なし。オフライン 7 ケース通過（`test_accept_warnings.py` 新規: 宣言ありで WARN＋bond 完成、withdrawn のみ・宣言なしで警告なし、`--from-b64`、3 者 bond で宣言あり 1 人のみ、markdown の stderr/stdout 分離、自分自身は警告対象外。既存の compromise 24 / integration 10 / governance 30 / revocation 8 回帰維持）。スコープ外: `propose` への統合（自覚済みのため不要）、`bind`（v0.11 で検討・`verify_binding` 側に統合）、自動 fetch、自動ブロック。
 - **v0.11**（完了）: `verify_binding` への侵害警告統合（§16）。§15.4 の「`bind`（将来候補）」の検討結果: 統合点は `bind` ではなく `verify_binding`。`bind` は自分の鍵での自分の主張であり発行者自覚済み（`propose` 除外と同型）。`verify_binding` は検証者の信頼決定の瞬間であり、対象 npub への非撤回宣言は判断材料として価値がある。実装: `cmd_verify_binding` で署名・platform・handle 検証の後、対象 npub（`b['npub']`）について `key_compromise_warnings` を呼び出し、非撤回宣言があれば stderr に WARN（§14 と同フォーマット、署名改ざん時も出す）。警告のみで exit コード不変（検証結果 `ok` には影響しない）。`verify_binding --compromise-registry` を追加。オフライン 6 ケース通過（`test_verify_binding_warnings.py` 新規: 宣言なしで有効+exit 0、宣言ありで WARN+有効+exit 0、withdrawn のみで警告なし、署名改ざんでも WARN+無効+exit 1、registry 切り替え、別鍵の宣言は対象外。既存の compromise 24 / integration 10 / governance 30 / revocation 8 回帰維持）。スコープ外: `bind`（自覚済み）、`unbind`/`verify_unbinding`、自動 fetch、自動ブロック。
 - **v0.12**（完了）: rotation 証明書の Nostr 公開（§17）。§13.6 の残課題（§14.4 でスコープ外とした「移行の Nostr 公開」）。kind 30102（parameterized replaceable、nakama 独自割当）、`d` タグ = 旧鍵の hex pubkey（取得方向: 旧鍵 → 移行先）、content = rotation JSON canonical。Nostr イベントの署名者は旧鍵（正規スロットを (pubkey, kind, d) で一意化、第三者スロットは fetch 側で無視）。実装: `ROTATION_NOSTR_KIND = 30102`、`rotation_nostr_event(rot, secret)`（純粋）、`verify_rotation_nostr_event(ev, old_hex)`（三段階検証: Nostr 署名 → JSON パース → `verify_rotation_cert` ＋ d タグ・pubkey の二重チェック、無効はスキップ）、`rotation_chain_fetch(old_hex, fetch_one, max_links=16)`（循環・上限ガード）、`rotate_pub <relay> <rotation.json> [--auth]`（keyfile の鍵 == old_npub を確認、不一致なら拒否で publish しない）、`rotate_fetch <relay> <old_npub> [--limit] [--auth] [--out] [--chain]`（有効なものを created_at 最大で 1 件表示、`--out` は mode 600 保存、`--chain` で全リンク表示）。`key_status --rotation` は引き続きファイル受付（自動 fetch なし、§14 の方針維持）。オフライン 8 ケース通過（`test_rotation_nostr.py` 新規、既存の revocation 8 / compromise 24 / integration 10 / governance 30 / accept 7 / verify_binding 6 回帰維持）。スコープ外: `key_status` の自動取得、rotation のローカル registry 化、kind の正式割当。
-- **v0.13**（設計中）: `remove` 決定種別の追加 — kind 9001 Remove User のガバナンス照合。設計は §18 に固定済み、実装は次ラン。
+- **v0.13**（完了）: `remove` 決定種別の追加 — kind 9001 Remove User のガバナンス照合（§18。`BOARD_DECISION_TYPES` + payload 検証 + `GOVERNANCE_COVERAGE['remove']={9001}` + 照合ルール置換、test_remove.py 10 ケース通過、全回帰維持）。
 
 ---
 
@@ -986,13 +986,13 @@ Nostr イベントの署名者は**旧鍵**（rotation の `old_npub` の鍵）�
 - rotation のローカル registry 化（§17.6）。
 - kind 30102 の正式割当申請（NIP 化は将来の候補）。
 
-- **v0.13**（設計中）: `remove` 決定種別の追加 — kind 9001 Remove User のガバナンス照合。設計は §18 に固定済み、実装は次ラン。
+- **v0.13**（完了）: `remove` 決定種別の追加 — kind 9001 Remove User のガバナンス照合（§18。`BOARD_DECISION_TYPES` + payload 検証 + `GOVERNANCE_COVERAGE['remove']={9001}` + 照合ルール置換、test_remove.py 10 ケース通過、全回帰維持）。
 
 ---
 
-## 18. v0.13 設計: `remove` 決定種別の追加（設計 — 実装は次ラン）
+## 18. v0.13: `remove` 決定種別の追加（実装済み 2026-10-01）
 
-§11.3 で kind 9001（Remove User）は「対応する決定語彙がないため WARN のまま。v0.6 の範囲外（将来 `remove` 決定種別の追加を検討）」とした。正当な除名まで警告ノイズになる。v0.13 では `remove` 決定種別を追加し、kind 9001 のガバナンス照合を完成させる（本セクションは設計の記録、実装は次ラン）。
+§11.3 で kind 9001（Remove User）は「対応する決定語彙がないため WARN のまま。v0.6 の範囲外（将来 `remove` 決定種別の追加を検討）」とした。正当な除名まで警告ノイズになる。v0.13 では `remove` 決定種別を追加し、kind 9001 のガバナンス照合を完成させた（実装記録: §18.6）。
 
 ### 18.1 用語の整理: 退会の自発 vs 除名
 
@@ -1052,26 +1052,18 @@ NIP-29 の管理イベントには「去る」と「外す」の 2 方向があ�
 - `board_read --governance` の表示: 除名対象がイベント時点の eligible に含まれていた場合、OK 判定に加えて INFO 注記「除名対象は運営者（eligible）でした — policy-update による規約更新を推奨」を付ける。警告カウントには含めない（除名自体は合意済み）。
 - 正直に書く: 運営者の除名は「合意の証拠」と「政策の実態」の一時的な乖離を生む。プロトコルは手続きの正当性だけを記録し、政策の更新は仲間の次の決定に委ねる（§11.5 の「内容の良し悪しは判断しない」と同じ思想）。
 
-### 18.6 実装計画（次ラン）
+### 18.6 実装記録（実装済み 2026-10-01）
+
+設計通り実装済み。変更箇所:
 
 - `nakama.py`:
   1. `BOARD_DECISION_TYPES` に `'remove'` を追加（`board_decide --decision` の choices は自動対応）。
-  2. `validate_decision_payload` に `remove` 分岐（キー集合 + candidate 文字列 + reason 文字列）。
+  2. `validate_decision_payload` に `remove` 分岐（キー集合 `{'candidate'}`|`{'candidate','reason'}`、candidate 文字列、reason 文字列）。
   3. `GOVERNANCE_COVERAGE['remove'] = {9001}`。
   4. `governance_match_events` の 9001 分岐を §18.4 のルールに置換（自発的除名 OK / remove 決定の照合 / 旧運営の INFO 注記）。
-  5. `cmd_board_governance` の表示対応（新規 status は増えない: ok / warn のまま、detail 文言と INFO 注記を追加）。
-- テスト計画（オフライン、10 ケース）:
-  1. 有効な remove 決定 + 対象一致の 9001（決定後の発行）→ OK
-  2. remove 決定なしの 9001 → WARN
-  3. 対象の異なる remove 決定 → WARN
-  4. 決定より前の created_at の 9001 → WARN
-  5. 承認不足の remove 決定 → 無効 → WARN
-  6. 発行者 == 対象の 9001（自発的除名）→ OK
-  7. 除名対象が eligible 内 → OK + INFO 注記（policy-update 推奨）
-  8. reason 改ざん → 決定の署名検証が失敗 → WARN（reason が署名対象であることの確認）
-  9. payload 形式違反（candidate なし / 余計なキー / reason が非文字列）→ `validate_decision_payload` が False
-  10. close 決定後の 9001 → WARN（既存の close 無効化ルールが優先）
-- 回帰: 既存の governance 30 / revocation 8 / compromise 24 / integration 10 / accept 7 / verify_binding 6 / rotation 8 を維持。
+  5. `cmd_board_governance` の表示: status は ok / warn のまま（新規 status なし）。INFO 注記は detail に追記し、警告カウントには含めない。
+- テスト `test_remove.py`: 上記の 10 ケース + 補足（INFO 注記の有無、自発的除名の決定独立性）を全通過。
+- 回帰: governance 30 / revocation 8 / compromise 24 / integration 10 / accept 7 / verify_binding 6 / rotation 8 を維持。
 
 ### 18.7 スコープ外
 
@@ -1117,3 +1109,4 @@ NIP-29 の管理イベントには「去る」と「外す」の 2 方向があ�
 - 2026-10-01: v0.12 完了 — §17 の設計を実装。`ROTATION_NOSTR_KIND = 30102`、`rotation_nostr_event(rot, secret)`（純粋、署名者は旧鍵）、`verify_rotation_nostr_event(ev, old_hex)`（三段階検証: Nostr 署名 → JSON パース → `verify_rotation_cert`＋d タグ・pubkey の二重チェック、正規スロットのみ受理・無効はスキップ）、`rotation_chain_fetch(old_hex, fetch_one, max_links=16)`（循環・上限ガード）、`rotate_pub <relay> <rotation.json> [--auth]`（cert 検証 → keyfile の鍵 == old_npub の取り違え防止、不一致は拒否で publish せず）、`rotate_fetch <relay> <old_npub> [--limit] [--auth] [--out] [--chain]`（有効なものを created_at 最大で 1 件表示、`--out` は mode 600 保存、`--chain` で全リンク表示＋最新を保存）。argparse 登録・dispatch 追加、docstring の usage 行も更新。オフライン 8 ケース通過（`test_rotation_nostr.py` 新規）＋ revocation 8 / compromise 24 / integration 10 / governance 30 / accept 7 / verify_binding 6 回帰維持。§13.6 の「移行の Nostr 公開」が埋まった。
 - 2026-10-01: v0.12 設計 — rotation 証明書の Nostr 公開を仕様書 §17 に固定（設計のみ、実装は次ラン）。§13.6 の残課題（§14.4 でスコープ外とした「移行の Nostr 公開」）。要点: kind 30102（parameterized replaceable、nakama 独自割当、30100/30101 に続く番号）、`d` タグ = 旧鍵の hex pubkey（取得方向: 旧鍵 → 移行先）、content = rotation JSON canonical。Nostr イベントの署名者は旧鍵（正規スロットを (pubkey, kind, d) で一意化、第三者スロットは fetch 側で無視）。`rotate_pub <relay> <rotation.json> [--auth]`（keyfile の鍵 == old_npub を確認、不一致なら拒否）。`rotate_fetch <relay> <old_npub> [--limit] [--auth] [--out] [--chain]`（三段階検証: Nostr 署名 → JSON パース → `verify_rotation_cert`＋d タグ・pubkey の二重チェック、無効はスキップ。`--chain` は純粋関数 `rotation_chain_fetch` で上限 16・循環ガード付きのチェーン走査）。`key_status --rotation` は引き続きファイル受付（自動 fetch なし、§14 の方針維持）。正直に書く: 旧鍵漏洩後の移行は Nostr 公開でも証明できない（§5.5.2 と同じ）、d=old_hex の列挙可能性は意図通り（公開は任意）、kind は正式割当ではない。テスト計画 8 ケース（オフライン）。ロードマップ §7 に v0.12（設計中）を追加、ヘッダの日付行も更新。
 - 2026-10-01: v0.13 設計 — `remove` 決定種別の追加を仕様書 §18 に固定（設計のみ、実装は次ラン）。§11.3 で将来候補とした項目。設計の要点: (1) 用語の整理 — kind 9008（Leave Group）は本人の自発的退会で決定不要（常に OK のまま）、kind 9001（Remove User）は運営者による他者の除名で `remove` 決定の照合対象。kind 9001 で発行者 == 対象は自発的退会と同型として OK。「本人の希望による除名」は検証不可能な宣言であり reason 記録のみで照合に影響なし。(2) `remove` 決定の形式は admit と対称（payload: `candidate` 必須 + `reason` 任意・署名対象、`_verify_decision_core` 流用、`BOARD_DECISION_TYPES` 追加で `board_decide --decision remove` が自動対応）。(3) 照合ルール: `GOVERNANCE_COVERAGE['remove'] = {9001}`、有効な remove 決定があり candidate == p タグ対象かつ決定が除名に先行すれば OK、それ以外は WARN。close 決定後の 9001 は既存の close 無効化ルールが優先。(4) 旧運営の処遇 — `remove` 決定は kind 9001 の正当化のみを行い政策（eligible）の変更は行わない。運営者の除名は remove + 後の policy-update の 2 ステップ（`resolve_policy_at` の不変条件を壊さない最小変更）。除名対象がイベント時点の eligible 内なら OK + INFO 注記（policy-update 推奨）。テスト計画 10 ケース（オフライン）、回帰維持。ロードマップ §7 に v0.13（設計中）を追加、ヘッダの日付行も更新。
+- 2026-10-01: v0.13 完了 — §18 の設計を実装。`BOARD_DECISION_TYPES` に `'remove'` 追加（`board_decide --decision remove` が自動対応）、`validate_decision_payload` に `remove` 分岐（キー集合 `{'candidate'}`|`{'candidate','reason'}`、candidate 文字列、reason 文字列・署名対象）、`GOVERNANCE_COVERAGE['remove'] = {9001}`、`governance_match_events` の 9001 分岐を置換（自発的除名 OK / 有効な remove 決定 + 対象一致 + 決定先行で OK / それ以外 WARN / 除名対象がイベント時点で eligible 内なら OK + INFO 注記「policy-update による規約更新を推奨」、警告カウントには含めない。remove 決定は政策変更を行わない — 旧運営の除名は remove + policy-update の 2 ステップ、`resolve_policy_at` の不変条件を維持）。オフライン 10 ケース通過（`test_remove.py` 新規）＋ governance 30 / revocation 8 / compromise 24 / integration 10 / accept 7 / verify_binding 6 / rotation 8 回帰維持。spec §18 の設計文面を実装記録に更新、ロードマップ §7・ヘッダも更新。agentgit + GitHub ミラーに push。

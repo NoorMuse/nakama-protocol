@@ -1962,7 +1962,7 @@ def cmd_verify_unbinding(args):
     sys.exit(0 if ok else 1)
 
 
-BOARD_DECISION_TYPES = ('admit', 'handover', 'policy-update', 'close')
+BOARD_DECISION_TYPES = ('admit', 'handover', 'policy-update', 'close', 'remove')
 
 
 def board_policy_message(board_id: str, relay: str, threshold: int, eligible: list, created_at: int) -> bytes:
@@ -2040,6 +2040,19 @@ def validate_decision_payload(decision: str, payload: dict) -> bool:
                 and 1 <= th <= len(elig))
     if decision == 'close':
         return set(payload.keys()) == {'reason'}
+    if decision == 'remove':
+        # v0.13 (spec §18.3): キー集合 {'candidate'} または {'candidate','reason'}。
+        # candidate は文字列。npub 形式の厳密検証はしない — 照合時の
+        # npub_to_hex が None を返して自然に不整合になる (admit と同型)。
+        # reason は署名対象に含める（改ざん検出 — §18.2）。
+        keys = set(payload.keys())
+        if keys not in ({'candidate'}, {'candidate', 'reason'}):
+            return False
+        if not isinstance(payload['candidate'], str):
+            return False
+        if 'reason' in payload and not isinstance(payload['reason'], str):
+            return False
+        return True
     return False
 
 
@@ -2261,6 +2274,7 @@ GOVERNANCE_COVERAGE = {
     'handover': {9004},
     'policy-update': set(),
     'close': set(),
+    'remove': {9001},
 }
 GOVERNANCE_CHECK_KINDS = [9000, 9001, 9003, 9004, 9005, 9006, 9007, 9008]
 
@@ -2373,9 +2387,50 @@ def governance_match_events(events: list, policy: dict, decisions: list) -> list
                 results.append({'status': 'warn', 'event': ev,
                                 'detail': '対応する admit 決定なし（仲間内の合意なしの参加追加）'})
         elif kind == 9001:
-            # remove に対応する決定種別は規約の語彙にない → 常に警告
-            results.append({'status': 'warn', 'event': ev,
-                            'detail': 'remove に対応する決定種別は規約にない（合意の証拠なし）'})
+            # v0.13 (spec §18.4): `remove` 決定のガバナンス照合。
+            # kind 9001 の subject は p タグの対象、issuer は発行者。
+            # 1. 自発的除名（発行者 == 対象）は自発的退会 (9008) と同型 → 常に OK
+            #    （決定不要 — 退会の自由は仲間の合意を要しない）。
+            # 2. 有効な remove 決定（決定時点の政策で検証済み —
+            #    temporal_valid_decisions を流用）があり、対象一致 + 決定が除名に
+            #    先行 → OK。
+            # 3. それ以外 → WARN（対応する remove 決定なし — 合意の証拠なしの除名）。
+            # remove 決定は政策変更を行わない（§18.5）: 除名対象がイベント時点で
+            # eligible（運営者）でも OK に加えて INFO 注記だけ付ける
+            # （policy-update による規約更新を推奨）。警告カウントには含めない。
+            issuer = ev.get('pubkey')
+            self_remove = bool(issuer and subject and issuer == subject)
+            cover = None
+            if not self_remove:
+                for d, n, m in valid:
+                    if d['decision'] != 'remove':
+                        continue
+                    if kind not in GOVERNANCE_COVERAGE['remove']:
+                        continue
+                    cand_hex = npub_to_hex(d['payload']['candidate'])
+                    if not (cand_hex and subject and cand_hex == subject):
+                        continue
+                    if ev.get('created_at', 0) < d['created_at']:
+                        continue
+                    cover = (d, n, m)
+                    break
+            if self_remove:
+                results.append({'status': 'ok', 'event': ev,
+                                'detail': 'Remove User（自分による除名 = 自発的退会と同型）'})
+            elif cover:
+                d, n, m = cover
+                detail = (f'remove 決定が対応（承認 {n}/{m}、決定時刻 '
+                          f'{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d["created_at"]))}）')
+                _, ev_eligible = resolve_policy_at(policy, decisions,
+                                                  ev.get('created_at', 0))
+                elig_hex = {h for h in (npub_to_hex(x) for x in ev_eligible) if h}
+                if subject and subject in elig_hex:
+                    detail += ' [注: 除名対象は運営者（eligible）でした — ' \
+                              'policy-update による規約更新を推奨]'
+                results.append({'status': 'ok', 'event': ev, 'detail': detail})
+            else:
+                results.append({'status': 'warn', 'event': ev,
+                                'detail': '対応する remove 決定なし（合意の証拠なしの除名）'})
         elif kind == 9004:
             # handover 決定後の旧運営による Delete Group は正当な運用 (spec §10.3)。
             # 新運営・部外者・決定前の一方的な削除は警告。
