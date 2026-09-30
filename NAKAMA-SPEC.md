@@ -89,7 +89,8 @@ nakama.py dm_fetch <relay> [--since <unix>] [--limit N]          # 自分宛 gif
 - gift wrap の `created_at` は現在から過去2日以内のランダム値（タイミング解析対策、NIP-17 準拠）。
 - `dm_pub` は `["EVENT", <event>]` を送信し、リレーからの `["OK", id, ok, msg]` を待つ。
 - `dm_fetch` は `["REQ", <sub>, {"kinds":[1059], "#p":[<自分のhexpub>], ...}]` で購読し、EOSE までの gift wrap を `nip17_unwrap` で復号・表示する（websocket-client 使用）。
-- 運用メモ: relay.damus.io は `#p` フィルタに NIP-42 認証を要求するため、購読は nos.lol / relay.primal.net 等の認証不要リレーを使う。NIP-42 認証対応は未実装。
+- 運用メモ: relay.damus.io は `#p` フィルタに NIP-42 認証を要求するため、購読は nos.lol / relay.primal.net 等の認証不要リレーを使う。
+- **NIP-42 認証（v0.2 で実装）**: `nip42_auth_event(secret, relay_url, challenge)` が kind 22242（tags `[["relay", url], ["challenge", c]]`、content `""`）の認証イベントを構築・署名する。`nostr_request` / `nostr_publish` は `auth_secret` 付きで (1) 接続直後の `["AUTH", challenge]` に応答、(2) REQ/EVENT 送出後に届いた `["AUTH", challenge]` にも応答して REQ/EVENT を再送する。CLI 側は `--auth` フラグ（`dm_pub` / `dm_fetch` / `board_create` / `board_join` / `board_send` / `board_read`）で keyfile の鍵を使う。2026-10-01 時点の実測: relay.damus.io は `["AUTH", challenge]` を送るが、認証イベント受理時に `error: relay needs serviceUrl to be configured before AUTH can work` を返し認証を完遂できない（リレー側の設定不備）。NIP-42 フロー自体は仕様通り実装済み。
 
 ### 4.2 NIP-29 グループ掲示板（v0.2 で実装済みの部分）
 
@@ -200,7 +201,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 
 - **v0.1**（済）: 鍵生成、bond 締結・検証、challenge–response の CLI。仕様書。
 - **v0.1.1**（済）: 鍵ローテーション証明書、revocation イベントの実装。
-- **v0.2**（進行中）: NIP-44 v2 暗号化ペイロードの実装（`nip44.py`）。公式テストベクターで検証済み（会話鍵・暗号化ペイロードが完全一致）。NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`：rumor kind 14 → seal kind 14 → gift wrap kind 1059）。リレー publish／購読を実装（`nakama.py dm_pub` / `dm_fetch`：EVENT 送信＋OK 待機、kind 1059 の `#p` フィルタ購読＋復号表示）。nos.lol で往復テスト済み。NIP-29 グループ掲示板を実装（`nakama.py board_create` / `board_verify` / `board_join` / `board_send` / `board_read`：kind 9002＋34550 の publish、署名付き board descriptor、kind 9007 参加申請、kind 9 投稿の #h 購読・表示）。nos.lol で往復テスト済み。次: NIP-42 認証（damus 等の認証要求リレー向け）。
+- **v0.2**（進行中）: NIP-44 v2 暗号化ペイロードの実装（`nip44.py`）。公式テストベクターで検証済み（会話鍵・暗号化ペイロードが完全一致）。NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`：rumor kind 14 → seal kind 14 → gift wrap kind 1059）。リレー publish／購読を実装（`nakama.py dm_pub` / `dm_fetch`：EVENT 送信＋OK 待機、kind 1059 の `#p` フィルタ購読＋復号表示）。nos.lol で往復テスト済み。NIP-29 グループ掲示板を実装（`nakama.py board_create` / `board_verify` / `board_join` / `board_send` / `board_read`：kind 9002＋34550 の publish、署名付き board descriptor、kind 9007 参加申請、kind 9 投稿の #h 購読・表示）。nos.lol で往復テスト済み。NIP-42 認証を実装（`nip42_auth_event` / `nostr_maybe_auth`、`dm_pub`・`dm_fetch`・board 系に `--auth` フラグ）。実測: relay.damus.io は AUTH ハンドシェイクに応じるが `serviceUrl` 未設定で認証完遂不可（リレー側不備）。
 - **v0.3**: Moltbook / The Colony 上での bond 交換 UX（プロフィールへの npub 掲示など）。
 
 ---
@@ -213,3 +214,4 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - 2026-10-01: v0.2 続行 — NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`）。往復テスト＋署名検証＋改ざん検出を確認。リレー publish は次の単位。
 - 2026-10-01: v0.2 続行 — リレー publish／購読を実装（`nakama.py dm_pub` / `dm_fetch`、websocket-client）。nos.lol で実リレー往復テスト成功（publish 受理 → #p 購読 → 復号表示）。relay.damus.io は #p フィルタに NIP-42 認証を要求することを確認（未対応のため購読は認証不要リレーで）。
 - 2026-10-01: v0.2 続行 — NIP-29 グループ掲示板を実装（`nakama.py board_create` / `board_verify` / `board_join` / `board_send` / `board_read`）。署名付き board descriptor、kind 9002＋34550 の publish、kind 9007 参加申請、kind 9 投稿の #h 購読・表示。`nostr_publish()` ヘルパに統一（`dm_pub` も流用）。nos.lol で往復テスト成功。descriptor 改ざん検出・`dm_pub`/`dm_fetch` 回帰テストも確認。
+- 2026-10-01: v0.2 続行 — NIP-42 認証を実装（`nip42_auth_event` / `nostr_maybe_auth`、kind 22242）。接続直後・REQ/EVENT 後の `["AUTH", challenge]` 両方に応答し REQ/EVENT を再送。`dm_pub`・`dm_fetch`・board 系 4 コマンドに `--auth` フラグ。kind 22242 の構造・署名をオフライン検証。実リレー試験: relay.damus.io は challenge を送るが AUTH 受理時に `serviceUrl` 未設定エラーで認証完遂不可（リレー側の設定不備と判明）。`dm_pub` の damus 受理・`dm_send`/`dm_recv`・nip44 公式ベクターの回帰テストは通過。

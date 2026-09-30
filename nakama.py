@@ -383,10 +383,50 @@ def nostr_relay_ws(url: str, timeout: int = 15):
         print(f'リレー {url} への接続に失敗しました: {e}'); sys.exit(1)
 
 
-def nostr_request(url: str, request: list, timeout: int = 15) -> list:
+def nip42_auth_event(secret: bytes, relay_url: str, challenge: str) -> dict:
+    """NIP-42 認証イベント (kind 22242) を構築・署名する。"""
+    return sign_event(secret, int(time.time()), 22242,
+                      [['relay', relay_url], ['challenge', challenge]], '')
+
+
+def nostr_maybe_auth(ws, url: str, secret: bytes | None, wait: float = 1.5) -> bool:
+    """接続直後の ["AUTH", challenge] を拾い、認証イベントで応答する (NIP-42)。
+    応答したら OK を待って True、不要・失敗なら False。"""
+    if secret is None:
+        return False
+    ws.settimeout(wait)
+    deadline = time.time() + wait
+    try:
+        while time.time() < deadline:
+            try:
+                msg = json.loads(ws.recv())
+            except Exception:
+                return False
+            if isinstance(msg, list) and msg and msg[0] == 'AUTH' and len(msg) > 1:
+                ev = nip42_auth_event(secret, url, str(msg[1]))
+                ws.send(json.dumps(['AUTH', ev]))
+                ws.settimeout(5)
+                try:
+                    while True:
+                        m2 = json.loads(ws.recv())
+                        if isinstance(m2, list) and m2 and m2[0] == 'OK' and len(m2) > 1 \
+                                and m2[1] == ev['id']:
+                            return bool(m2[2])
+                        if isinstance(m2, list) and m2 and m2[0] == 'NOTICE':
+                            return False
+                except Exception:
+                    return False
+            # AUTH 以外は読み捨て（後段の REQ/EVENT フローが再送する）
+    except Exception:
+        return False
+    return False
+
+
+def nostr_request(url: str, request: list, timeout: int = 15, auth_secret: bytes | None = None) -> list:
     """REQ を投げ、EOSE までイベントを収集して返す（短い余裕時間つき）。"""
     ws = nostr_relay_ws(url, timeout)
     try:
+        nostr_maybe_auth(ws, url, auth_secret)
         ws.send(json.dumps(request))
         events, eose = [], False
         deadline = time.time() + timeout
@@ -403,6 +443,11 @@ def nostr_request(url: str, request: list, timeout: int = 15) -> list:
             elif kind == 'EOSE':
                 eose = True
                 break
+            elif kind == 'AUTH' and auth_secret is not None and len(msg) > 1:
+                # リレーが購読途中で認証を要求した場合: 応答して REQ を再送
+                ev = nip42_auth_event(auth_secret, url, str(msg[1]))
+                ws.send(json.dumps(['AUTH', ev]))
+                ws.send(json.dumps(request))
             elif kind == 'CLOSED':
                 break
         # EOSE 後の余裕: 直前に届いた EVENT を拾い漏らさないよう少し待つ
@@ -435,7 +480,7 @@ def cmd_dm_pub(args):
             print('npub の形式が不正です'); sys.exit(1)
         seal = nip17_build_seal(secret, recipient_hexpub, args.message)
         wrap = nip17_build_gift_wrap(seal, recipient_hexpub)
-    accepted, reason = nostr_publish(args.relay, wrap)
+    accepted, reason = nostr_publish(args.relay, wrap, auth_secret=secret if args.auth else None)
     print(f'publish: {"受理" if accepted else "拒否"} ({reason}) id={wrap["id"]}')
     sys.exit(0 if accepted else 1)
 
@@ -448,7 +493,7 @@ def cmd_dm_fetch(args):
     if args.since:
         filt['since'] = args.since
     sub_id = secrets.token_hex(8)
-    events = nostr_request(args.relay, ['REQ', sub_id, filt])
+    events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=secret if args.auth else None)
     shown = 0
     for ev in sorted(events, key=lambda e: e.get('created_at', 0)):
         try:
@@ -496,10 +541,11 @@ def cmd_dm_recv(args):
 # 広場（board）はリレーベースのグループ: kind 9002（Create Group）+ kind 34550（メタデータ）、
 # kind 9（チャット投稿、h タグでグループ指定）、kind 9007（参加申請）。投稿は平文（§4.2 の選択）。
 
-def nostr_publish(url: str, event: dict, timeout: int = 15) -> tuple:
+def nostr_publish(url: str, event: dict, timeout: int = 15, auth_secret: bytes | None = None) -> tuple:
     """単一イベントをリレーに publish し (accepted, reason) を返す。"""
     ws = nostr_relay_ws(url, timeout)
     try:
+        nostr_maybe_auth(ws, url, auth_secret)
         ws.send(json.dumps(['EVENT', event]))
         ws.settimeout(timeout)
         deadline = time.time() + timeout
@@ -510,6 +556,12 @@ def nostr_publish(url: str, event: dict, timeout: int = 15) -> tuple:
                 break
             if isinstance(msg, list) and msg and msg[0] == 'OK' and len(msg) > 1 and msg[1] == event['id']:
                 return (bool(msg[2]), msg[3] if len(msg) > 3 else '')
+            if isinstance(msg, list) and msg and msg[0] == 'AUTH' and auth_secret is not None and len(msg) > 1:
+                # publish 時に認証を要求された場合: 応答して EVENT を再送
+                ev = nip42_auth_event(auth_secret, url, str(msg[1]))
+                ws.send(json.dumps(['AUTH', ev]))
+                ws.send(json.dumps(['EVENT', event]))
+                continue
             if isinstance(msg, list) and msg and msg[0] in ('NOTICE', 'CLOSED'):
                 return (False, ' '.join(str(x) for x in msg[1:]))
     finally:
@@ -535,7 +587,7 @@ def cmd_board_create(args):
     ev_meta = sign_event(secret, created_at, 34550, [['d', board_id]],
                          json.dumps(meta, ensure_ascii=False, separators=(',', ':')))
     for label, ev in (('9002', ev_create), ('34550', ev_meta)):
-        accepted, reason = nostr_publish(args.relay, ev)
+        accepted, reason = nostr_publish(args.relay, ev, auth_secret=secret if args.auth else None)
         print(f'kind {label}: {"受理" if accepted else "拒否"} ({reason})')
         if not accepted:
             sys.exit(1)
@@ -574,7 +626,7 @@ def cmd_board_join(args):
     """広場に参加申請: kind 9007 を publish。"""
     secret = load_key(args.keyfile)
     ev = sign_event(secret, int(time.time()), 9007, [['h', args.board_id]], '')
-    accepted, reason = nostr_publish(args.relay, ev)
+    accepted, reason = nostr_publish(args.relay, ev, auth_secret=secret if args.auth else None)
     print(f'参加申請: {"受理" if accepted else "拒否"} ({reason}) id={ev["id"]}')
     sys.exit(0 if accepted else 1)
 
@@ -583,7 +635,7 @@ def cmd_board_send(args):
     """広場に投稿: kind 9（平文、投稿者署名が発言の証）を publish。"""
     secret = load_key(args.keyfile)
     ev = sign_event(secret, int(time.time()), 9, [['h', args.board_id]], args.message)
-    accepted, reason = nostr_publish(args.relay, ev)
+    accepted, reason = nostr_publish(args.relay, ev, auth_secret=secret if args.auth else None)
     print(f'投稿: {"受理" if accepted else "拒否"} ({reason}) id={ev["id"]}')
     sys.exit(0 if accepted else 1)
 
@@ -594,7 +646,8 @@ def cmd_board_read(args):
     filt = {'kinds': [9], '#h': [args.board_id], 'limit': args.limit}
     if args.since:
         filt['since'] = args.since
-    events = nostr_request(args.relay, ['REQ', sub_id, filt])
+    auth_secret = load_key(args.keyfile) if args.auth else None
+    events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=auth_secret)
     shown = 0
     for ev in sorted(events, key=lambda e: e.get('created_at', 0)):
         if not verify_event_sig(ev):
@@ -649,16 +702,22 @@ def main():
     s = sub.add_parser('dm_recv'); s.add_argument('giftwrap')
     s = sub.add_parser('dm_pub'); s.add_argument('relay'); s.add_argument('--in', dest='in_file')
     s.add_argument('--to-npub'); s.add_argument('--message')
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
     s = sub.add_parser('dm_fetch'); s.add_argument('relay'); s.add_argument('--since', type=int)
     s.add_argument('--limit', type=int, default=20)
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
     s = sub.add_parser('board_create'); s.add_argument('relay'); s.add_argument('--name', default='仲間の広場')
     s.add_argument('--about', default=''); s.add_argument('--admission', choices=['open', 'approval'], default='approval')
     s.add_argument('--out')
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
     s = sub.add_parser('board_verify'); s.add_argument('descriptor')
     s = sub.add_parser('board_join'); s.add_argument('relay'); s.add_argument('board_id')
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
     s = sub.add_parser('board_send'); s.add_argument('relay'); s.add_argument('board_id'); s.add_argument('message')
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
     s = sub.add_parser('board_read'); s.add_argument('relay'); s.add_argument('board_id')
     s.add_argument('--since', type=int); s.add_argument('--limit', type=int, default=20)
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
 
     args = ap.parse_args()
     {'init': cmd_init, 'whoami': cmd_whoami, 'propose': cmd_propose,
