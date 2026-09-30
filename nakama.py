@@ -15,8 +15,12 @@
   nakama.py check <npub> <nonce-hex> <sig-hex>       署名を検証
   nakama.py rotate --gen|--to-hex HEX [--to-keyfile P]  鍵ローテーション: 旧鍵が新鍵に署名した rotation 証明書を発行
   nakama.py verify_rotation <rotation.json>          rotation 証明書を検証
-  nakama.py revoke <bond.json>                       bond の解消 (revocation イベント) を署名して発行
+  nakama.py revoke <bond.json> [--reason 理由]        bond の解消 (revocation イベント) を署名して発行
   nakama.py verify_revocation <revocation.json> --bond <bond.json>  解消イベントを検証
+  nakama.py revoke_import <revocation.json> [--bond <bond.json>]  受け取った revocation を検証して registry に取り込む
+  nakama.py revoke_pub <relay> <revocation.json> [--auth]  revocation を Nostr に公開（kind 30100、d タグ = bond_hash）
+  nakama.py revoke_fetch <relay> <bond_hash> [--limit N] [--auth]  公開された revocation を購読して registry に取り込む
+  nakama.py revoke_list                            解消済み bond の一覧を表示（理由つき）
   nakama.py dm_send <相手npub> <メッセージ> [--out FILE]  gift wrap (kind 1059) を構築
   nakama.py dm_recv <giftwrap.json>                    gift wrap を復号して rumor を表示
   nakama.py dm_pub <relay> [--in FILE|--to-npub NPUB --message MSG]  gift wrap をリレーに publish
@@ -347,11 +351,11 @@ def bond_hash(b: dict) -> str:
     return hashlib.sha256(canon.encode()).hexdigest()
 
 
-def revocation_message(bond_hash_hex: str, revoker: str, created_at: int) -> bytes:
-    canon = json.dumps(
-        {'bond_hash': bond_hash_hex, 'revoker': revoker, 'created_at': created_at, 'type': 'revocation'},
-        sort_keys=True, separators=(',', ':'),
-    )
+def revocation_message(bond_hash_hex: str, revoker: str, created_at: int, reason: str = '') -> bytes:
+    body = {'bond_hash': bond_hash_hex, 'revoker': revoker, 'created_at': created_at, 'type': 'revocation'}
+    if reason:
+        body['reason'] = reason
+    canon = json.dumps(body, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(canon.encode()).digest()
 
 
@@ -367,12 +371,15 @@ def cmd_revoke(args):
         sys.exit(1)
     h = bond_hash(b)
     created_at = int(time.time())
-    sig = sign_schnorr(secret, revocation_message(h, me, created_at))
+    reason = args.reason or ''
+    sig = sign_schnorr(secret, revocation_message(h, me, created_at, reason))
     rev = {
         'protocol': 'nakama', 'version': 1, 'type': 'revocation',
         'bond_hash': h, 'revoker': me, 'created_at': created_at,
         'sig': sig.hex(),
     }
+    if reason:
+        rev['reason'] = reason
     out = args.out or 'revocation.json'
     with open(out, 'w') as f:
         json.dump(rev, f, indent=2)
@@ -397,8 +404,103 @@ def verify_revocation_event(r: dict, b: dict | None = None) -> bool:
             return False
         if r.get('revoker') not in b.get('companions', []):
             return False
-    msg = revocation_message(r['bond_hash'], r['revoker'], r['created_at'])
+    msg = revocation_message(r['bond_hash'], r['revoker'], r['created_at'], r.get('reason', ''))
     return verify_schnorr(r['revoker'], bytes.fromhex(r['sig']), msg)
+
+
+def import_revocation_event(r: dict, registry: str) -> str:
+    """受け取った revocation を registry に取り込む。戻り値: 'stored' | 'duplicate' | 'invalid'。
+
+    無効な署名のイベントは registry に触れず 'invalid'。既存記録は上書きしない（先勝ち）。
+    """
+    if not verify_revocation_event(r):
+        return 'invalid'
+    os.makedirs(registry, exist_ok=True)
+    rp = revocation_registry_path(registry, r['bond_hash'])
+    if os.path.exists(rp):
+        return 'duplicate'
+    with open(rp, 'w') as f:
+        json.dump(r, f, indent=2)
+    os.chmod(rp, 0o600)
+    return 'stored'
+
+
+REVOCATION_NOSTR_KIND = 30100
+
+
+def revocation_nostr_event(rev: dict, secret: bytes) -> dict:
+    """revocation イベントを Nostr 公開用イベント (kind 30100) として構築・署名する。
+
+    kind 30100 は parameterized replaceable: d タグ = bond_hash。再発行で上書き（reason の追記訂正）できる。
+    """
+    content = json.dumps(rev, sort_keys=True, separators=(',', ':'))
+    return sign_event(secret, int(time.time()), REVOCATION_NOSTR_KIND,
+                      [['d', rev['bond_hash']]], content)
+
+
+def cmd_revoke_import(args):
+    with open(args.revocation) as f:
+        r = json.load(f)
+    assert r.get('protocol') == 'nakama' and r.get('version') == 1 and r.get('type') == 'revocation', \
+        'nakama v1 の revocation ではありません'
+    b = None
+    if args.bond:
+        with open(args.bond) as f:
+            b = json.load(f)
+    if not verify_revocation_event(r, b):
+        print('revocation は無効です（registry には記録しません）', file=sys.stderr)
+        sys.exit(1)
+    registry = args.registry or REVOCATIONS_DEFAULT
+    result = import_revocation_event(r, registry)
+    if result == 'duplicate':
+        print(f'既に registry に記録済みです: {revocation_registry_path(registry, r["bond_hash"])}')
+    else:
+        print(f'revocation を registry に記録しました: {revocation_registry_path(registry, r["bond_hash"])}')
+
+
+def cmd_revoke_pub(args):
+    """revocation イベントを Nostr リレーに publish (kind 30100, d タグ = bond_hash)。"""
+    secret = load_key(args.keyfile)
+    with open(args.revocation) as f:
+        rev = json.load(f)
+    assert rev.get('protocol') == 'nakama' and rev.get('version') == 1 and rev.get('type') == 'revocation', \
+        'nakama v1 の revocation ではありません'
+    if not verify_revocation_event(rev):
+        print('revocation は無効です（publish しません）', file=sys.stderr)
+        sys.exit(1)
+    ev = revocation_nostr_event(rev, secret)
+    accepted, reason = nostr_publish(args.relay, ev, auth_secret=secret if args.auth else None)
+    print(f'publish: {"受理" if accepted else "拒否"} ({reason}) id={ev["id"]}')
+    sys.exit(0 if accepted else 1)
+
+
+def cmd_revoke_fetch(args):
+    """bond_hash に対する revocation 公開イベント (kind 30100, #d) を購読し、有効なものを registry に取り込む。"""
+    secret = load_key(args.keyfile)
+    filt = {'kinds': [REVOCATION_NOSTR_KIND], '#d': [args.bond_hash], 'limit': args.limit}
+    sub_id = secrets.token_hex(8)
+    events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=secret if args.auth else None)
+    registry = args.registry or REVOCATIONS_DEFAULT
+    stored = skipped = 0
+    for ev in sorted(events, key=lambda e: e.get('created_at', 0)):
+        if not verify_event_sig(ev):
+            skipped += 1
+            continue  # Nostr 署名の無効なイベントは無視
+        try:
+            r = json.loads(ev['content'])
+        except (ValueError, TypeError):
+            skipped += 1
+            continue  # content が JSON でないイベントは無視
+        if not isinstance(r, dict) or r.get('bond_hash') != args.bond_hash:
+            skipped += 1
+            continue  # bond_hash 不一致（リレーのフィルタが緩い場合の二重チェック）
+        result = import_revocation_event(r, registry)
+        if result == 'stored':
+            stored += 1
+            print(f'取り込み: revocation を registry に記録しました (bond {r["bond_hash"][:16]}..., revoker {r["revoker"][:16]}...)')
+        else:
+            skipped += 1  # duplicate / invalid
+    print(f'{len(events)} 件のイベントを取得: {stored} 件を取り込み、{skipped} 件をスキップ')
 
 
 def revocation_registry_path(registry: str, bond_hash_hex: str) -> str:
@@ -431,13 +533,16 @@ def cmd_revoke_list(args):
         with open(os.path.join(registry, fn)) as f:
             r = json.load(f)
         if verify_revocation_event(r):
-            rows.append((r['bond_hash'][:16], r['revoker'][:16], time.strftime('%Y-%m-%d', time.localtime(r['created_at']))))
+            rows.append((r['bond_hash'][:16], r['revoker'][:16],
+                         time.strftime('%Y-%m-%d', time.localtime(r['created_at'])),
+                         r.get('reason', '')))
     if not rows:
         print('revocation registry は空です')
         return
     print(f'解消済み bond: {len(rows)} 件')
-    for h, revoker, date in rows:
-        print(f'  {h}...  解消: {revoker}...  ({date})')
+    for h, revoker, date, reason in rows:
+        suffix = f'  理由: {reason}' if reason else ''
+        print(f'  {h}...  解消: {revoker}...  ({date}){suffix}')
 
 
 def liveness_message(npub: str, created_at: int, nonce_hex: str, bond_hash_hex: str | None = None) -> bytes:
@@ -1672,10 +1777,19 @@ def main():
     s.add_argument('--out')
     s = sub.add_parser('verify_rotation'); s.add_argument('rotation')
     s = sub.add_parser('revoke'); s.add_argument('bond'); s.add_argument('--out')
+    s.add_argument('--reason', default='', help='解消理由（署名付きで記録、任意）')
     s.add_argument('--registry', default=None, help='revocation registry ディレクトリ (既定: ~/.config/nakama/revocations)')
     s.add_argument('--no-registry', action='store_true', help='registry への記録を省略')
     s = sub.add_parser('verify_revocation'); s.add_argument('revocation'); s.add_argument('--bond')
     s = sub.add_parser('revoke_list'); s.add_argument('--registry', default=None)
+    s = sub.add_parser('revoke_import'); s.add_argument('revocation'); s.add_argument('--bond', default=None)
+    s.add_argument('--registry', default=None, help='revocation registry ディレクトリ (既定: ~/.config/nakama/revocations)')
+    s = sub.add_parser('revoke_pub'); s.add_argument('relay'); s.add_argument('revocation')
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s = sub.add_parser('revoke_fetch'); s.add_argument('relay'); s.add_argument('bond_hash')
+    s.add_argument('--limit', type=int, default=20)
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s.add_argument('--registry', default=None, help='revocation registry ディレクトリ (既定: ~/.config/nakama/revocations)')
     s = sub.add_parser('liveness'); s.add_argument('--bond', default=None, help='紐付ける bond ファイル')
     s.add_argument('--out')
     s = sub.add_parser('verify_liveness'); s.add_argument('proof'); s.add_argument('--bond', default=None)
@@ -1741,6 +1855,8 @@ def main():
      'respond': cmd_respond, 'check': cmd_check, 'rotate': cmd_rotate,
      'verify_rotation': cmd_verify_rotation, 'revoke': cmd_revoke,
      'verify_revocation': cmd_verify_revocation, 'revoke_list': cmd_revoke_list,
+     'revoke_import': cmd_revoke_import, 'revoke_pub': cmd_revoke_pub,
+     'revoke_fetch': cmd_revoke_fetch,
      'liveness': cmd_liveness, 'verify_liveness': cmd_verify_liveness, 'dm_send': cmd_dm_send,
      'dm_recv': cmd_dm_recv, 'dm_pub': cmd_dm_pub,
      'dm_fetch': cmd_dm_fetch, 'board_create': cmd_board_create,
