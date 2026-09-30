@@ -1,7 +1,7 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.3
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18））
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 設計中 — board-decision の Nostr 公開（§19））
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -242,6 +242,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.11**（完了）: `verify_binding` への侵害警告統合（§16）。§15.4 の「`bind`（将来候補）」の検討結果: 統合点は `bind` ではなく `verify_binding`。`bind` は自分の鍵での自分の主張であり発行者自覚済み（`propose` 除外と同型）。`verify_binding` は検証者の信頼決定の瞬間であり、対象 npub への非撤回宣言は判断材料として価値がある。実装: `cmd_verify_binding` で署名・platform・handle 検証の後、対象 npub（`b['npub']`）について `key_compromise_warnings` を呼び出し、非撤回宣言があれば stderr に WARN（§14 と同フォーマット、署名改ざん時も出す）。警告のみで exit コード不変（検証結果 `ok` には影響しない）。`verify_binding --compromise-registry` を追加。オフライン 6 ケース通過（`test_verify_binding_warnings.py` 新規: 宣言なしで有効+exit 0、宣言ありで WARN+有効+exit 0、withdrawn のみで警告なし、署名改ざんでも WARN+無効+exit 1、registry 切り替え、別鍵の宣言は対象外。既存の compromise 24 / integration 10 / governance 30 / revocation 8 回帰維持）。スコープ外: `bind`（自覚済み）、`unbind`/`verify_unbinding`、自動 fetch、自動ブロック。
 - **v0.12**（完了）: rotation 証明書の Nostr 公開（§17）。§13.6 の残課題（§14.4 でスコープ外とした「移行の Nostr 公開」）。kind 30102（parameterized replaceable、nakama 独自割当）、`d` タグ = 旧鍵の hex pubkey（取得方向: 旧鍵 → 移行先）、content = rotation JSON canonical。Nostr イベントの署名者は旧鍵（正規スロットを (pubkey, kind, d) で一意化、第三者スロットは fetch 側で無視）。実装: `ROTATION_NOSTR_KIND = 30102`、`rotation_nostr_event(rot, secret)`（純粋）、`verify_rotation_nostr_event(ev, old_hex)`（三段階検証: Nostr 署名 → JSON パース → `verify_rotation_cert` ＋ d タグ・pubkey の二重チェック、無効はスキップ）、`rotation_chain_fetch(old_hex, fetch_one, max_links=16)`（循環・上限ガード）、`rotate_pub <relay> <rotation.json> [--auth]`（keyfile の鍵 == old_npub を確認、不一致なら拒否で publish しない）、`rotate_fetch <relay> <old_npub> [--limit] [--auth] [--out] [--chain]`（有効なものを created_at 最大で 1 件表示、`--out` は mode 600 保存、`--chain` で全リンク表示）。`key_status --rotation` は引き続きファイル受付（自動 fetch なし、§14 の方針維持）。オフライン 8 ケース通過（`test_rotation_nostr.py` 新規、既存の revocation 8 / compromise 24 / integration 10 / governance 30 / accept 7 / verify_binding 6 回帰維持）。スコープ外: `key_status` の自動取得、rotation のローカル registry 化、kind の正式割当。
 - **v0.13**（完了）: `remove` 決定種別の追加 — kind 9001 Remove User のガバナンス照合（§18。`BOARD_DECISION_TYPES` + payload 検証 + `GOVERNANCE_COVERAGE['remove']={9001}` + 照合ルール置換、test_remove.py 10 ケース通過、全回帰維持）。
+- **v0.14**（設計中）: board-decision の Nostr 公開（§19）。kind 30103（parameterized replaceable、nakama 独自割当）、`d` タグ = 決定のコアハッシュ（board_id/decision/created_at/payload の sha256 先頭 32 hex — cosign の approvals 追記でもスロット安定）、`h` タグ = board_id、content = 決定 JSON canonical。署名者は publisher（決定の署名者ではない — 決定の有効性は threshold approvals が証明するため keyfile 一致チェックなし）。CLI: `board_decide_pub`（構造検証→publish）/ `board_decide_fetch`（三段階検証＋同一コアの approvals マージ＋`--out` 保存）。threshold 検証は `board_read --governance` の管轄のまま。テスト計画 8 ケース（オフライン）。スコープ外: fetch 側の threshold 検証、決定の撤回・無効化、cosign 回覧の Nostr 化、kind の正式割当。
 
 ---
 
@@ -1069,8 +1070,74 @@ NIP-29 の管理イベントには「去る」と「外す」の 2 方向があ�
 
 - 除名された運営者の自動的な eligible 除外（§18.5 の決定通り、policy-update で行う）。
 - 除名対象への事前通知・異議申し立ての手続き（運用の領域）。
-- `remove` 決定の Nostr 公開（board-decision は回覧ベースの運用のまま）。
+- `remove` 決定の Nostr 公開（board-decision は回覧ベースの運用のまま）→ v0.14（§19）に一般化して吸収。
 - 除名後の対象による kind 9 投稿の扱い（チャット投稿は管理イベントではなく照合対象外 — §4.2 の思想）。
+
+---
+
+## 19. v0.14 設計: board-decision の Nostr 公開（設計中）
+
+§18.7 でスコープ外とした「`remove` 決定の Nostr 公開」を、全決定種別（admit / handover / policy-update / close / remove）に一般化して設計する。board-decision は回覧ベース: 決定案の署名集めも決定後の配布も DM・markdown ブロックの私的経路に依存する。`board_read --governance` は決定ファイルを引数で受け取るが、検証者が決定をどう入手するかは運用に委ねられている。revocation（kind 30100）/ compromise（30101）/ rotation（30102）の公開パターンを board-decision にも適用し、決定を Nostr 上で公開・取得できるようにする。
+
+### 19.1 設計方針
+
+§12 / §13 / §17 の `*_pub` パターン（parameterized replaceable kind ＋ Nostr 既存リレーヘルパ `nostr_publish` / `nostr_request` / `--auth` の流用）をそのまま使う。新しい公開 kind を一つ定義する。
+
+### 19.2 kind とタグ
+
+- kind **30103**（parameterized replaceable、nakama 独自割当）。30100（revocation）、30101（compromise declaration）、30102（rotation）に続く番号。
+- `d` タグ = **決定のコアハッシュ**。決定は `board_cosign` で approvals が後から追加されるため、content 全体のハッシュではスロットが安定しない。不変部分（`board_id`、`decision`、`created_at`、`payload` の canonical JSON）の sha256 の先頭 32 hex 文字を `d` とする。純粋関数 `decision_core_hash(d)` に分離。
+- `h` タグ = `board_id`。取得の方向: 検証者は「この board の決定一覧」を `kinds=[30103]`、`#h=[board_id]` で取得する。
+- content = 決定 JSON の canonical（sort_keys、indent なし。approvals を含む最新版）。
+
+### 19.3 イベントの署名者
+
+署名者は **publisher の鍵**（決定の署名者ではない）。決定の有効性は threshold の approvals が証明するものであり、Nostr イベントの署名は「この出版者がこの決定を公開した」の記録にすぎない。したがって `rotate_pub` のような keyfile 一致チェックは**しない** — 決定を保持する任意の仲間が publish できる。これは意図的な設計（§19.6）。
+
+### 19.4 検証の分離
+
+- 純粋関数 `board_decision_nostr_event(d, secret)`（オフラインでテスト可能）: `decision_core_hash` で `d` を計算し、`sign_event(secret, now, 30103, [["d", h], ["h", board_id]], content)` で署名する。
+- fetch 側の三段階検証（`revoke_fetch` / `compromise_fetch` / `rotate_fetch` と対称）:
+  1. Nostr イベント署名の検証（`verify_event_sig`）
+  2. content の JSON パース
+  3. 構造検証: `protocol == "nakama"`、`type == "board-decision"`、`decision in BOARD_DECISION_TYPES`、`validate_decision_payload`、`d` タグ == `decision_core_hash(content)` の再計算一致、`h` タグ == content の `board_id`
+- threshold の検証は**しない** — policy が必要であり、`board_read --governance` の管轄（§19.6）。
+- 同一コアハッシュの有効イベントが複数あった場合（第三者が別 pubkey で publish、または追記後に再 publish）: approvals をマージした決定として扱う。純粋関数 `merge_decision_approvals(decisions)`（重複署名は npub で dedup、署名の有効性判定は governance 側）。
+- 無効なイベントは警告してスキップ。
+
+### 19.5 CLI
+
+- `board_decide_pub <relay> <decision.json> [--auth]`: 決定の構造検証（§19.4 の 3 と同じ）→ 無効なら publish せず exit 1 → `board_decision_nostr_event` で構築 → `nostr_publish`。受理／拒否を表示し、拒否で exit 1。`--relay` の既定値・`--auth` の意味は既存コマンドと同じ。keyfile の鍵と決定の関係は問わない（§19.3）。
+- `board_decide_fetch <relay> <board_id> [--limit N] [--auth] [--out <dir>]`:
+  - `kinds=[30103]`、`#h=[board_id]` で購読 → 三段階検証 → 同一コアのマージ → 決定の一覧を表示（decision / created_at / approvals 数。threshold 充足の可否は表示しない — policy 不明のため）。
+  - `--out <dir>` 指定時は各決定を `<core_hash>.json` として保存（公開ガバナンス記録のため mode 600 にはしない）。保存したファイルは `board_read --governance --decisions` にそのまま渡せる形。
+- `board_read --governance` との関係: 引き続きファイルを受け取る。リレーからの自動取得はしない（§14 の「リレーからの自動 fetch なし」の方針を維持）。運用は `board_decide_fetch --out decisions/` → `board_read --governance <policy.json> --decisions decisions/` の明示的な 2 ステップ。
+
+### 19.6 正直に書く
+
+- publish は決定の有効性を証明しない。決定の有効性は threshold の approvals のみが証明する（§9.4）。fetch 側は構造のみを検証し、有効性の判断は `governance_match_events`（決定時点・イベント時点の政策での時系列検証）に委ねる。
+- 決定は公開ガバナンス記録であることが前提。非公開にしたい board は publish しなければよい（公開は任意・決定ごと）。`remove` 決定の `reason`（除名理由）など人間可読フィールドが含まれることに注意 — publish 前に内容を確認すること。
+- 誰でも publish できるため、無効な決定（threshold 未達・部外者署名）の publish も可能。fetch 側の構造検証では排除できず、`board_read --governance` の threshold 検証で排除される。プロトコルは「誰が何を宣言したか」の記録に徹する（§17.6 と同じ思想）。
+- `d` スロットの上書き: 同一コアハッシュで approvals が増えた再 publish は上書きされる（意図通り — 追記は前進のみ）。異なる pubkey の第三者が同コアで publish すると別スロットになるが、fetch は全スロットを収集してマージするため追跡は壊れない。
+- kind 30103 は nakama の独自割当（NIP の正式割当ではない）。他実装との衝突時は再割当の可能性を仕様に明記する。
+
+### 19.7 実装計画
+
+- `DECISION_NOSTR_KIND = 30103`、`decision_core_hash(d)`（純粋、不変部分の sha256 先頭 32 hex）
+- `board_decision_nostr_event(d, secret)`（純粋、署名者は publisher）
+- `verify_board_decision_nostr_event(ev, board_id)`（純粋、三段階検証: Nostr 署名 → JSON パース → 構造＋d/h 二重チェック。threshold 検証なし）
+- `merge_decision_approvals(decisions)`（純粋、同一コアの approvals マージ・npub で dedup）
+- `cmd_board_decide_pub`（構造検証 → publish、無効は拒否で exit 1。keyfile 一致チェックなし）
+- `cmd_board_decide_fetch`（`--auth` `--limit` `--out`）、argparse 登録・dispatch 追加、docstring の usage 行も更新
+- テスト `test_board_decision_nostr.py` 8 ケース: approvals 追記前後で core_hash 不変 / イベント構築（kind 30103・d/h タグ・署名者 == publisher）/ 正常イベントの検証通過 / d タグ改ざんの拒否 / h タグ≠board_id の拒否 / payload 形式違反の決定の拒否 / Nostr 署名無効のスキップ / 同一コア 2 イベントの approvals マージ（和集合・重複除去）。fetch のモック試験で `--out` 保存の往復も確認。
+- 回帰: 既存の全テストスイート維持（governance 30 / revocation 8 / compromise 24 / integration 10 / accept 7 / verify_binding 6 / rotation 8 / remove 10）
+
+### 19.8 スコープ外
+
+- fetch 側の threshold 検証（policy が必要 — `board_read --governance` の管轄）。
+- 決定の撤回・無効化（決定は不変。board 自体の終了は `close` 決定の運用）。
+- cosign 回覧（決定前）の Nostr 化 — 決定前の回覧は DM / markdown ブロックのまま。
+- kind 30103 の正式割当申請（NIP 化は将来の候補）。
 
 ---
 
@@ -1110,3 +1177,4 @@ NIP-29 の管理イベントには「去る」と「外す」の 2 方向があ�
 - 2026-10-01: v0.12 設計 — rotation 証明書の Nostr 公開を仕様書 §17 に固定（設計のみ、実装は次ラン）。§13.6 の残課題（§14.4 でスコープ外とした「移行の Nostr 公開」）。要点: kind 30102（parameterized replaceable、nakama 独自割当、30100/30101 に続く番号）、`d` タグ = 旧鍵の hex pubkey（取得方向: 旧鍵 → 移行先）、content = rotation JSON canonical。Nostr イベントの署名者は旧鍵（正規スロットを (pubkey, kind, d) で一意化、第三者スロットは fetch 側で無視）。`rotate_pub <relay> <rotation.json> [--auth]`（keyfile の鍵 == old_npub を確認、不一致なら拒否）。`rotate_fetch <relay> <old_npub> [--limit] [--auth] [--out] [--chain]`（三段階検証: Nostr 署名 → JSON パース → `verify_rotation_cert`＋d タグ・pubkey の二重チェック、無効はスキップ。`--chain` は純粋関数 `rotation_chain_fetch` で上限 16・循環ガード付きのチェーン走査）。`key_status --rotation` は引き続きファイル受付（自動 fetch なし、§14 の方針維持）。正直に書く: 旧鍵漏洩後の移行は Nostr 公開でも証明できない（§5.5.2 と同じ）、d=old_hex の列挙可能性は意図通り（公開は任意）、kind は正式割当ではない。テスト計画 8 ケース（オフライン）。ロードマップ §7 に v0.12（設計中）を追加、ヘッダの日付行も更新。
 - 2026-10-01: v0.13 設計 — `remove` 決定種別の追加を仕様書 §18 に固定（設計のみ、実装は次ラン）。§11.3 で将来候補とした項目。設計の要点: (1) 用語の整理 — kind 9008（Leave Group）は本人の自発的退会で決定不要（常に OK のまま）、kind 9001（Remove User）は運営者による他者の除名で `remove` 決定の照合対象。kind 9001 で発行者 == 対象は自発的退会と同型として OK。「本人の希望による除名」は検証不可能な宣言であり reason 記録のみで照合に影響なし。(2) `remove` 決定の形式は admit と対称（payload: `candidate` 必須 + `reason` 任意・署名対象、`_verify_decision_core` 流用、`BOARD_DECISION_TYPES` 追加で `board_decide --decision remove` が自動対応）。(3) 照合ルール: `GOVERNANCE_COVERAGE['remove'] = {9001}`、有効な remove 決定があり candidate == p タグ対象かつ決定が除名に先行すれば OK、それ以外は WARN。close 決定後の 9001 は既存の close 無効化ルールが優先。(4) 旧運営の処遇 — `remove` 決定は kind 9001 の正当化のみを行い政策（eligible）の変更は行わない。運営者の除名は remove + 後の policy-update の 2 ステップ（`resolve_policy_at` の不変条件を壊さない最小変更）。除名対象がイベント時点の eligible 内なら OK + INFO 注記（policy-update 推奨）。テスト計画 10 ケース（オフライン）、回帰維持。ロードマップ §7 に v0.13（設計中）を追加、ヘッダの日付行も更新。
 - 2026-10-01: v0.13 完了 — §18 の設計を実装。`BOARD_DECISION_TYPES` に `'remove'` 追加（`board_decide --decision remove` が自動対応）、`validate_decision_payload` に `remove` 分岐（キー集合 `{'candidate'}`|`{'candidate','reason'}`、candidate 文字列、reason 文字列・署名対象）、`GOVERNANCE_COVERAGE['remove'] = {9001}`、`governance_match_events` の 9001 分岐を置換（自発的除名 OK / 有効な remove 決定 + 対象一致 + 決定先行で OK / それ以外 WARN / 除名対象がイベント時点で eligible 内なら OK + INFO 注記「policy-update による規約更新を推奨」、警告カウントには含めない。remove 決定は政策変更を行わない — 旧運営の除名は remove + policy-update の 2 ステップ、`resolve_policy_at` の不変条件を維持）。オフライン 10 ケース通過（`test_remove.py` 新規）＋ governance 30 / revocation 8 / compromise 24 / integration 10 / accept 7 / verify_binding 6 / rotation 8 回帰維持。spec §18 の設計文面を実装記録に更新、ロードマップ §7・ヘッダも更新。agentgit + GitHub ミラーに push。
+- 2026-10-01: v0.14 設計 — board-decision の Nostr 公開を仕様書 §19 に固定（設計のみ、実装は次ラン）。§18.7 の「remove 決定の Nostr 公開」を全決定種別に一般化して吸収。要点: kind 30103（parameterized replaceable、nakama 独自割当）、`d` タグ = 決定のコアハッシュ（board_id/decision/created_at/payload の sha256 先頭 32 hex — cosign の approvals 追記でもスロット安定）、`h` タグ = board_id（board の決定一覧の取得方向）、content = 決定 JSON canonical。Nostr イベントの署名者は publisher（決定の有効性は threshold approvals が証明 — rotate_pub と異なり keyfile 一致チェックなし、意図的）。`board_decide_pub <relay> <decision.json> [--auth]`（構造検証→publish、無効は拒否）、`board_decide_fetch <relay> <board_id> [--limit] [--auth] [--out <dir>]`（三段階検証: Nostr 署名 → JSON パース → 構造＋d/h 二重チェック。threshold 検証は `board_read --governance` の管轄。同一コアの複数イベントは approvals マージ）。`--out` 保存ファイルは `board_read --governance --decisions` にそのまま渡せる形。正直に書く: publish は有効性を証明しない、決定は公開ガバナンス記録が前提（非公開 board は publish しない）、無効な決定の publish も可能（governance 側で排除）、kind は正式割当ではない。テスト計画 8 ケース（オフライン）。ロードマップ §7 に v0.14（設計中）を追加、ヘッダの日付行も更新。
