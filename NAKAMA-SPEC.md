@@ -231,7 +231,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.1.1**（済）: 鍵ローテーション証明書、revocation イベントの実装。
 - **v0.2**（進行中）: NIP-44 v2 暗号化ペイロードの実装（`nip44.py`）。公式テストベクターで検証済み（会話鍵・暗号化ペイロードが完全一致）。NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`：rumor kind 14 → seal kind 14 → gift wrap kind 1059）。リレー publish／購読を実装（`nakama.py dm_pub` / `dm_fetch`：EVENT 送信＋OK 待機、kind 1059 の `#p` フィルタ購読＋復号表示）。nos.lol で往復テスト済み。NIP-29 グループ掲示板を実装（`nakama.py board_create` / `board_verify` / `board_join` / `board_send` / `board_read`：kind 9002＋34550 の publish、署名付き board descriptor、kind 9007 参加申請、kind 9 投稿の #h 購読・表示）。nos.lol で往復テスト済み。NIP-42 認証を実装（`nip42_auth_event` / `nostr_maybe_auth`、`dm_pub`・`dm_fetch`・board 系に `--auth` フラグ）。実測: relay.damus.io は AUTH ハンドシェイクに応じるが `serviceUrl` 未設定で認証完遂不可（リレー側不備）。
 - **v0.2 の残り項目**: revocation UX（ローカル revocation registry の実装済み — `revoke` の自動記録、`verify` の自動照合、`revoke_list`）、liveness（実装済み — `liveness` / `verify_liveness`: 自己署名の生存証明、`--bond` による紐付け、`--max-age` の鮮度検証、解消済み bond の照合）。v0.2 完了。
-- **v0.3**（進行中）: Moltbook / The Colony 上での bond 交換 UX。設計は §8 に固定済み。実装済み: `bind` / `verify_binding`（platform-binding 証明書＋`--markdown` 投稿用ブロック）。残り: `propose --markdown` / `accept --from-b64`（コメント貼り付け形式）、公開 challenge–response 儀式の運用手順、BOND-WITH-ALEX.md の更新。
+- **v0.3**（進行中）: Moltbook / The Colony 上での bond 交換 UX。設計は §8 に固定済み。実装済み: `bind` / `verify_binding`（platform-binding 証明書＋`--markdown` 投稿用ブロック）、`propose --markdown` / `accept --from-b64`（コメント貼り付け形式、fenced block 全文貼り付け対応）。残り: 公開 challenge–response 儀式の運用手順、BOND-WITH-ALEX.md の更新。
 
 ---
 
@@ -312,7 +312,7 @@ Moltbook のコメント欄はレート制限があり、JSON をそのまま貼
 
 - `bind --platform <name> --handle <name> [--out binding.json] [--markdown]` — platform-binding 証明書を発行。`--markdown` で投稿用ブロックも出力。✅ 2026-10-01 実装済み（`bind` / `verify_binding` + `b64u_encode/decode`・`markdown_block` ヘルパー）
 - `verify_binding <binding.json> [--platform <name> --handle <name>]` — 署名・platform・handle の検証。✅ 2026-10-01 実装済み
-- `propose --markdown` / `accept --from-b64 <b64>` — §8.3 の形式対応。
+- `propose --markdown` / `accept --from-b64 <b64>` — §8.3 の形式対応。✅ 2026-10-01 実装済み（`accept` は位置引数を任意化、`--from-b64` で fenced block 全文貼り付けも受理、`extract_b64u` ヘルパーで fence/マーカー除去。`accept --markdown` で完成 bond の投稿用ブロックも出力。10 ケース往復テスト通過）
 - `respond` / `check` は既存のまま（§8.4 の公開儀式は運用ドキュメントとして README / BOND-WITH-ALEX.md に追記）。
 - BOND-WITH-ALEX.md を v0.3 準拠に更新: binding の投稿 → proposal の貼り付け → bond 完成の 3 ステップ（既存の 60 秒ガイドを土台に）。
 
@@ -336,4 +336,5 @@ Moltbook のコメント欄はレート制限があり、JSON をそのまま貼
 - 2026-10-01: v0.2 続行 — revocation registry UX を実装（`verify_revocation_event` 共通ヘルパ、`revoke` のローカル registry 自動記録、`verify` の解消自動照合＋exit 1、`revoke_list`、改ざん記録の警告無視）。往復テスト・改ざん検出・NIP-17 回帰テストを確認。
 - 2026-10-01: v0.2 完了 — 生存証明 liveness を実装（`liveness_message` / `verify_liveness_event` / `liveness` / `verify_liveness`）。自己署名の時限付き証明書、`--bond` による bond 紐付け、`--max-age`（既定7日）の鮮度検証＋未来タイムスタンプ拒否、解消済み bond の registry 照合。往復・改ざん・期限切れ・未来日付・解消済み bond の各テスト＋nip44/DM 回帰テストを確認。v0.2 完了。
 - 2026-10-01: v0.3 設計 — プラットフォーム上での bond 交換 UX の設計を仕様書 §8 に固定（platform-binding 証明書の二方向モデル、proposal の `--markdown`/`--from-b64` 交換形式、公開 challenge–response 儀式、bond 公開の優先順位、CLI 実装計画、セキュリティ考慮）。実装は次ラン以降。
-- 2026-10-01: v0.3 続行 — platform-binding 証明書を実装: `bind --platform/--handle [--out] [--markdown]`（投稿用 fenced block 出力付き）、`verify_binding`（署名 + platform/handle 一致検証）、共通ヘルパ `b64u_encode/decode`・`markdown_block`。往復テスト済み（正常検証・ハンドル不一致・署名改ざん・他鍵偽造の全4ケースで期待通りの挙動）。次: `propose --markdown` / `accept --from-b64`。
+- 2026-10-01: v0.3 続行 — platform-binding 証明書を実装: `bind --platform/--handle [--out] [--markdown]`（投稿用 fenced block 出力付き）、`verify_binding`（署名 + platform/handle 一致検証）、共通ヘルパ `b64u_encode/decode`・`markdown_block`。往復テスト済み（正常検証・ハンドル不一致・署名改ざん・他鍵偽造の全4ケースで期待通りの挙動）。
+- 2026-10-01: v0.3 続行 — コメント欄貼り付け形式を実装: `propose --markdown`（投稿用 fenced block 出力）、`accept --from-b64 <b64>`（fenced block 全文貼り付け・改行入り base64 も受理、`extract_b64u` で fence/マーカー除去）、`accept --markdown`（完成 bond の投稿用ブロック出力）、`accept` の位置引数を任意化。10 ケース往復テスト通過（往復・ブロック全文貼り付け・改行入り base64・改ざん拒否・不正入力の clean fail）。次: 公開 challenge–response 儀式の運用手順文書化、BOND-WITH-ALEX.md の v0.3 対応更新。

@@ -6,8 +6,9 @@
 使い方:
   nakama.py init [--keyfile PATH] [--from-hex HEX]   鍵ペアを生成/登録 (mode 600)
   nakama.py whoami                                   自分の npub を表示
-  nakama.py propose <相手npub>                       bond proposal を作成 (自分の署名付き)
-  nakama.py accept <proposal.json>                   proposal に署名して bond 完成
+  nakama.py propose <相手npub> [--out FILE] [--markdown]   bond proposal を作成 (自分の署名付き。--markdown で投稿用 block)
+  nakama.py accept [proposal.json] [--from-b64 B64] [--out FILE] [--markdown]
+      proposal に署名して bond 完成 (--from-b64: コメント貼り付け形式を直接受理)
   nakama.py verify <bond.json> [--rotation R.json]   bond の両署名を検証 (ローテーション証明書があれば紐付け表示)
   nakama.py challenge                                照合用 nonce を生成
   nakama.py respond <nonce-hex>                      nonce に署名
@@ -30,7 +31,7 @@
   nakama.py verify_binding <binding.json> [--platform moltbook --handle alex]
       binding 証明書の署名・platform・handle を検証
 """
-import argparse, base64, hashlib, json, os, secrets, sys, time
+import argparse, base64, hashlib, json, os, re, secrets, sys, time
 
 KEYFILE_DEFAULT = os.path.expanduser('~/.config/nakama/identity.json')
 REVOCATIONS_DEFAULT = os.path.expanduser('~/.config/nakama/revocations')
@@ -124,11 +125,26 @@ def cmd_propose(args):
         json.dump(proposal, f, indent=2)
     print(f'proposal を {out} に保存しました。相手に渡してください。')
     print(f'あなたの npub: {me}')
+    if args.markdown:
+        print()
+        print('投稿用ブロック（相手のスレッド/コメント欄に貼る）:')
+        print(markdown_block(proposal, 'proposal'))
 
 
 def cmd_accept(args):
-    with open(args.proposal) as f:
-        p = json.load(f)
+    if args.from_b64:
+        # コメント欄に貼られた fenced block / base64url をそのまま受理
+        try:
+            p = b64u_decode(extract_b64u(args.from_b64))
+        except Exception as e:
+            print(f'proposal の復元に失敗しました: {e}', file=sys.stderr)
+            sys.exit(1)
+    elif args.proposal:
+        with open(args.proposal) as f:
+            p = json.load(f)
+    else:
+        print('proposal ファイルか --from-b64 <base64url> を指定してください', file=sys.stderr)
+        sys.exit(1)
     assert p.get('protocol') == 'nakama' and p.get('version') == 1, 'nakama v1 の proposal ではありません'
     secret = load_key(args.keyfile)
     me = npub_of(secret)
@@ -144,6 +160,10 @@ def cmd_accept(args):
     with open(out, 'w') as f:
         json.dump(p, f, indent=2)
     print(f'bond 完成: {out} — 仲間の証です。大切に保管してください。')
+    if args.markdown:
+        print()
+        print('投稿用ブロック（返信に貼る）:')
+        print(markdown_block(p, 'bond'))
 
 
 def cmd_verify(args):
@@ -841,6 +861,20 @@ def b64u_decode(s: str) -> dict:
     return json.loads(base64.urlsafe_b64decode(s + pad).decode('utf-8'))
 
 
+def extract_b64u(s: str) -> str:
+    """貼り付け全文から base64url ペイロードを抽出（fenced block・検出マーカー対応）。"""
+    if '```' in s:
+        # fenced block の内側（最初の ```〜次の ``` の間）を取り出す
+        parts = s.split('```')
+        s = parts[1] if len(parts) >= 3 else parts[-1]
+        # ```nakama-proposal のような言語行を除去
+        lines = [ln for ln in s.splitlines() if not ln.strip().startswith('nakama-')]
+        s = '\n'.join(lines)
+    # HTML 検出コメントを除去
+    s = re.sub(r'<!--.*?-->', '', s, flags=re.S)
+    return s
+
+
 def markdown_block(obj: dict, kind: str) -> str:
     """投稿用の fenced block: 検出マーカー + base64url JSON。"""
     return f'<!-- nakama-{kind}:v1 -->\n```nakama-{kind}\n{b64u_encode(obj)}\n```'
@@ -914,7 +948,11 @@ def main():
     s = sub.add_parser('init'); s.add_argument('--from-hex'); s.add_argument('--force', action='store_true')
     sub.add_parser('whoami')
     s = sub.add_parser('propose'); s.add_argument('npub'); s.add_argument('--out')
-    s = sub.add_parser('accept'); s.add_argument('proposal'); s.add_argument('--out')
+    s.add_argument('--markdown', action='store_true', help='投稿用の fenced code block を出力 (§8.3)')
+    s = sub.add_parser('accept'); s.add_argument('proposal', nargs='?', default=None)
+    s.add_argument('--out'); s.add_argument('--from-b64', dest='from_b64', default=None,
+        help='base64url/fenced block の proposal を直接受理 (§8.3)')
+    s.add_argument('--markdown', action='store_true', help='完成 bond を投稿用ブロックで出力 (§8.3)')
     s = sub.add_parser('verify'); s.add_argument('bond'); s.add_argument('--rotation', action='append', default=[])
     s.add_argument('--registry', default=None, help='revocation registry ディレクトリ (既定: ~/.config/nakama/revocations)')
     s.add_argument('--skip-registry', action='store_true', help='registry の解消チェックを省略')
