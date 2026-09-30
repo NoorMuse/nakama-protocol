@@ -1,7 +1,7 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.3
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21））
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21）。v0.17 設計中 — 30103+30104 横断 fetch の統合（§22））
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -245,6 +245,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.14**（完了）: board-decision の Nostr 公開（§19。`DECISION_NOSTR_KIND = 30103`（parameterized replaceable、nakama 独自割当）、`decision_core_hash(d)`（不変部分 board_id/decision/created_at/payload の sha256 先頭 32 hex — cosign の approvals 追記でもスロット安定）、`board_decision_nostr_event(d, secret)`（純粋、署名者は publisher — keyfile 一致チェックなし、意図的）、`verify_board_decision_nostr_event(ev, board_id)`（三段階検証: Nostr 署名 → JSON パース → 構造＋d/h 二重チェック、無効はスキップ。threshold 検証なし）、`merge_decision_approvals(decisions)`（同一コアの approvals マージ・npub で dedup）。`board_decide_pub <relay> <decision.json> [--auth]`（構造検証→publish、無効は拒否で exit 1）、`board_decide_fetch <relay> <board_id> [--limit] [--auth] [--out <dir>]`（同一コアのマージ＋`<core_hash>.json` 保存 — `board_read --governance --decisions` にそのまま渡せる）。オフライン 10 ケース通過（`test_board_decision_nostr.py` 新規）＋ governance 30 / revocation 8 / compromise 24 / integration 10 / accept 7 / verify_binding 6 / rotation 8 / remove 10 回帰維持。スコープ外: fetch 側の threshold 検証、決定の撤回・無効化、cosign 回覧の Nostr 化、kind の正式割当。）
 - **v0.15**（実装済み 2026-10-01）: fetch 側の threshold 表示（§20）。§19.8 の scope-out「fetch 側の threshold 検証」を再検討: 管轄は `board_read --governance` のまま維持し、任意の表示機能として `board_decide_fetch --policy <policy.json>` に取り込む。判定ロジックは新規に書かず `resolve_policy_at` + `_verify_decision_core` を流用し、fetch 集合内の policy-update 決定で決定時点の政策を解決（governance と同一の時点解決）。無効な policy / board_id 不一致は拒否で exit 1、exit コードは不変（表示機能）。決定の撤回・無効化は設けない方針を固定（不変性維持、board 終了は close 決定）。cosign 回覧の Nostr 化は v0.16 の候補。
 - **v0.16**（完了）: cosign 回覧（決定前）の Nostr 化（§21）。kind 30104（parameterized replaceable、nakama 独自割当）、`d` タグ = `decision_core_hash(d)`（30103 と同一コアで草案→完成を対応付け）、`h` タグ = board_id。方式 B: 各承認者が cosign した版を自分の (publisher, 30104, d) スロットに再公開し、fetch 側で `merge_decision_approvals` が統合（approvals の出所保持・last-writer-wins 競合なし）。`board_decision_nostr_event` を kind パラメータ化（`decision_nostr_event(d, secret, kind)`、既定値で互換維持。旧名は薄いラッパー）、`verify_board_decision_nostr_event(ev, board_id, expect_kind)` に kind チェック追加。`board_draft_pub` / `board_draft_fetch [--policy]`（30104、threshold 表示は §20 と同一ロジック＋「草案（回覧中）」マーカー。草案の時点解決は現行政策のみ — policy-update 決定の草案化は対象外）。承認フローは既存コマンドの組み合わせ（fetch --out → board_cosign → board_draft_pub、新規 cosign コマンドなし）。成立の公開宣言は kind 30103 の publish。オフライン 8 ケース通過（`test_draft_nostr.py` 新規）＋ governance 30 / revocation 8 / compromise 24 / integration 10 / accept 7 / verify_binding 6 / rotation 8 / remove 10 / board_decision_nostr 10 / board_decision_fetch_policy 8 回帰維持。スコープ外: fetch 統合、自動通知、草案の期限、kind の正式割当、policy-update 決定の草案化。
+- **v0.17**（設計中）: 30103+30104 横断 fetch の統合（§22）。§21.8 のスコープ外項目を昇格: 新規コマンド `board_fetch_all <relay> <board_id> [--limit] [--auth] [--policy] [--out]` が 1 回の REQ で kinds=[30103, 30104] を #h=[board_id] 購読し、kind 横断で approvals をマージ（npub dedup、§19 と同一意味論）、30103 含むコアは「成立済み」・30104 のみは「草案（回覧中）」と状態表示。--policy の threshold 表示は成立済みと草案で時点解決の意味論を分離（§20 / §21.5）。--out は内部マーカーを剥がしたプレーン決定 JSON で board_cosign / board_read --governance 互換。既存の 2 fetch コマンドは維持（単目的ツールとして置き換えない）。新規純粋関数なし。テスト計画 8 ケース（オフライン）。スコープ外: 2 fetch の廃止、自動通知、草案の期限、kind 正式割当、政策スナップショットの保存。
 
 ---
 
@@ -1273,7 +1274,7 @@ approvals 追記版の公開方式は二択だった:
 
 ### 21.8 スコープ外
 
-- `board_decide_fetch` と `board_draft_fetch` の統合（board_id 単位の 30103+30104 横断購読）— 将来候補。
+- ~~`board_decide_fetch` と `board_draft_fetch` の統合（board_id 単位の 30103+30104 横断購読）— 将来候補。~~→ v0.17 の設計対象（§22）。
 - 草案への自動通知（DM での通知連携）— 将来候補。
 - 草案の期限（expiry）— 将来候補。
 - kind 30104 の正式割当申請。
@@ -1288,6 +1289,74 @@ approvals 追記版の公開方式は二択だった:
 - argparse 登録・dispatch 追加、docstring の usage 行も更新。
 - `test_draft_nostr.py` 新規 8 ケース通過（イベント構築/検証の kind 引数化/別 publisher の approvals マージ/--policy の草案表示/方式 B の往復: cosign 追記→再公開→fetch マージ/無効草案の publish 拒否/d タグ改ざん拒否/草案→threshold 達成→30103 公開→core_hash 一致）。
 - 回帰: governance 30 / revocation 8 / compromise 24 / integration 10 / accept 7 / verify_binding 6 / rotation 8 / remove 10 / board_decision_nostr 10 / board_decision_fetch_policy 8 の全スイート維持。
+
+---
+
+## 22. v0.17 設計: 30103+30104 横断 fetch の統合（設計のみ、実装は次ラン）
+
+`board_decide_fetch`（30103）と `board_draft_fetch`（30104）は別コマンドのため、board の決定状態の全体把握には 2 回の REQ ラウンドトリップが必要で、草案と完成決定の対応付けも運用者の頭の中で行うしかない。§21.8 のスコープ外項目を昇格し、board_id 単位の横断購読を 1 コマンドに統合する（§22.1〜22.6）。
+
+### 22.1 問題
+
+- 運用者は「この board の決定は今どうなっているか」を知るのに 2 コマンド（2 回の購読）を回す必要がある。--policy の threshold 表示も 2 回分かれて出る。
+- 草案→完成の対応付け（d タグ = 同一コアハッシュ）は表示されない。「この草案はもう成立済みなのか」が分からない。
+- 草案の approvals と完成決定の approvals が別表示になるが、§21 の方式 B では草案の approvals が承認履歴そのものであり、完成版の approvals との統合表示が自然。
+
+### 22.2 設計: `board_fetch_all`
+
+新規コマンド（既存の 2 fetch コマンドは残す — 単目的ツールとしての独立運用は維持）:
+
+```
+nakama.py board_fetch_all <relay> <board_id> [--limit N] [--auth] [--policy <policy.json>] [--out <dir>]
+```
+
+1. Nostr 照会: 1 回の REQ で `kinds=[30103, 30104]`・`#h=[board_id]` を購読（ラウンドトリップ削減）。
+2. 検証: イベントごとに `verify_board_decision_nostr_event(ev, board_id, expect_kind=ev['kind'])`。`ev['kind'] ∈ {30103, 30104}` 以外はスキップ（三段階検証は §19 と同一、threshold 検証なし）。純粋関数は新規に書かない方針（§21 と同じ）: 分類は呼び出し側の kind ホワイトリストで済ませる。
+3. kind 追跡と kind 横断マージ: 検証済みの各決定 dict のコピーに `'nostr_kind'`（30103 / 30104）を付与（入力の破壊なし）し、そのまま `merge_decision_approvals` に渡す（余分なキーは無視される）。同一コアの草案版と完成版は 1 レコードに統合され、approvals は npub dedup で和集合。`finalized = (nostr_kind の集合に 30103 が含まれる)` をレコードに付記。表示専用の内部マーカーであり、`--out` 保存時には剥がしてプレーンな決定 JSON にする（§22.5）。
+4. 表示: マージ順（created_at 昇順）を維持し、レコードごとに状態タグ:
+   - `[成立済み <core_hash>] <decision>`（30103 あり）
+   - `[草案（回覧中） <core_hash>] <decision>`（30104 のみ。同一コアに 30103 があれば「成立済み」に統合されるため、この状態は「まだ成立していない草案」のみ）
+   2 コマンドの表示書式（`[コアハッシュ] 決定 (created_at, approvals)`）と互換を保つ。
+
+### 22.3 --policy との連携
+
+- `--policy` 指定時は各レコードに `fetch_threshold_status` で threshold 充足/不足を表示（§20 と同一ロジック、exit コード不変・表示のみ）。
+- 時点解決の意味論:
+  - 成立済み（30103 あり）: fetch 集合内の 30103 決定で `resolve_policy_at`（§20.2 と同一）。
+  - 草案（30104 のみ）: 現行政策のみ（`resolve_policy_at` に空集合。§21.5 の不変条件を維持）。
+- 書式: 成立済みは `threshold <n>/<m> 充足/不足`、草案は `草案: threshold <n>/<m> 不足/充足`＋「草案は成立の証拠ではありません」の注記（§21.5 の文言を流用）。草案の「充足」は「成立可能」の意味。
+- 草案と成立済み決定のペアが同一 fetch 内にある場合、草案レコードは成立済みレコードに吸収される（§22.2 のマージ）ため、両者が二重表示されることはない。
+
+### 22.4 既存コマンドとの関係
+
+- `board_decide_fetch` / `board_draft_fetch` は残す。単一 kind の照会が必要な運用（例: 草案回覧中は 30104 だけ見る）には引き続き使える。`board_fetch_all` は統合ビューであり、どちらかを置き換えない。
+- `board_fetch_all` の `--out` 保存ファイルは `<core_hash>.json`（§19.6 の命名規則を維持）。
+
+### 22.5 --out の正直な扱い
+
+- kind 横断でマージされたレコードは approvals の和集合を含む。これは §19 の within-kind マージと同一の意味論（governance 側が threshold を検証する）なので、保存ファイルに問題はない。
+- 内部マーカー（`nostr_kind` / `finalized`）は保存時に剥がす。保存 JSON はプレーンな決定 dict であり、`board_read --governance --decisions` と `board_cosign` の両方にそのまま渡せる。
+- 正直に書く: `--out` のファイルは fetch 時点のスナップショット。草案の approvals は増える可能性があり、30103 の存在が「今後覆らない」ことを保証しない（新しい policy-update 決定が政策を変えうる — §11 の時点解決の意味）。
+
+### 22.6 テスト計画（オフライン、nostr_request をモック）
+
+1. 混在 fetch: 30103 と 30104 の両イベントが受理され、kind 9 など他 kind がスキップされる。
+2. kind 横断マージ: 同一コアの 30103 と 30104 の approvals が npub dedup で統合される。
+3. finalized 判定: 30103 を含むコア → `成立済み`、30104 のみ → `草案（回覧中）`。
+4. --policy 表示: 成立済みは `threshold n/m 充足/不足`、草案は `草案: threshold n/m ...` マーカー。
+5. 草案→成立の対応付け: 草案と同一コアの 30103 が同 fetch にあると 1 レコードに統合（二重表示なし）。
+6. expect_kind 不一致: 30104 イベントを 30103 として検証しようとすると拒否される（既存の kind チェックが効く）。
+7. --out: 保存 JSON に内部マーカーが含まれず、`board_cosign` 互換のプレーン決定であること。
+8. 無効イベントのスキップ: 署名無効 / d タグ改ざんはスキップされ、有効レコードに影響しない。
+- 回帰: 既存の board_decision_nostr 10 / board_decision_fetch_policy 8 / draft 8 の全ケースは不変（`board_fetch_all` は既存関数に手を加えない）。
+
+### 22.7 スコープ外
+
+- 既存 2 fetch コマンドの廃止（単目的ツールとして維持）。
+- 草案への自動通知（DM 連携）— 将来候補（§21.8 から据え置き）。
+- 草案の期限（expiry）— 将来候補。
+- kind 30103 / 30104 の正式割当申請。
+- fetch 時点の政策スナップショットの保存（--policy の検証者入手前提は維持）。
 
 ---
 
@@ -1332,3 +1401,4 @@ approvals 追記版の公開方式は二択だった:
 - 2026-10-01: v0.15 設計 — fetch 側の threshold 表示を仕様書 §20 に固定（設計のみ、実装は次ラン）。§19.8 の「fetch 側の threshold 検証」を再検討: 管轄は `board_read --governance` のまま維持し、任意の表示機能として `board_decide_fetch --policy <policy.json>` に取り込む。判定ロジックは新規に書かず `resolve_policy_at` + `_verify_decision_core` を流用し、fetch 集合内の policy-update 決定で決定時点の政策を解決（governance と同一の時点解決）。純粋関数 `fetch_threshold_status(d, policy, decisions)` を分離（オフラインでテスト可能）。無効な policy cert / board_id 不一致は拒否で exit 1、exit コードは不変。正直に書く: 「充足」は決定時点の政策での approvals ≥ threshold のみを意味しガバナンス有効性を含まない、policy は検証者が自分で入手したものを使う前提、policy-update 決定の欠落で古い政策表示になる暫定性。決定の撤回・無効化は設けない方針を固定（不変性維持、board 終了は close 決定）。テスト計画 8 ケース（オフライン・nostr_request モック）、回帰維持。cosign 回覧の Nostr 化は v0.16 の候補。ロードマップ §7 に v0.15（設計中）を追加、ヘッダの日付行も更新。
 - 2026-10-01: v0.15 実装 — §20 の設計をコード化。`fetch_threshold_status`（純粋関数、`(ok, n, m)` = 充足・有効署名数・決定時点の eligible 数）を `cmd_board_decide_fetch` の直前に追加し、`board_decide_fetch --policy <policy.json>` 任意フラグを実装。policy は `verify_board_policy_cert` で事前検証（無効・board_id 不一致は拒否で exit 1）、表示は各決定行に `threshold <n>/<m> 充足/不足`＋冒頭に暫定性の注記、`--policy` なしの従来動作・`--out` 保存内容・exit コードは不変。`getattr(args, 'policy', None)` で既存の SimpleNamespace 呼び出し互換を維持。`test_board_decision_fetch_policy.py` 新規 8 ケース通過、既存 9 スイート（governance 30 / revocation 8 / compromise 24 / integration 10 / accept 7 / verify_binding 6 / rotation 8 / remove 10 / board_decision_nostr 10）の回帰維持。ロードマップ §7 とヘッダの日付行を「v0.15 完了」に更新。
 - 2026-10-01: v0.16 実装 — cosign 回覧（決定前）の Nostr 化（§21）。`DRAFT_NOSTR_KIND = 30104`、`decision_nostr_event` の kind パラメータ化（旧名は薄いラッパー）、`verify_board_decision_nostr_event` の kind 引数化、`board_draft_pub` / `board_draft_fetch [--policy]`（30104）。方式 B: 各承認者が cosign 追記した版を自分の (publisher, 30104, d) スロットに再公開、fetch 側で `merge_decision_approvals` が統合（新規純粋関数なし）。草案の --policy 表示は「草案（回覧中）」マーカーつき、時点解決は現行政策のみ（policy-update 決定の草案化は対象外、`resolve_policy_at` の不変条件維持）。`test_draft_nostr.py` 新規 8 ケース通過、全回帰維持。ロードマップ §7 に v0.16（完了）、ヘッダの日付行も更新。
+- 2026-10-01: v0.17 設計 — 30103+30104 横断 fetch の統合を仕様書 §22 に固定（設計のみ、実装は次ラン）。§21.8 のスコープ外項目を昇格: 新規コマンド `board_fetch_all <relay> <board_id> [--limit] [--auth] [--policy <policy.json>] [--out <dir>]` が 1 回の REQ で kinds=[30103, 30104]・#h=[board_id] を購読。検証は `verify_board_decision_nostr_event(ev, board_id, expect_kind=ev['kind'])`（kind ホワイトリスト {30103, 30104}）。検証済み決定のコピーに nostr_kind を付与して `merge_decision_approvals` に渡し（純粋関数新規なし）、30103 を含むコアは「成立済み」・30104 のみは「草案（回覧中）」と状態表示。--policy の threshold 表示は成立済み（§20 と同一の時点解決）と草案（現行政策のみ、§21.5）で意味論を分離。--out は内部マーカーを剥がしたプレーン決定 JSON（board_cosign / board_read --governance --decisions 互換）。既存の 2 fetch コマンドは維持（単目的ツールとして置き換えない）。テスト計画 8 ケース（オフライン・nostr_request モック）、既存回帰は不変。ロードマップ §7 に v0.17（設計中）を追加、ヘッダの日付行も更新。
