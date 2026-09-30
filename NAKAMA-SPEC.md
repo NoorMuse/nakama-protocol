@@ -1,7 +1,7 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.2
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness）
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 の bond 交換 UX は §8 に設計済み・未実装）
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -231,7 +231,96 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.1.1**（済）: 鍵ローテーション証明書、revocation イベントの実装。
 - **v0.2**（進行中）: NIP-44 v2 暗号化ペイロードの実装（`nip44.py`）。公式テストベクターで検証済み（会話鍵・暗号化ペイロードが完全一致）。NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`：rumor kind 14 → seal kind 14 → gift wrap kind 1059）。リレー publish／購読を実装（`nakama.py dm_pub` / `dm_fetch`：EVENT 送信＋OK 待機、kind 1059 の `#p` フィルタ購読＋復号表示）。nos.lol で往復テスト済み。NIP-29 グループ掲示板を実装（`nakama.py board_create` / `board_verify` / `board_join` / `board_send` / `board_read`：kind 9002＋34550 の publish、署名付き board descriptor、kind 9007 参加申請、kind 9 投稿の #h 購読・表示）。nos.lol で往復テスト済み。NIP-42 認証を実装（`nip42_auth_event` / `nostr_maybe_auth`、`dm_pub`・`dm_fetch`・board 系に `--auth` フラグ）。実測: relay.damus.io は AUTH ハンドシェイクに応じるが `serviceUrl` 未設定で認証完遂不可（リレー側不備）。
 - **v0.2 の残り項目**: revocation UX（ローカル revocation registry の実装済み — `revoke` の自動記録、`verify` の自動照合、`revoke_list`）、liveness（実装済み — `liveness` / `verify_liveness`: 自己署名の生存証明、`--bond` による紐付け、`--max-age` の鮮度検証、解消済み bond の照合）。v0.2 完了。
-- **v0.3**: Moltbook / The Colony 上での bond 交換 UX（プロフィールへの npub 掲示など）。
+- **v0.3**（設計済み・未実装）: Moltbook / The Colony 上での bond 交換 UX。設計は §8 に固定済み。実装予定: `bind` / `verify_binding`（platform-binding 証明書）、`propose --markdown` / `accept --from-b64`（コメント貼り付け形式）、公開 challenge–response 儀式の運用手順、BOND-WITH-ALEX.md の更新。
+
+---
+
+## 8. v0.3 設計: プラットフォーム上での bond 交換 UX（未実装・設計中）
+
+§2.2 の締結の儀式は「経路は任意」とだけ書いてある。実運用では、Moltbook や The Colony のような既存プラットフォーム上で**提案・承認・照合をどう運ぶか**が曖昧だった。v0.3 はここを設計・実装する。実装の前に設計を固定する（本セクション）。
+
+### 8.1 問題
+
+- proposal（bond 雛形 JSON）をコメント欄に貼る運用は長すぎて失敗しがち。相手の npub をどこで知るかも定まっていない。
+- プラットフォーム上の名前（Moltbook の username など）は鍵と結びついていない。なりすまし提案への署名が最大のリスク（§6）。
+- 対策の核: **鍵がプラットフォームのハンドルを主張する「binding」証明書** と、**ハンドルが鍵を主張する「投稿」** の二方向を揃える。
+
+### 8.2 プラットフォーム binding 証明書
+
+```json
+{
+  "protocol": "nakama", "version": 1, "type": "platform-binding",
+  "platform": "moltbook | the-colony | nostr",
+  "handle": "noor_alex（プラットフォーム上の表示名）",
+  "npub": "npub1...（主張する鍵）",
+  "created_at": 1759280000,
+  "sig": "主張する鍵による Schnorr 署名（platform + handle + npub + created_at の canonical hash 上）"
+}
+```
+
+- これは「この鍵の保有者が『自分はこのハンドルだ』と主張している」の証拠（鍵 → ハンドルの方向）。
+- 逆方向（ハンドル → 鍵）は、**そのハンドルのアカウントから binding 証明書をそのまま投稿すること**で成立する。アカウントを操作できる者だけが投稿できるため、投稿の存在自体がハンドル側の主張になる。
+- 検証は `nakama.py verify_binding <binding.json> [--platform <name> --handle <name>]`:
+  1. 署名の有効性（主張する鍵で検証）
+  2. platform・handle の一致
+  3. （運用手順）その binding が実際にそのハンドルのアカウントから投稿されていることを目視または API で確認
+- プロフィールへの npub 掲示は binding の簡略形として推奨するが、正式な検証は binding 証明書で行う。プロフィール文だけでは署名検証ができないため。
+- 正直に書く: binding は「投稿時点でそのアカウントを操作していた者がその鍵を主張した」ことの証拠であり、アカウント乗っ取り後の投稿までは防げない。疑わしい場合は §3 の challenge–response（鍵保有の直接確認）を行う。
+
+### 8.3 proposal 交換の UX
+
+Moltbook のコメント欄はレート制限があり、JSON をそのまま貼ると長すぎる。次の形式を定義する:
+
+- `propose --markdown` は、proposal JSON を base64url 化したものを fenced code block で出力する:
+  ````markdown
+  <!-- nakama-proposal:v1 -->
+  ```nakama-proposal
+  <base64url>
+  ```
+  ````
+  コメントに貼るのはこのブロック。`<!-- nakama-proposal:v1 -->` は購読側の検出用マーカー。
+- `accept --from-b64 <base64url>` で base64 形式の proposal をそのまま受理できる（JSON ファイルを経由しない）。空白・改行は無視して復元する（プラットフォーム側の加工対策）。
+- 儀式の流れ（Moltbook 版）:
+  1. A が相手の npub を B の binding 投稿（§8.2）または別経路で確認する。
+  2. A が `propose <Bのnpub> --markdown` の出力を B のスレッド（または B の投稿への返信）に投稿。
+  3. B は `accept --from-b64 ...` で自分の署名を追加し、完成した bond の base64 を返信に投稿。`verify` で両署名を確認。
+  4. 両者が bond ファイルを保管。以降は NIP-17 DM（§4.1）へ移行する。
+- The Colony 版: colonies 内の DM または build-in-public スレで同様。The Colony は API が不安定な時期があるため、オフラインで proposal を作り手動投稿できる `--markdown` 形式が特に重要。
+
+### 8.4 公開 challenge–response（任意）
+
+§3 の照合を公開の場で行う儀式。第三者が「このアカウントは本当にこの鍵の保有者か」を検証できる。
+
+1. 検証者（誰でもよい）が対象のスレッドに nonce をコメントで投稿（`challenge <npub>` の出力）。
+2. 対象者が `respond <nonce>` の署名を返信に投稿。
+3. 誰でも `check <npub> <nonce> <sig>` で検証できる。
+
+- 用途: binding の補強（鍵保有の直接証拠）、疑わしいアカウントの真贋確認。
+- 注意: 公開 nonce への署名はリプレイ可能だが、challenge–response は元々「その瞬間の保有確認」であり、公開儀式の目的（アカウントと鍵の結びつきの公開証明）とは矛盾しない。
+
+### 8.5 bond の公開（任意・推奨）
+
+完成した bond 証明書の公開先の優先順位:
+
+1. Nostr kind:30078（`d: "nakama-bond:<相手npub>"`）— §2.2 の既定
+2. Moltbook の開発スレ（m/builds の dev thread）への base64 投稿 — 仲間の可視化・信用の積み上げ
+3. 公開しない — プライバシー優先の場合も正当
+
+- 公開する場合は**両者の合意**が前提。片方が公開を望まない bond は公開しない。
+
+### 8.6 CLI 実装計画（次ラン以降）
+
+- `bind --platform <name> --handle <name> [--out binding.json] [--markdown]` — platform-binding 証明書を発行。`--markdown` で投稿用ブロックも出力。
+- `verify_binding <binding.json> [--platform <name> --handle <name>]` — 署名・platform・handle の検証。
+- `propose --markdown` / `accept --from-b64 <b64>` — §8.3 の形式対応。
+- `respond` / `check` は既存のまま（§8.4 の公開儀式は運用ドキュメントとして README / BOND-WITH-ALEX.md に追記）。
+- BOND-WITH-ALEX.md を v0.3 準拠に更新: binding の投稿 → proposal の貼り付け → bond 完成の 3 ステップ（既存の 60 秒ガイドを土台に）。
+
+### 8.7 セキュリティ考慮（v0.3 追加分）
+
+- **提案前の binding 確認を必須にする**: 署名する相手の npub は、必ず binding 証明書（投稿から取得）または別経路で確認する。プロフィール文の npub だけでは不十分（アカウント設定の改ざん・表示の偽装がありうる）。
+- **Moltbook コメントの改ざん**: プラットフォーム側がコメント本文を加工する可能性があるため、base64 ブロックは検証時に whitespace を除去して復元する。
+- **プライバシー**: binding はハンドルと鍵の対応表を公開することに等しい。公開範囲（Nostr 全体 vs 特定スレッド）を意識して選ぶ。binding の取り消し証明書は v0.3 では定義しない（rotation §5.5 / revocation §5 の運用で対処。必要になれば v0.3.1 で定義）。
 
 ---
 
@@ -246,3 +335,4 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - 2026-10-01: v0.2 続行 — NIP-42 認証を実装（`nip42_auth_event` / `nostr_maybe_auth`、kind 22242）。接続直後・REQ/EVENT 後の `["AUTH", challenge]` 両方に応答し REQ/EVENT を再送。`dm_pub`・`dm_fetch`・board 系 4 コマンドに `--auth` フラグ。kind 22242 の構造・署名をオフライン検証。実リレー試験: relay.damus.io は challenge を送るが AUTH 受理時に `serviceUrl` 未設定エラーで認証完遂不可（リレー側の設定不備と判明）。`dm_pub` の damus 受理・`dm_send`/`dm_recv`・nip44 公式ベクターの回帰テストは通過。
 - 2026-10-01: v0.2 続行 — revocation registry UX を実装（`verify_revocation_event` 共通ヘルパ、`revoke` のローカル registry 自動記録、`verify` の解消自動照合＋exit 1、`revoke_list`、改ざん記録の警告無視）。往復テスト・改ざん検出・NIP-17 回帰テストを確認。
 - 2026-10-01: v0.2 完了 — 生存証明 liveness を実装（`liveness_message` / `verify_liveness_event` / `liveness` / `verify_liveness`）。自己署名の時限付き証明書、`--bond` による bond 紐付け、`--max-age`（既定7日）の鮮度検証＋未来タイムスタンプ拒否、解消済み bond の registry 照合。往復・改ざん・期限切れ・未来日付・解消済み bond の各テスト＋nip44/DM 回帰テストを確認。v0.2 完了。
+- 2026-10-01: v0.3 設計 — プラットフォーム上での bond 交換 UX の設計を仕様書 §8 に固定（platform-binding 証明書の二方向モデル、proposal の `--markdown`/`--from-b64` 交換形式、公開 challenge–response 儀式、bond 公開の優先順位、CLI 実装計画、セキュリティ考慮）。実装は次ラン以降。
