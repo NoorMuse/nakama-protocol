@@ -1733,6 +1733,13 @@ def cmd_verify_binding(args):
     print('binding は有効です' if ok else 'binding は無効です')
     if ok:
         print('（運用手順）: この binding が実際に該当ハンドルのアカウントから投稿されていることを確認してください')
+    # §16: verify_binding 時の侵害警告 — 署名・platform・handle 検証の後、対象 npub への
+    # 非撤回宣言があれば stderr に WARN（advisory、exit コード不変）。署名無効でも出す（情報は直交）。
+    creg = getattr(args, 'compromise_registry', None) or COMPROMISES_DEFAULT
+    subj = b.get('npub')
+    if subj:
+        for w in key_compromise_warnings(subj, creg):
+            print(w, file=sys.stderr)
     sys.exit(0 if ok else 1)
 
 
@@ -2476,6 +2483,7 @@ def main():
     s.add_argument('--markdown', action='store_true', help='投稿用の fenced code block を出力')
     s = sub.add_parser('verify_binding'); s.add_argument('binding')
     s.add_argument('--platform'); s.add_argument('--handle')
+    s.add_argument('--compromise-registry', default=None, help='compromise registry ディレクトリ (既定: ~/.config/nakama/compromises)')
     s = sub.add_parser('unbind'); s.add_argument('--platform', required=True)
     s.add_argument('--handle', required=True); s.add_argument('--out')
     s.add_argument('--reason', default=''); s.add_argument('--binding-created-at', type=int, default=0,
