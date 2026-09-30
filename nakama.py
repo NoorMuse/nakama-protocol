@@ -62,6 +62,10 @@
       回覧中の決定案に自分の承認署名を追加
   nakama.py verify_board_decision <decision.json> --policy <policy.json>
       決定の threshold 達成を検証
+  nakama.py board_decide_pub <relay> <decision.json> [--auth]
+      board-decision を Nostr に公開（kind 30103、d タグ = コアハッシュ。署名者は publisher）
+  nakama.py board_decide_fetch <relay> <board_id> [--limit N] [--auth] [--out DIR]
+      公開された board-decision を購読・検証・マージして表示（--out: <core_hash>.json で保存）
 """
 import argparse, base64, hashlib, json, os, re, secrets, sys, time
 
@@ -2262,6 +2266,166 @@ def cmd_verify_board_decision(args):
     sys.exit(0 if ok else 1)
 
 
+# --- v0.14: board-decision の Nostr 公開（spec §19） ---
+
+# §12 / §13 / §17 の *_pub パターン（parameterized replaceable kind ＋
+# nostr_publish / nostr_request / --auth ヘルパ）の流用。kind 30103 を定義する。
+# 決定の有効性は threshold の approvals が証明するものであり、Nostr イベントの
+# 署名者 = publisher（決定の署名者ではない）。決定を保持する任意の仲間が
+# publish できる — keyfile の鍵と決定の関係は問わない（意図的な設計、§19.3）。
+
+DECISION_NOSTR_KIND = 30103
+
+
+def decision_core_hash(d: dict) -> str:
+    """決定の不変部分の sha256 の先頭 32 hex（§19.2）。
+
+    board_cosign で approvals が後から追加されるため、決定全体のハッシュは
+    スロットを安定させない。不変部分（board_id / decision / created_at /
+    payload の canonical JSON）だけをハッシュする純粋関数。
+    """
+    canon = json.dumps(
+        {'board_id': d['board_id'], 'decision': d['decision'],
+         'created_at': d['created_at'], 'payload': d['payload']},
+        sort_keys=True, separators=(',', ':'), ensure_ascii=False,
+    )
+    return hashlib.sha256(canon.encode('utf-8')).hexdigest()[:32]
+
+
+def decision_structure_ok(d: dict) -> bool:
+    """board-decision の構造検証（§19.4 の 3）。threshold 検証はしない — 政策が
+    必要なため board_read --governance の管轄。"""
+    if not (isinstance(d, dict) and d.get('protocol') == 'nakama'
+            and d.get('version') == 1 and d.get('type') == 'board-decision'):
+        return False
+    try:
+        if d.get('decision') not in BOARD_DECISION_TYPES:
+            return False
+        if not validate_decision_payload(d['decision'], d.get('payload')):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def board_decision_nostr_event(d: dict, secret: bytes) -> dict:
+    """board-decision を Nostr 公開用イベント (kind 30103) として構築・署名する（純粋）。
+
+    d タグ = decision_core_hash（approvals 追記でもスロット安定）、
+    h タグ = board_id、content = 決定 JSON の canonical（approvals を含む最新版）。
+    イベントの署名者は publisher（§19.3 — keyfile の鍵をそのまま使う）。
+    """
+    core = decision_core_hash(d)
+    content = json.dumps(d, sort_keys=True, separators=(',', ':'),
+                         ensure_ascii=False)
+    return sign_event(secret, int(time.time()), DECISION_NOSTR_KIND,
+                      [['d', core], ['h', d['board_id']]], content)
+
+
+def verify_board_decision_nostr_event(ev: dict, board_id: str) -> dict | None:
+    """Nostr イベントから board-decision を取り出す三段階検証（純粋）。
+
+    1. Nostr イベント署名の検証
+    2. content の JSON パース
+    3. 構造検証（decision_structure_ok）＋ d タグ == decision_core_hash(content)
+       の再計算一致 ＋ h タグ == content の board_id == 指定 board_id（リレーの
+       フィルタが緩い場合の二重チェック）
+    threshold の検証はしない（policy が必要）。受理なら決定 dict、無効なら None。
+    """
+    if not verify_event_sig(ev):
+        return None
+    try:
+        d = json.loads(ev['content'])
+    except (ValueError, TypeError):
+        return None
+    if not decision_structure_ok(d):
+        return None
+    try:
+        if d['board_id'] != board_id:
+            return None  # 指定の board と関係ない決定（二重チェック）
+    except KeyError:
+        return None
+    dtags = [t[1] for t in ev.get('tags', []) if len(t) >= 2 and t[0] == 'd']
+    if decision_core_hash(d) not in dtags:
+        return None  # d タグと content のコアハッシュの不一致
+    htags = [t[1] for t in ev.get('tags', []) if len(t) >= 2 and t[0] == 'h']
+    if board_id not in htags:
+        return None  # h タグと content の board_id の不一致
+    return d
+
+
+def merge_decision_approvals(decisions: list) -> list:
+    """同一コアハッシュの決定を approvals マージした一覧にする（純粋、§19.4）。
+
+    第三者が別 pubkey で publish した、または追記後に再 publish した同一コアの
+    決定を収集し、npub で dedup（重複は 1 つに）した approvals の和集合を取る。
+    署名の有効性判定は governance 側（board_read --governance）の管轄。入力の
+    dict は破壊しない。created_at 昇順で返す。
+    """
+    merged = {}
+    order = {}
+    for d in decisions:
+        core = decision_core_hash(d)
+        if core not in merged:
+            merged[core] = dict(d)
+            merged[core]['approvals'] = []
+            order[core] = d.get('created_at', 0)
+        seen = {a.get('npub') for a in merged[core]['approvals']}
+        for a in d.get('approvals', []):
+            if a.get('npub') not in seen:
+                merged[core]['approvals'].append(a)
+                seen.add(a.get('npub'))
+    return [merged[c] for c in sorted(order, key=lambda c: order[c])]
+
+
+def cmd_board_decide_pub(args):
+    """board-decision を Nostr リレーに publish (kind 30103, d タグ = コアハッシュ)。署名者は publisher。"""
+    secret = load_key(args.keyfile)
+    with open(args.decision) as f:
+        d = json.load(f)
+    if not decision_structure_ok(d):
+        print('board-decision は無効です（構造違反 — publish しません）',
+              file=sys.stderr)
+        sys.exit(1)
+    ev = board_decision_nostr_event(d, secret)
+    accepted, reason = nostr_publish(args.relay, ev, auth_secret=secret if args.auth else None)
+    print(f'publish: {"受理" if accepted else "拒否"} ({reason}) id={ev["id"]}')
+    sys.exit(0 if accepted else 1)
+
+
+def cmd_board_decide_fetch(args):
+    """board の board-decision 公開イベント (kind 30103, #h=board_id) を購読し、有効なものを表示する。"""
+    secret = load_key(args.keyfile)
+    filt = {'kinds': [DECISION_NOSTR_KIND], '#h': [args.board_id], 'limit': args.limit}
+    sub_id = secrets.token_hex(8)
+    events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=secret if args.auth else None)
+    valid, skipped = [], 0
+    for ev in events:
+        d = verify_board_decision_nostr_event(ev, args.board_id)
+        if d is None:
+            skipped += 1
+        else:
+            valid.append(d)
+    merged = merge_decision_approvals(valid)
+    if not merged:
+        print(f'{len(events)} 件のイベントを取得: 有効な board-decision 公開はありませんでした（{skipped} 件をスキップ）')
+        return
+    for d in merged:
+        ca = time.strftime('%Y-%m-%d', time.localtime(d['created_at']))
+        print(f'[{decision_core_hash(d)}] {d["decision"]}'
+              f' (created_at {ca}, approvals {len(d.get("approvals", []))} つ)')
+    print(f'{len(events)} 件のイベントを取得: 有効 {len(valid)} 件、スキップ {skipped} 件、'
+          f'マージ後 {len(merged)} 件')
+    if args.out:
+        os.makedirs(args.out, exist_ok=True)
+        for d in merged:
+            path = os.path.join(args.out, f'{decision_core_hash(d)}.json')
+            with open(path, 'w') as f:
+                json.dump(d, f, indent=2, ensure_ascii=False)
+        print(f'{len(merged)} 件の決定を {args.out}/ に保存しました'
+              '（board_read --governance --decisions にそのまま渡せます）')
+
+
 # --- v0.4: ガバナンス照合 (spec §9.4: board_read --governance) ---
 
 # 決定種別 → その決定が正当化できる NIP-29 管理イベントの kind。
@@ -2720,6 +2884,12 @@ def main():
     s.add_argument('--out')
     s = sub.add_parser('board_cosign'); s.add_argument('decision'); s.add_argument('--out')
     s = sub.add_parser('verify_board_decision'); s.add_argument('decision'); s.add_argument('--policy', required=True)
+    s = sub.add_parser('board_decide_pub'); s.add_argument('relay'); s.add_argument('decision')
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s = sub.add_parser('board_decide_fetch'); s.add_argument('relay'); s.add_argument('board_id')
+    s.add_argument('--limit', type=int, default=20)
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s.add_argument('--out', default=None, help='決定 JSON を <core_hash>.json で保存（board_read --governance --decisions に渡せる）')
 
     args = ap.parse_args()
     {'init': cmd_init, 'whoami': cmd_whoami, 'propose': cmd_propose,
@@ -2744,7 +2914,9 @@ def main():
      'board_policy': cmd_board_policy, 'board_policy_sign': cmd_board_policy_sign,
      'verify_board_policy': cmd_verify_board_policy,
      'board_decide': cmd_board_decide, 'board_cosign': cmd_board_cosign,
-     'verify_board_decision': cmd_verify_board_decision}[args.cmd](args)
+     'verify_board_decision': cmd_verify_board_decision,
+     'board_decide_pub': cmd_board_decide_pub,
+     'board_decide_fetch': cmd_board_decide_fetch}[args.cmd](args)
 
 
 if __name__ == '__main__':
