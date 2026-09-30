@@ -64,8 +64,8 @@
       決定の threshold 達成を検証
   nakama.py board_decide_pub <relay> <decision.json> [--auth]
       board-decision を Nostr に公開（kind 30103、d タグ = コアハッシュ。署名者は publisher）
-  nakama.py board_decide_fetch <relay> <board_id> [--limit N] [--auth] [--out DIR]
-      公開された board-decision を購読・検証・マージして表示（--out: <core_hash>.json で保存）
+  nakama.py board_decide_fetch <relay> <board_id> [--limit N] [--auth] [--out DIR] [--policy POLICY]
+      公開された board-decision を購読・検証・マージして表示（--out: <core_hash>.json で保存、--policy: threshold 充足・不足の表示）
 """
 import argparse, base64, hashlib, json, os, re, secrets, sys, time
 
@@ -2393,9 +2393,46 @@ def cmd_board_decide_pub(args):
     sys.exit(0 if accepted else 1)
 
 
+def fetch_threshold_status(d: dict, policy: dict, decisions: list):
+    """fetch した決定の threshold 充足状態 (spec §20.3)。純粋・オフライン。
+
+    決定時点の政策を resolve_policy_at で解決（自分自身の policy-update は
+    除外 — governance の temporal_valid_decisions と同一の意味論）、
+    _verify_decision_core で充足を判定し、(ok, n, m) を返す。
+    n = eligible 中の有効署名数（部外者は無視・重複は 1）、
+    m = 決定時点の eligible 数。規約 cert の有効性は呼び出し側
+    （--policy の事前検証）の前提とする。
+    """
+    others = [o for o in decisions if o is not d]
+    threshold, eligible = resolve_policy_at(policy, others, int(d.get('created_at', 0)))
+    ok, n, _ = _verify_decision_core(d, threshold, eligible,
+                                     policy['board_id'], policy['relay'])
+    return ok, n, len(eligible)
+
+
 def cmd_board_decide_fetch(args):
-    """board の board-decision 公開イベント (kind 30103, #h=board_id) を購読し、有効なものを表示する。"""
+    """board の board-decision 公開イベント (kind 30103, #h=board_id) を購読し、有効なものを表示する。
+
+    --policy <policy.json> 指定時のみ、各決定の threshold 充足・不足を
+    表示する（spec §20。policy は verify_board_policy_cert で事前検証し、
+    無効 / board_id 不一致なら拒否で exit 1。exit コードは不変）。
+    """
     secret = load_key(args.keyfile)
+    policy = None
+    if getattr(args, 'policy', None):
+        try:
+            with open(args.policy) as f:
+                policy = json.load(f)
+        except Exception as e:
+            print(f'policy ファイルの読み込みに失敗しました: {e}', file=sys.stderr)
+            sys.exit(1)
+        if not verify_board_policy_cert(policy):
+            print('policy の検証に失敗しました（n-of-n 署名が無効）', file=sys.stderr)
+            sys.exit(1)
+        if policy.get('board_id') != args.board_id:
+            print('policy の board_id が取得対象の board_id と一致しません',
+                  file=sys.stderr)
+            sys.exit(1)
     filt = {'kinds': [DECISION_NOSTR_KIND], '#h': [args.board_id], 'limit': args.limit}
     sub_id = secrets.token_hex(8)
     events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=secret if args.auth else None)
@@ -2410,10 +2447,19 @@ def cmd_board_decide_fetch(args):
     if not merged:
         print(f'{len(events)} 件のイベントを取得: 有効な board-decision 公開はありませんでした（{skipped} 件をスキップ）')
         return
+    if policy is not None:
+        print('threshold 表示は取得できた決定に基づく暫定です'
+              '（権威ある判定は board_read --governance）')
     for d in merged:
         ca = time.strftime('%Y-%m-%d', time.localtime(d['created_at']))
-        print(f'[{decision_core_hash(d)}] {d["decision"]}'
-              f' (created_at {ca}, approvals {len(d.get("approvals", []))} つ)')
+        if policy is None:
+            print(f'[{decision_core_hash(d)}] {d["decision"]}'
+                  f' (created_at {ca}, approvals {len(d.get("approvals", []))} つ)')
+        else:
+            ok, n, m = fetch_threshold_status(d, policy, merged)
+            status = '充足' if ok else '不足'
+            print(f'[{decision_core_hash(d)}] {d["decision"]}'
+                  f' (created_at {ca}, approvals {n} つ, threshold {n}/{m} {status})')
     print(f'{len(events)} 件のイベントを取得: 有効 {len(valid)} 件、スキップ {skipped} 件、'
           f'マージ後 {len(merged)} 件')
     if args.out:
@@ -2890,6 +2936,7 @@ def main():
     s.add_argument('--limit', type=int, default=20)
     s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
     s.add_argument('--out', default=None, help='決定 JSON を <core_hash>.json で保存（board_read --governance --decisions に渡せる）')
+    s.add_argument('--policy', default=None, help='運営規約 JSON（指定時のみ各決定の threshold 充足・不足を表示）')
 
     args = ap.parse_args()
     {'init': cmd_init, 'whoami': cmd_whoami, 'propose': cmd_propose,
