@@ -10,9 +10,9 @@
   nakama.py accept [proposal.json] [--from-b64 B64] [--out FILE] [--markdown]
       proposal に署名して bond 完成 (--from-b64: コメント貼り付け形式を直接受理)
   nakama.py verify <bond.json> [--rotation R.json]   bond の両署名を検証 (ローテーション証明書があれば紐付け表示)
-  nakama.py challenge                                照合用 nonce を生成
+  nakama.py challenge [--to <npub>]                   照合用 nonce を生成（--to で宛先の侵害宣言を警告 §14.2）
   nakama.py respond <nonce-hex>                      nonce に署名
-  nakama.py check <npub> <nonce-hex> <sig-hex>       署名を検証
+  nakama.py check <npub> <nonce-hex> <sig-hex>       署名を検証（対手の侵害宣言を警告 §14.2）
   nakama.py rotate --gen|--to-hex HEX [--to-keyfile P]  鍵ローテーション: 旧鍵が新鍵に署名した rotation 証明書を発行
   nakama.py verify_rotation <rotation.json>          rotation 証明書を検証
   nakama.py revoke <bond.json> [--reason 理由]        bond の解消 (revocation イベント) を署名して発行
@@ -27,17 +27,17 @@
   nakama.py compromise_pub <relay> <declaration.json> [--auth]  侵害宣言を Nostr に公開（kind 30101、d タグ = subject_hex:declarant_hex）
   nakama.py compromise_fetch <relay> <npub> [--limit N] [--auth]  公開された侵害宣言を購読して registry に取り込む
   nakama.py compromise_withdraw --subject <npub>  自分の侵害宣言を withdrawn: true で再発行（撤回）
-  nakama.py key_status <npub> [--threshold N] [--bond bond.json ...] [--liveness proof.json] [--max-age 秒]
-      侵害宣言の状態を照会（bond graph で重みづけ、閾値到達で「疑わしい」）
-  nakama.py dm_send <相手npub> <メッセージ> [--out FILE]  gift wrap (kind 1059) を構築
+  nakama.py key_status <npub> [--threshold N] [--bond bond.json ...] [--liveness proof.json] [--max-age 秒] [--rotation R.json ...]
+      侵害宣言の状態を照会（bond graph で重みづけ、閾値到達で「疑わしい」。--rotation で移行完了を表示 §14.3）
+  nakama.py dm_send <相手npub> <メッセージ> [--out FILE]  gift wrap (kind 1059) を構築（宛先の侵害宣言を警告 §14.2）
   nakama.py dm_recv <giftwrap.json>                    gift wrap を復号して rumor を表示
   nakama.py dm_pub <relay> [--in FILE|--to-npub NPUB --message MSG]  gift wrap をリレーに publish
   nakama.py dm_fetch <relay> [--since TS] [--limit N]  自分宛 gift wrap を購読・復号
   nakama.py board_create <relay> --name "広場名" [--about 説明] [--admission open|approval] [--out FILE]  NIP-29 広場を作る（kind 9002 + 34550 を publish、descriptor を出力）
-  nakama.py board_verify <descriptor.json>        board descriptor の署名を検証
+  nakama.py board_verify <descriptor.json>        board descriptor の署名を検証（運営鍵の侵害宣言を警告 §14.2）
   nakama.py board_join <relay> <board_id>         広場に参加申請（kind 9007 を publish）
-  nakama.py board_send <relay> <board_id> "MSG"   広場に投稿（kind 9 平文を publish）
-  nakama.py board_read <relay> <board_id> [--since TS] [--limit N]  広場の投稿を購読・表示
+  nakama.py board_send <relay> <board_id> "MSG" [--descriptor D.json]  広場に投稿（kind 9 平文を publish、侵害宣言を警告 §14.2）
+  nakama.py board_read <relay> <board_id> [--since TS] [--limit N]  広場の投稿を購読・表示（投稿者に侵害宣言があれば注記 §14.2）
   nakama.py board_read <relay> <board_id> --governance <policy.json> [--decisions <file|dir>...]
       管理イベント (kind 9000/9001) と board-decision の合意照合（spec §9.4）
   nakama.py bind --platform moltbook --handle alex [--out binding.json] [--markdown]
@@ -251,6 +251,16 @@ def cmd_verify(args):
                 sys.exit(1)
             else:
                 print('⚠ registry 内の revocation 記録は署名検証に失敗しました（無視して続行）', file=sys.stderr)
+    # §14.2: 侵害宣言の警告（advisory — exit コードは不変）。
+    # --rotation 指定時は移行後の有効 npub を検査対象とし、旧鍵への宣言は INFO に格下げする。
+    creg = args.compromise_registry or COMPROMISES_DEFAULT
+    for npub in b['companions']:
+        for w in key_compromise_warnings(rotations.get(npub, npub), creg):
+            print(w, file=sys.stderr)
+        if npub in rotations:
+            for w in key_compromise_warnings(npub, creg):
+                print('INFO: ' + w[len('WARN: '):] + ' — 旧鍵への宣言（ローテーション済みのため情報扱い）',
+                      file=sys.stderr)
     sys.exit(0 if ok else 1)
 
 
@@ -613,6 +623,101 @@ def verify_compromise_event(decl: dict) -> bool:
         return False
 
 
+# --- v0.9: 侵害宣言の統合（spec §14） ---
+# 信頼モデルは §13 のまま（記録はプロトコル、評価は検証者）。ここにあるのは
+# ローカル registry を参照するだけの advisory な警告であり、exit コードは変えない。
+
+def hex_to_npub(hexpub: str) -> str | None:
+    """64 hex pubkey → npub。変換不能なら None。"""
+    try:
+        h = (hexpub or '').strip().lower()
+        assert len(h) == 64 and all(c in '0123456789abcdef' for c in h)
+        return NostrPublicKey.from_hex(h).npub
+    except Exception:
+        return None
+
+
+def load_compromise_declarations(subject_hex: str, registry: str | None = None) -> list:
+    """subject に対する registry 内の侵害宣言（署名有効、撤回含む）のリスト（オフライン）。"""
+    registry = registry or COMPROMISES_DEFAULT
+    rp = compromise_registry_path(registry, subject_hex)
+    decls = []
+    if os.path.exists(rp):
+        try:
+            with open(rp) as f:
+                decls = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            decls = []
+        if not isinstance(decls, list):
+            decls = []
+    return [d for d in decls if isinstance(d, dict) and verify_compromise_event(d)]
+
+
+def active_compromise_declarations(subject_hex: str, registry: str | None = None) -> list:
+    """subject に対する有効（署名有効・非撤回）の侵害宣言のリスト（オフライン）。"""
+    return [d for d in load_compromise_declarations(subject_hex, registry) if not d.get('withdrawn')]
+
+
+def key_compromise_warnings(npub_or_hex: str, registry_dir: str | None = None) -> list:
+    """§14.2: npub に対する侵害宣言（非撤回）が 1 件以上あれば警告文字列のリストを返す。
+
+    参照するのはローカル registry（明示的に compromise_fetch / import 済みの分）のみ — リレーから自動 fetch はしない。
+    宣言なし・撤回済みのみ → 空リスト。呼び出し側は stderr に出すだけで、exit コードは変えないこと。
+    """
+    npub = npub_or_hex if (npub_or_hex or '').startswith('npub1') else hex_to_npub(npub_or_hex or '')
+    if not npub:
+        return []
+    hexpub = npub_to_hex(npub)
+    if not hexpub:
+        return []
+    decls = active_compromise_declarations(hexpub, registry_dir)
+    if not decls:
+        return []
+    n = len(decls)
+    return [f'WARN: {npub[:12]}... has {n} active compromise declaration(s) — see: nakama.py key_status {npub}']
+
+
+def migration_status(subject_hex: str, rotation_chain: list, declarations: list) -> dict:
+    """§14.3: rotation チェーンと侵害宣言から「移行完了」状態を判定する（純粋）。
+
+    rotation_chain: rotation 証明書のリスト（チェーン順）。declarations: key-compromise-declaration のリスト。
+    戻り値: {'status': 'complete'|'stale'|'broken'|'none', 'chain_npubs': [...], 'rotated_at': int|None,
+             'latest_declaration_at': int|None, 'at': int|None, 'reason': str, 'final_hex': str|None}
+    """
+    empty = {'status': 'none', 'chain_npubs': [], 'rotated_at': None,
+             'latest_declaration_at': None, 'at': None, 'reason': '', 'final_hex': None}
+    if not rotation_chain:
+        return empty
+    expected_old = (subject_hex or '').lower()
+    chain_npubs = []
+    for i, cert in enumerate(rotation_chain):
+        if not isinstance(cert, dict) or not verify_rotation_cert(cert):
+            return {**empty, 'status': 'broken', 'chain_npubs': chain_npubs,
+                    'at': i, 'reason': 'rotation 証明書の署名が無効'}
+        old_hex = npub_to_hex(cert.get('old_npub', ''))
+        new_hex = npub_to_hex(cert.get('new_npub', ''))
+        if not old_hex or not new_hex:
+            return {**empty, 'status': 'broken', 'chain_npubs': chain_npubs,
+                    'at': i, 'reason': 'npub 形式が不正'}
+        if old_hex != expected_old:
+            return {**empty, 'status': 'broken', 'chain_npubs': chain_npubs,
+                    'at': i, 'reason': 'チェーンが連鎖していない（old_npub != 前リンクの new_npub）'}
+        chain_npubs.append(cert['old_npub'])
+        expected_old = new_hex
+    chain_npubs.append(rotation_chain[-1]['new_npub'])
+    final_hex = npub_to_hex(rotation_chain[-1]['new_npub'])
+    active = [d for d in declarations
+              if isinstance(d, dict) and verify_compromise_event(d) and not d.get('withdrawn')]
+    if not active:
+        return empty  # 宣言なし → 移行の文脈なし（既存の宣言表示のみ）
+    latest_decl = max(d['created_at'] for d in active)
+    first_rot = rotation_chain[0].get('created_at')
+    status = 'complete' if first_rot is not None and first_rot >= latest_decl else 'stale'
+    return {'status': status, 'chain_npubs': chain_npubs, 'rotated_at': first_rot,
+            'latest_declaration_at': latest_decl, 'at': None, 'reason': '',
+            'final_hex': final_hex}
+
+
 def import_compromise_event(decl: dict, registry: str) -> str:
     """受け取った侵害宣言を registry に取り込む。戻り値: 'stored' | 'duplicate' | 'updated' | 'invalid'。
 
@@ -953,6 +1058,35 @@ def cmd_key_status(args):
         print(f'  {r["declarant"][:16]}...  [{r["category"]}] ({date}){w}{suffix}')
     if st['invalid_count']:
         print(f'  ※ 署名無効な宣言 {st["invalid_count"]} 件は無視しました')
+    # §14.3: rotation チェーンによる「移行完了」の表示
+    if args.rotation:
+        chain = []
+        for rp in args.rotation:
+            try:
+                with open(rp) as f:
+                    chain.append(json.load(f))
+            except (OSError, json.JSONDecodeError):
+                print(f'rotation ファイルを読めません: {rp}', file=sys.stderr)
+                chain.append(None)
+        subject_hex = npub_to_hex(args.npub)
+        decls = load_compromise_declarations(subject_hex, registry)
+        mig = migration_status(subject_hex, chain, decls)
+        arrow = ' -> '.join(n[:12] + '...' for n in mig['chain_npubs'])
+        if mig['status'] == 'complete':
+            rd = time.strftime('%Y-%m-%d', time.localtime(mig['rotated_at']))
+            ld = time.strftime('%Y-%m-%d', time.localtime(mig['latest_declaration_at']))
+            new_active = active_compromise_declarations(mig['final_hex'], registry)
+            extra = ' — 新鍵への有効な宣言はありません' if not new_active \
+                else f' — 注意: 新鍵にも {len(new_active)} 件の有効な宣言があります'
+            print(f'migration: complete ({arrow}) — rotated at {rd}, after latest declaration at {ld}{extra}')
+        elif mig['status'] == 'stale':
+            rd = time.strftime('%Y-%m-%d', time.localtime(mig['rotated_at']))
+            ld = time.strftime('%Y-%m-%d', time.localtime(mig['latest_declaration_at']))
+            print(f'migration: stale ({arrow}) — rotation は {rd}、最新の宣言は {ld} より新しい。'
+                  '今回の移行の証拠になりません')
+        elif mig['status'] == 'broken':
+            print(f'migration: broken — {mig["reason"]} (link {mig["at"]})')
+        # none: 宣言の表示のみ（セクションなし）
     # 反証: subject の liveness が宣言より新しいか
     if args.liveness:
         try:
@@ -1296,6 +1430,9 @@ def cmd_dm_send(args):
         recipient_hexpub = NostrPublicKey.from_npub(args.npub).hex()
     except Exception:
         print('npub の形式が不正です'); sys.exit(1)
+    # §14.2: 宛先への侵害宣言の警告（stderr のみ — stdout の gift wrap JSON は汚さない。exit コード不変）
+    for w in key_compromise_warnings(args.npub, getattr(args, 'compromise_registry', None) or COMPROMISES_DEFAULT):
+        print(w, file=sys.stderr)
     seal = nip17_build_seal(secret, recipient_hexpub, args.message)
     wrap = nip17_build_gift_wrap(seal, recipient_hexpub)
     if args.out:
@@ -1401,6 +1538,11 @@ def cmd_board_verify(args):
     except (KeyError, ValueError, TypeError):
         ok = False
     print('board descriptor は有効です' if ok else 'board descriptor は無効です')
+    # §14.2: descriptor の signer（board 運営者）への侵害宣言の警告（advisory — exit コード不変）
+    if d.get('moderators'):
+        for w in key_compromise_warnings(d['moderators'][0],
+                                         getattr(args, 'compromise_registry', None) or COMPROMISES_DEFAULT):
+            print(w, file=sys.stderr)
     sys.exit(0 if ok else 1)
 
 
@@ -1416,6 +1558,20 @@ def cmd_board_join(args):
 def cmd_board_send(args):
     """広場に投稿: kind 9（平文、投稿者署名が発言の証）を publish。"""
     secret = load_key(args.keyfile)
+    # §14.2: 送信者・（--descriptor 指定時は）board 運営鍵への侵害宣言の警告（advisory — exit コード不変）
+    creg = getattr(args, 'compromise_registry', None) or COMPROMISES_DEFAULT
+    for w in key_compromise_warnings(npub_of(secret), creg):
+        print(w, file=sys.stderr)
+    if getattr(args, 'descriptor', None):
+        try:
+            with open(args.descriptor) as f:
+                d = json.load(f)
+            mods = d.get('moderators') or []
+            if mods:
+                for w in key_compromise_warnings(mods[0], creg):
+                    print(w + ' — この板の運営鍵（board descriptor の signer）に疑念あり', file=sys.stderr)
+        except (OSError, json.JSONDecodeError, KeyError):
+            print('descriptor を読めません（警告を省略）', file=sys.stderr)
     ev = sign_event(secret, int(time.time()), 9, [['h', args.board_id]], args.message)
     accepted, reason = nostr_publish(args.relay, ev, auth_secret=secret if args.auth else None)
     print(f'投稿: {"受理" if accepted else "拒否"} ({reason}) id={ev["id"]}')
@@ -1433,13 +1589,22 @@ def cmd_board_read(args):
         filt['since'] = args.since
     auth_secret = load_key(args.keyfile) if args.auth else None
     events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=auth_secret)
+    creg = getattr(args, 'compromise_registry', None) or COMPROMISES_DEFAULT
+    warn_cache = {}  # §14.2: issuer ごとの侵害宣言チェック結果（registry 読みは 1 鍵 1 回）
+
+    def _issuer_flag(pubkey_hex):
+        if pubkey_hex not in warn_cache:
+            npub = hex_to_npub(pubkey_hex)
+            warn_cache[pubkey_hex] = bool(npub and key_compromise_warnings(npub, creg))
+        return ' ⚠ compromised?' if warn_cache[pubkey_hex] else ''
+
     shown = 0
     for ev in sorted(events, key=lambda e: e.get('created_at', 0)):
         if not verify_event_sig(ev):
             continue
         shown += 1
         ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ev.get('created_at', 0)))
-        print(f"--- [{ts}] {ev['pubkey'][:16]}...")
+        print(f"--- [{ts}] {ev['pubkey'][:16]}...{_issuer_flag(ev['pubkey'])}")
         print(ev['content'])
     if not shown:
         print('投稿はまだありません')
@@ -1447,6 +1612,10 @@ def cmd_board_read(args):
 
 def cmd_challenge(args):
     print(secrets.token_hex(32))
+    # §14.2: --to で宛先 npub が分かれば侵害宣言の警告（advisory — exit コード不変）
+    if getattr(args, 'to', None):
+        for w in key_compromise_warnings(args.to, getattr(args, 'compromise_registry', None) or COMPROMISES_DEFAULT):
+            print(w, file=sys.stderr)
 
 
 def cmd_respond(args):
@@ -1459,6 +1628,9 @@ def cmd_respond(args):
 def cmd_check(args):
     ok = verify_schnorr(args.npub, bytes.fromhex(args.sig), bytes.fromhex(args.nonce))
     print('本人です 🤝' if ok else '検証失敗')
+    # §14.2: response 署名者（対手）への侵害宣言の警告（advisory — exit コード不変）
+    for w in key_compromise_warnings(args.npub, getattr(args, 'compromise_registry', None) or COMPROMISES_DEFAULT):
+        print(w, file=sys.stderr)
     sys.exit(0 if ok else 1)
 
 
@@ -2197,13 +2369,18 @@ def main():
     s.add_argument('--registry', default=None, help='revocation registry ディレクトリ (既定: ~/.config/nakama/revocations)')
     s.add_argument('--skip-registry', action='store_true', help='registry の解消チェックを省略')
     s.add_argument('--skip-expiry', action='store_true', help='有効期限チェックを省略')
+    s.add_argument('--compromise-registry', default=None, help='compromise registry ディレクトリ (既定: ~/.config/nakama/compromises)')
     s = sub.add_parser('renew'); s.add_argument('bond'); s.add_argument('--out')
     s.add_argument('--expires-days', type=int, default=BOND_DEFAULT_EXPIRY_DAYS,
                    help=f'更新後の有効期限（日数、既定 {BOND_DEFAULT_EXPIRY_DAYS} 日）')
     s.add_argument('--markdown', action='store_true', help='投稿用の fenced code block を出力 (§8.3)')
-    sub.add_parser('challenge')
+    # 注意: challenge 自体は nonce 生成のみ。--to を付けると宛先 npub への侵害宣言を警告する (§14.2)
+    sc = sub.add_parser('challenge')
+    sc.add_argument('--to', default=None, help='対手の npub（侵害宣言の警告用、任意）')
+    sc.add_argument('--compromise-registry', default=None, help='compromise registry ディレクトリ (既定: ~/.config/nakama/compromises)')
     s = sub.add_parser('respond'); s.add_argument('nonce')
     s = sub.add_parser('check'); s.add_argument('npub'); s.add_argument('nonce'); s.add_argument('sig')
+    s.add_argument('--compromise-registry', default=None, help='compromise registry ディレクトリ (既定: ~/.config/nakama/compromises)')
     s = sub.add_parser('rotate')
     s.add_argument('--gen', action='store_true')
     s.add_argument('--to-hex')
@@ -2248,6 +2425,8 @@ def main():
     s.add_argument('--liveness', default=None, help='subject の生存証明ファイル（反証として評価）')
     s.add_argument('--max-age', type=int, default=7 * 86400, help='反証に使う生存証明の許容する古さ（秒、既定7日）')
     s.add_argument('--registry', default=None, help='compromise registry ディレクトリ (既定: ~/.config/nakama/compromises)')
+    s.add_argument('--rotation', action='append', default=[],
+                   help='rotation 証明書ファイル（チェーン順に複数指定可、移行完了の表示用 §14.3）')
     s = sub.add_parser('liveness'); s.add_argument('--bond', default=None, help='紐付ける bond ファイル')
     s.add_argument('--out')
     s = sub.add_parser('verify_liveness'); s.add_argument('proof'); s.add_argument('--bond', default=None)
@@ -2255,6 +2434,7 @@ def main():
     s.add_argument('--registry', default=None, help='revocation registry ディレクトリ (既定: ~/.config/nakama/revocations)')
     s.add_argument('--skip-registry', action='store_true', help='registry の解消チェックを省略')
     s = sub.add_parser('dm_send'); s.add_argument('npub'); s.add_argument('message'); s.add_argument('--out')
+    s.add_argument('--compromise-registry', default=None, help='compromise registry ディレクトリ (既定: ~/.config/nakama/compromises)')
     s = sub.add_parser('dm_recv'); s.add_argument('giftwrap')
     s = sub.add_parser('dm_pub'); s.add_argument('relay'); s.add_argument('--in', dest='in_file')
     s.add_argument('--to-npub'); s.add_argument('--message')
@@ -2267,13 +2447,17 @@ def main():
     s.add_argument('--out')
     s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
     s = sub.add_parser('board_verify'); s.add_argument('descriptor')
+    s.add_argument('--compromise-registry', default=None, help='compromise registry ディレクトリ (既定: ~/.config/nakama/compromises)')
     s = sub.add_parser('board_join'); s.add_argument('relay'); s.add_argument('board_id')
     s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
     s = sub.add_parser('board_send'); s.add_argument('relay'); s.add_argument('board_id'); s.add_argument('message')
     s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s.add_argument('--descriptor', default=None, help='board descriptor ファイル（運営鍵の侵害宣言チェック用 §14.2、任意）')
+    s.add_argument('--compromise-registry', default=None, help='compromise registry ディレクトリ (既定: ~/.config/nakama/compromises)')
     s = sub.add_parser('board_read'); s.add_argument('relay'); s.add_argument('board_id')
     s.add_argument('--since', type=int); s.add_argument('--limit', type=int, default=20)
     s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s.add_argument('--compromise-registry', default=None, help='compromise registry ディレクトリ (既定: ~/.config/nakama/compromises)')
     s.add_argument('--governance', metavar='POLICY',
                    help='ガバナンス照合モード: board-policy を読み込み、管理イベント (kind 9000/9001) と board-decision の合意を照合する (spec §9.4)')
     s.add_argument('--decisions', nargs='*', metavar='PATH',
