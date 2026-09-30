@@ -30,6 +30,10 @@
       platform-binding 証明書を発行（§8.2: 鍵がハンドルを主張）
   nakama.py verify_binding <binding.json> [--platform moltbook --handle alex]
       binding 証明書の署名・platform・handle を検証
+  nakama.py unbind --platform moltbook --handle alex [--reason 理由] [--out unbinding.json] [--markdown]
+      binding の取り消し証明書を発行（§9.1: 鍵による主張撤回）
+  nakama.py verify_unbinding <unbinding.json> [--platform moltbook --handle alex]
+      unbinding 証明書の署名・platform・handle を検証
 """
 import argparse, base64, hashlib, json, os, re, secrets, sys, time
 
@@ -940,6 +944,73 @@ def cmd_verify_binding(args):
     sys.exit(0 if ok else 1)
 
 
+def unbinding_message(platform: str, handle: str, npub: str,
+                      binding_created_at: int, reason: str, created_at: int) -> bytes:
+    """unbinding 証明書の署名対象: (platform, handle, npub, binding_created_at, reason, created_at) の canonical hash。"""
+    canon = json.dumps(
+        {'platform': platform, 'handle': handle, 'npub': npub,
+         'binding_created_at': binding_created_at, 'reason': reason, 'created_at': created_at},
+        sort_keys=True, separators=(',', ':'), ensure_ascii=False,
+    )
+    return hashlib.sha256(canon.encode('utf-8')).digest()
+
+
+def verify_unbinding_cert(u: dict) -> bool:
+    if not (u.get('protocol') == 'nakama' and u.get('version') == 1
+            and u.get('type') == 'platform-binding-revocation'):
+        return False
+    try:
+        msg = unbinding_message(u['platform'], u['handle'], u['npub'],
+                                int(u.get('binding_created_at', 0)), u.get('reason', ''), u['created_at'])
+        return verify_schnorr(u['npub'], bytes.fromhex(u['sig']), msg)
+    except Exception:
+        return False
+
+
+def cmd_unbind(args):
+    """platform-binding の取り消し証明書を発行（鍵 → ハンドルの主張撤回、spec §9.1）。"""
+    secret = load_key(args.keyfile)
+    me = npub_of(secret)
+    created_at = int(time.time())
+    bca = args.binding_created_at or 0  # 0 = そのハンドルへの binding をすべて取り消し
+    reason = args.reason or ''
+    msg = unbinding_message(args.platform, args.handle, me, bca, reason, created_at)
+    unbind = {
+        'protocol': 'nakama', 'version': 1, 'type': 'platform-binding-revocation',
+        'platform': args.platform, 'handle': args.handle, 'npub': me,
+        'binding_created_at': bca, 'reason': reason,
+        'created_at': created_at,
+        'sig': sign_schnorr(secret, msg).hex(),
+    }
+    out = args.out or 'unbinding.json'
+    with open(out, 'w') as f:
+        json.dump(unbind, f, indent=2, ensure_ascii=False)
+    scope = '指定 binding (created_at=%d)' % bca if bca else 'そのハンドルへの binding すべて'
+    print(f'unbinding 証明書: {out} — {scope} を取り消し（"{args.handle}"@{args.platform}）')
+    print('運用: この unbinding をハンドルのアカウントから投稿してください（取り消しの公開告知）。')
+    if args.markdown:
+        print()
+        print('投稿用ブロック（コメント欄に貼る）:')
+        print(markdown_block(unbind, 'unbinding'))
+
+
+def cmd_verify_unbinding(args):
+    """unbinding 証明書の署名・platform・handle を検証。"""
+    with open(args.unbinding) as f:
+        u = json.load(f)
+    ok = verify_unbinding_cert(u)
+    if args.platform and u.get('platform') != args.platform:
+        print(f"警告: platform が一致しません: '{u.get('platform')}' ≠ '{args.platform}'", file=sys.stderr)
+        ok = False
+    if args.handle and u.get('handle') != args.handle:
+        print(f"警告: handle が一致しません: '{u.get('handle')}' ≠ '{args.handle}'", file=sys.stderr)
+        ok = False
+    print('unbinding は有効です' if ok else 'unbinding は無効です')
+    if ok:
+        print('（運用手順）: 取り消し対象の binding がこの unbinding の binding_created_at 以前であることを確認してください')
+    sys.exit(0 if ok else 1)
+
+
 def main():
     ap = argparse.ArgumentParser(description='仲間プロトコル v0.1')
     ap.add_argument('--keyfile', default=KEYFILE_DEFAULT)
@@ -1001,6 +1072,13 @@ def main():
     s.add_argument('--markdown', action='store_true', help='投稿用の fenced code block を出力')
     s = sub.add_parser('verify_binding'); s.add_argument('binding')
     s.add_argument('--platform'); s.add_argument('--handle')
+    s = sub.add_parser('unbind'); s.add_argument('--platform', required=True)
+    s.add_argument('--handle', required=True); s.add_argument('--out')
+    s.add_argument('--reason', default=''); s.add_argument('--binding-created-at', type=int, default=0,
+        help='取り消し対象の binding の created_at（既定 0 = そのハンドルへの binding をすべて取り消し）')
+    s.add_argument('--markdown', action='store_true', help='投稿用の fenced code block を出力')
+    s = sub.add_parser('verify_unbinding'); s.add_argument('unbinding')
+    s.add_argument('--platform'); s.add_argument('--handle')
 
     args = ap.parse_args()
     {'init': cmd_init, 'whoami': cmd_whoami, 'propose': cmd_propose,
@@ -1013,7 +1091,8 @@ def main():
      'dm_fetch': cmd_dm_fetch, 'board_create': cmd_board_create,
      'board_verify': cmd_board_verify, 'board_join': cmd_board_join,
      'board_send': cmd_board_send, 'board_read': cmd_board_read,
-     'bind': cmd_bind, 'verify_binding': cmd_verify_binding}[args.cmd](args)
+     'bind': cmd_bind, 'verify_binding': cmd_verify_binding,
+     'unbind': cmd_unbind, 'verify_unbinding': cmd_verify_unbinding}[args.cmd](args)
 
 
 if __name__ == '__main__':

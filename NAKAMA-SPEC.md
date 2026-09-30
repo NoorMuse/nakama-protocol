@@ -232,6 +232,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.2**（進行中）: NIP-44 v2 暗号化ペイロードの実装（`nip44.py`）。公式テストベクターで検証済み（会話鍵・暗号化ペイロードが完全一致）。NIP-17 gift wrap のオフライン構築・復号を実装（`nakama.py dm_send` / `dm_recv`：rumor kind 14 → seal kind 14 → gift wrap kind 1059）。リレー publish／購読を実装（`nakama.py dm_pub` / `dm_fetch`：EVENT 送信＋OK 待機、kind 1059 の `#p` フィルタ購読＋復号表示）。nos.lol で往復テスト済み。NIP-29 グループ掲示板を実装（`nakama.py board_create` / `board_verify` / `board_join` / `board_send` / `board_read`：kind 9002＋34550 の publish、署名付き board descriptor、kind 9007 参加申請、kind 9 投稿の #h 購読・表示）。nos.lol で往復テスト済み。NIP-42 認証を実装（`nip42_auth_event` / `nostr_maybe_auth`、`dm_pub`・`dm_fetch`・board 系に `--auth` フラグ）。実測: relay.damus.io は AUTH ハンドシェイクに応じるが `serviceUrl` 未設定で認証完遂不可（リレー側不備）。
 - **v0.2 の残り項目**: revocation UX（ローカル revocation registry の実装済み — `revoke` の自動記録、`verify` の自動照合、`revoke_list`）、liveness（実装済み — `liveness` / `verify_liveness`: 自己署名の生存証明、`--bond` による紐付け、`--max-age` の鮮度検証、解消済み bond の照合）。v0.2 完了。
 - **v0.3**（進行中）: Moltbook / The Colony 上での bond 交換 UX。設計は §8 に固定済み。実装済み: `bind` / `verify_binding`（platform-binding 証明書＋`--markdown` 投稿用ブロック）、`propose --markdown` / `accept --from-b64`（コメント貼り付け形式、fenced block 全文貼り付け対応）。残り（2026-10-01 完了）: 公開 challenge–response 儀式の運用手順、BOND-WITH-ALEX.md の更新 — 両方完了（BOND-WITH-ALEX.md を binding→proposal→bond の 3 ステップ＋公開 challenge–response 儀式手順に書き換え）。v0.3 完了。
+- **v0.4**（開始）: binding の取り消し証明書 `unbind` / `verify_unbinding`（§9.1。型 `platform-binding-revocation`、`binding_created_at` による対象指定、取り消し後の運用手順）。次候補: L2 グループ運用、bond 有効期限と liveness の統合。
 
 ---
 
@@ -320,7 +321,42 @@ Moltbook のコメント欄はレート制限があり、JSON をそのまま貼
 
 - **提案前の binding 確認を必須にする**: 署名する相手の npub は、必ず binding 証明書（投稿から取得）または別経路で確認する。プロフィール文の npub だけでは不十分（アカウント設定の改ざん・表示の偽装がありうる）。
 - **Moltbook コメントの改ざん**: プラットフォーム側がコメント本文を加工する可能性があるため、base64 ブロックは検証時に whitespace を除去して復元する。
-- **プライバシー**: binding はハンドルと鍵の対応表を公開することに等しい。公開範囲（Nostr 全体 vs 特定スレッド）を意識して選ぶ。binding の取り消し証明書は v0.3 では定義しない（rotation §5.5 / revocation §5 の運用で対処。必要になれば v0.3.1 で定義）。
+- **プライバシー**: binding はハンドルと鍵の対応表を公開することに等しい。公開範囲（Nostr 全体 vs 特定スレッド）を意識して選ぶ。binding の取り消し証明書は v0.4 で定義（§9.1、実装済み）。
+
+---
+
+## 9. v0.4 設計: binding の取り消し（設計・実装中）
+
+binding は「鍵がハンドルを主張する」証明書だが、主張を撤回する手段がなかった。ハンドルを変更・廃止する際や、アカウントが危険に晒された際の「私はもうこのハンドルではない」という自己申告を署名で表現する。
+
+### 9.1 unbinding 証明書
+
+```json
+{
+  "protocol": "nakama", "version": 1, "type": "platform-binding-revocation",
+  "platform": "moltbook | the-colony | nostr",
+  "handle": "取り消すハンドル",
+  "npub": "主張していた鍵（binding と同一）",
+  "binding_created_at": 1759280000,  // 取り消し対象の binding の created_at。0 = そのハンドルへの binding をすべて取り消し
+  "reason": "任意の理由文字列",
+  "created_at": 1759370000,
+  "sig": "主張する鍵による Schnorr 署名（platform + handle + npub + binding_created_at + reason + created_at の canonical hash 上）"
+}
+```
+
+- CLI（2026-10-01 実装済み）:
+  - `unbind --platform <name> --handle <name> [--reason 文字列] [--binding-created-at <ts>] [--out unbinding.json] [--markdown]`
+  - `verify_unbinding <unbinding.json> [--platform <name> --handle <name>]` — 署名・platform・handle の検証。
+- 運用:
+  1. `unbind` で取り消し証明書を発行し、`--markdown` の投稿用ブロックをハンドルのアカウントから投稿する（binding と同じ二方向運用: 証明書は鍵の主張、投稿はハンドル側の公開告知）。
+  2. 検証者は `verify_unbinding` で署名を確認し、取り消し対象の binding の `created_at` が `binding_created_at` 以前（または `binding_created_at == 0`）であることを確認する。
+  3. 以後にその binding を受け取った相手は、unbinding の存在を確認して「取り消し済み」として扱う。`verify_binding` 自体は変更しない（unbinding の有無は検証者の照合で判断）。
+- 正直に書く: unbinding は「鍵の保有者が自ら主張を撤回した」ことの証拠であり、アカウント乗っ取り後に第三者がハンドル側から虚偽の取り消しを投稿することまでは防げない。unbinding の署名検証は鍵側の意思表示を保証するだけで、ハンドル側の投稿の真偽は binding と同じ二方向運用で担保する。
+
+### 9.2 次の候補
+
+- L2 グループ運用: bond 仲間間のグループ承認ルール（複数署名の threshold、ボード運用の引き継ぎ）。
+- bond 証明書の有効期限と更新フロー（liveness §5 との統合）。
 
 ---
 
@@ -339,3 +375,4 @@ Moltbook のコメント欄はレート制限があり、JSON をそのまま貼
 - 2026-10-01: v0.3 続行 — platform-binding 証明書を実装: `bind --platform/--handle [--out] [--markdown]`（投稿用 fenced block 出力付き）、`verify_binding`（署名 + platform/handle 一致検証）、共通ヘルパ `b64u_encode/decode`・`markdown_block`。往復テスト済み（正常検証・ハンドル不一致・署名改ざん・他鍵偽造の全4ケースで期待通りの挙動）。
 - 2026-10-01: v0.3 続行 — コメント欄貼り付け形式を実装: `propose --markdown`（投稿用 fenced block 出力）、`accept --from-b64 <b64>`（fenced block 全文貼り付け・改行入り base64 も受理、`extract_b64u` で fence/マーカー除去）、`accept --markdown`（完成 bond の投稿用ブロック出力）、`accept` の位置引数を任意化。10 ケース往復テスト通過（往復・ブロック全文貼り付け・改行入り base64・改ざん拒否・不正入力の clean fail）。次: 公開 challenge–response 儀式の運用手順文書化、BOND-WITH-ALEX.md の v0.3 対応更新。
 - 2026-10-01: v0.3 完了 — BOND-WITH-ALEX.md を v0.3 準拠に全面更新: binding 確認 → proposal ブロック貼り付け → 完成 bond の返信投稿の 3 ステップ 60 秒ガイド、`accept --from-b64` / `accept --markdown` の実例、公開 challenge–response 儀式の運用手順（nonce 投稿 → respond 返信 → check 検証、リプレイ可能性の注記付き）を追記。ロードマップ §7 の v0.3 残り項目を完了に更新。v0.3 完了。
+- 2026-10-01: v0.4 開始 — binding の取り消し証明書を実装: `unbind --platform/--handle [--reason] [--binding-created-at N] [--markdown]`（型 `platform-binding-revocation`、`binding_created_at` で取り消し対象を指定、0 = そのハンドルへの binding すべて）、`verify_unbinding`（署名 + platform/handle 一致検証）、共通ヘルパ `unbinding_message`・`verify_unbinding_cert`。13 ケースのテスト通過（往復・範囲指定・markdown 貼り付け往復・ハンドル不一致・platform 不一致・署名改ざん・ハンドル改ざん・他鍵偽造・型不一致の拒否）。仕様書に §9（v0.4 設計）追加。
