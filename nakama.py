@@ -15,19 +15,19 @@
   nakama.py check <npub> <nonce-hex> <sig-hex>       署名を検証（対手の侵害宣言を警告 §14.2）
   nakama.py rotate --gen|--to-hex HEX [--to-keyfile P]  鍵ローテーション: 旧鍵が新鍵に署名した rotation 証明書を発行
   nakama.py verify_rotation <rotation.json>          rotation 証明書を検証
-  nakama.py rotate_pub <relay> <rotation.json> [--auth]  rotation 証明書を Nostr に公開（kind 30102、d タグ = old_hex）
+  nakama.py rotate_pub <relay> <rotation.json> [--auth]  rotation 証明書を Nostr に公開（kind 30109、d タグ = old_hex）
   nakama.py rotate_fetch <relay> <old_npub> [--limit N] [--auth] [--out FILE] [--chain]
       公開された rotation 証明書を購読・追跡（--chain: new→old のチェーン全体をたどる）
   nakama.py revoke <bond.json> [--reason 理由]        bond の解消 (revocation イベント) を署名して発行
   nakama.py verify_revocation <revocation.json> --bond <bond.json>  解消イベントを検証
   nakama.py revoke_import <revocation.json> [--bond <bond.json>]  受け取った revocation を検証して registry に取り込む
-  nakama.py revoke_pub <relay> <revocation.json> [--auth]  revocation を Nostr に公開（kind 30100、d タグ = bond_hash）
+  nakama.py revoke_pub <relay> <revocation.json> [--auth]  revocation を Nostr に公開（kind 30107、d タグ = bond_hash）
   nakama.py revoke_fetch <relay> <bond_hash> [--limit N] [--auth]  公開された revocation を購読して registry に取り込む
   nakama.py revoke_list                            解消済み bond の一覧を表示（理由つき）
   nakama.py compromise_declare --subject <npub> [--reason 理由] [--evidence 証拠] [--bond bond.json]
       鍵スコープの侵害宣言を発行（§13: 「この npub はもう本人ではない」と仲間が宣言）
   nakama.py compromise_import <declaration.json> [--subject <npub>]  受け取った侵害宣言を検証して registry に取り込む
-  nakama.py compromise_pub <relay> <declaration.json> [--auth]  侵害宣言を Nostr に公開（kind 30101、d タグ = subject_hex:declarant_hex）
+  nakama.py compromise_pub <relay> <declaration.json> [--auth]  侵害宣言を Nostr に公開（kind 30108、d タグ = subject_hex:declarant_hex）
   nakama.py compromise_fetch <relay> <npub> [--limit N] [--auth]  公開された侵害宣言を購読して registry に取り込む
   nakama.py compromise_withdraw --subject <npub>  自分の侵害宣言を withdrawn: true で再発行（撤回）
   nakama.py key_status <npub> [--threshold N] [--bond bond.json ...] [--liveness proof.json] [--max-age 秒] [--rotation R.json ...]
@@ -63,15 +63,15 @@
   nakama.py verify_board_decision <decision.json> --policy <policy.json>
       決定の threshold 達成を検証
   nakama.py board_decide_pub <relay> <decision.json> [--auth]
-      board-decision を Nostr に公開（kind 30103、d タグ = コアハッシュ。署名者は publisher）
+      board-decision を Nostr に公開（kind 30110、d タグ = コアハッシュ。署名者は publisher）
   nakama.py board_decide_fetch <relay> <board_id> [--limit N] [--auth] [--out DIR] [--policy POLICY]
       公開された board-decision を購読・検証・マージして表示（--out: <core_hash>.json で保存、--policy: threshold 充足・不足の表示）
   nakama.py board_draft_pub <relay> <draft.json> [--auth]
-      決定前の草案を Nostr に公開（kind 30104、d タグ = コアハッシュ。署名者は publisher。各承認者が自分のスロットに再公開する方式 B）
+      決定前の草案を Nostr に公開（kind 30111、d タグ = コアハッシュ。署名者は publisher。各承認者が自分のスロットに再公開する方式 B）
   nakama.py board_draft_fetch <relay> <board_id> [--limit N] [--auth] [--out DIR] [--policy POLICY]
       公開された草案を購読・検証・マージして表示（--out: <core_hash>.json で保存 — board_cosign にそのまま渡せる、--policy: 草案の threshold 充足・不足の表示）
   nakama.py board_fetch_all <relay> <board_id> [--limit N] [--auth] [--out DIR] [--policy POLICY]
-      30103+30104 を 1 回の REQ で購読し同一コアの草案・完成を統合表示（--out: 内部マーカーを剥がした <core_hash>.json、--policy: 成立済みは時点解決・草案は現行政策のみで threshold 表示）
+      30110+30111 を 1 回の REQ で購読し同一コアの草案・完成を統合表示（--out: 内部マーカーを剥がした <core_hash>.json、--policy: 成立済みは時点解決・草案は現行政策のみで threshold 表示）
   nakama.py board_draft_notify <relay> <board_id> [--limit N] [--auth] [--policy POLICY] [--within SECS] [--include-expired] [--dry-run] [--resend] [--from NPUB]
       期限間近の草案を発行者に NIP-17 DM で通知（--within 既定 24h、送信記録で二重送信防止、宛先は草案イベントの publisher のみ — spec §25）
 """
@@ -384,22 +384,52 @@ def cmd_verify_rotation(args):
         sys.exit(1)
 
 
-# --- v0.12: rotation 証明書の Nostr 公開（spec §17） ---
-# §12 の revoke_pub パターン（kind 30100）を流用。Nostr の既存リレーヘルパ
-# （nostr_publish / nostr_request / --auth）をそのまま使い、kind 30102 を定義する。
+# --- v0.23 §26.10: Nostr kind の環境変数上書き ---
 
-ROTATION_NOSTR_KIND = 30102
+def _kind_from_env(env_name: str, default: int) -> int:
+    """Nostr kind 定数の環境変数上書きを解決する（spec §26.10）。
+
+    無効値（非 int / 30000–39999 の範囲外）は起動時ではなく使用時に検証し、
+    その操作を exit 1 で拒否する（無関係なコマンドまで壊さないため）。
+    正直な注記: 環境変数は足元の運用（自分が発行・購読する kind）のための
+    もので、他者の kind 使用を変える力はない。
+    """
+    raw = os.environ.get(env_name)
+    if raw is None or raw.strip() == '':
+        return default
+    v = None
+    try:
+        v = int(raw.strip(), 10)
+    except ValueError:
+        pass
+    if v is None or not 30000 <= v <= 39999:
+        sys.stderr.write(
+            f'error: {env_name}={raw!r} は無効です。'
+            f'30000–39999 の整数を指定してください。\n')
+        sys.exit(1)
+    return v
+
+
+# --- v0.12: rotation 証明書の Nostr 公開（spec §17） ---
+# §12 の revoke_pub パターン（kind 30107）を流用。Nostr の既存リレーヘルパ
+# （nostr_publish / nostr_request / --auth）をそのまま使い、kind 30109 を定義する。
+
+def ROTATION_NOSTR_KIND() -> int:
+    """rotation 証明書の Nostr kind。既定 30109（v0.23 で 30102 から再マップ）。
+
+    NAKAMA_KIND_ROTATION で上書き可能。使用時に環境変数を読んで検証する。"""
+    return _kind_from_env('NAKAMA_KIND_ROTATION', 30109)
 
 
 def rotation_nostr_event(rot: dict, secret: bytes) -> dict:
-    """rotation 証明書を Nostr 公開用イベント (kind 30102) として構築・署名する（純粋）。
+    """rotation 証明書を Nostr 公開用イベント (kind 30109) として構築・署名する（純粋）。
 
-    kind 30102 は parameterized replaceable: d タグ = old_hex。イベントの署名者は
+    kind 30109 は parameterized replaceable: d タグ = old_hex。イベントの署名者は
     旧鍵（正規スロット (pubkey, kind, d) を一つに定める。§17.3）。
     """
     content = json.dumps(rot, sort_keys=True, separators=(',', ':'))
     old_hex = npub_to_hex(rot['old_npub'])
-    return sign_event(secret, int(time.time()), ROTATION_NOSTR_KIND,
+    return sign_event(secret, int(time.time()), ROTATION_NOSTR_KIND(),
                       [['d', old_hex]], content)
 
 
@@ -461,7 +491,7 @@ def rotation_chain_fetch(old_hex: str, fetch_one, max_links: int = 16) -> list:
 
 
 def cmd_rotate_pub(args):
-    """rotation 証明書を Nostr リレーに publish (kind 30102, d タグ = old_hex)。署名者は旧鍵。"""
+    """rotation 証明書を Nostr リレーに publish (kind 30109, d タグ = old_hex)。署名者は旧鍵。"""
     secret = load_key(args.keyfile)
     with open(args.rotation) as f:
         rot = json.load(f)
@@ -482,7 +512,7 @@ def cmd_rotate_pub(args):
 
 
 def cmd_rotate_fetch(args):
-    """old_npub に対する rotation 公開イベント (kind 30102, #d=old_hex) を購読し、有効なものを表示する。"""
+    """old_npub に対する rotation 公開イベント (kind 30109, #d=old_hex) を購読し、有効なものを表示する。"""
     secret = load_key(args.keyfile)
     try:
         old_hex = npub_to_hex(args.old_npub)
@@ -491,7 +521,7 @@ def cmd_rotate_fetch(args):
         sys.exit(1)
 
     def fetch_one(target_hex):
-        filt = {'kinds': [ROTATION_NOSTR_KIND], '#d': [target_hex], 'limit': args.limit}
+        filt = {'kinds': [ROTATION_NOSTR_KIND()], '#d': [target_hex], 'limit': args.limit}
         sub_id = secrets.token_hex(8)
         events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=secret if args.auth else None)
         best = None
@@ -615,16 +645,20 @@ def import_revocation_event(r: dict, registry: str) -> str:
     return 'stored'
 
 
-REVOCATION_NOSTR_KIND = 30100
+def REVOCATION_NOSTR_KIND() -> int:
+    """revocation の Nostr kind。既定 30107（v0.23 で 30100 から再マップ）。
+
+    NAKAMA_KIND_REVOCATION で上書き可能。使用時に環境変数を読んで検証する。"""
+    return _kind_from_env('NAKAMA_KIND_REVOCATION', 30107)
 
 
 def revocation_nostr_event(rev: dict, secret: bytes) -> dict:
-    """revocation イベントを Nostr 公開用イベント (kind 30100) として構築・署名する。
+    """revocation イベントを Nostr 公開用イベント (kind 30107) として構築・署名する。
 
-    kind 30100 は parameterized replaceable: d タグ = bond_hash。再発行で上書き（reason の追記訂正）できる。
+    kind 30107 は parameterized replaceable: d タグ = bond_hash。再発行で上書き（reason の追記訂正）できる。
     """
     content = json.dumps(rev, sort_keys=True, separators=(',', ':'))
-    return sign_event(secret, int(time.time()), REVOCATION_NOSTR_KIND,
+    return sign_event(secret, int(time.time()), REVOCATION_NOSTR_KIND(),
                       [['d', rev['bond_hash']]], content)
 
 
@@ -649,7 +683,7 @@ def cmd_revoke_import(args):
 
 
 def cmd_revoke_pub(args):
-    """revocation イベントを Nostr リレーに publish (kind 30100, d タグ = bond_hash)。"""
+    """revocation イベントを Nostr リレーに publish (kind 30107, d タグ = bond_hash)。"""
     secret = load_key(args.keyfile)
     with open(args.revocation) as f:
         rev = json.load(f)
@@ -665,9 +699,9 @@ def cmd_revoke_pub(args):
 
 
 def cmd_revoke_fetch(args):
-    """bond_hash に対する revocation 公開イベント (kind 30100, #d) を購読し、有効なものを registry に取り込む。"""
+    """bond_hash に対する revocation 公開イベント (kind 30107, #d) を購読し、有効なものを registry に取り込む。"""
     secret = load_key(args.keyfile)
-    filt = {'kinds': [REVOCATION_NOSTR_KIND], '#d': [args.bond_hash], 'limit': args.limit}
+    filt = {'kinds': [REVOCATION_NOSTR_KIND()], '#d': [args.bond_hash], 'limit': args.limit}
     sub_id = secrets.token_hex(8)
     events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=secret if args.auth else None)
     registry = args.registry or REVOCATIONS_DEFAULT
@@ -736,7 +770,11 @@ def cmd_revoke_list(args):
 
 
 COMPROMISES_DEFAULT = os.path.expanduser('~/.config/nakama/compromises')
-COMPROMISE_NOSTR_KIND = 30101
+def COMPROMISE_NOSTR_KIND() -> int:
+    """key-compromise-declaration の Nostr kind。既定 30108（v0.23 で 30101 から再マップ）。
+
+    NAKAMA_KIND_COMPROMISE で上書き可能。使用時に環境変数を読んで検証する。"""
+    return _kind_from_env('NAKAMA_KIND_COMPROMISE', 30108)
 
 
 def compromise_message(subject_hex: str, declarant_hex: str, created_at: int, withdrawn: bool = False,
@@ -932,15 +970,15 @@ def import_compromise_event(decl: dict, registry: str) -> str:
 
 
 def compromise_nostr_event(decl: dict, secret: bytes) -> dict:
-    """侵害宣言を Nostr 公開用イベント (kind 30101) として構築・署名する。
+    """侵害宣言を Nostr 公開用イベント (kind 30108) として構築・署名する。
 
-    kind 30101 は parameterized replaceable: d タグ = subject_hex:declarant_hex。
+    kind 30108 は parameterized replaceable: d タグ = subject_hex:declarant_hex。
     同一宣言者の再発行で上書き（withdrawn による撤回）ができる。
     """
     content = json.dumps(decl, sort_keys=True, separators=(',', ':'))
     subject_hex = npub_to_hex(decl['subject'])
     declarant_hex = npub_to_hex(decl['declarant'])
-    return sign_event(secret, int(time.time()), COMPROMISE_NOSTR_KIND,
+    return sign_event(secret, int(time.time()), COMPROMISE_NOSTR_KIND(),
                       [['d', f'{subject_hex}:{declarant_hex}']], content)
 
 
@@ -1027,7 +1065,7 @@ def cmd_compromise_import(args):
 
 
 def cmd_compromise_pub(args):
-    """侵害宣言を Nostr リレーに publish (kind 30101, d タグ = subject_hex:declarant_hex)。"""
+    """侵害宣言を Nostr リレーに publish (kind 30108, d タグ = subject_hex:declarant_hex)。"""
     secret = load_key(args.keyfile)
     with open(args.declaration) as f:
         decl = json.load(f)
@@ -1044,14 +1082,14 @@ def cmd_compromise_pub(args):
 
 
 def cmd_compromise_fetch(args):
-    """subject に対する侵害宣言の公開イベント (kind 30101) を購読し、有効なものを registry に取り込む。"""
+    """subject に対する侵害宣言の公開イベント (kind 30108) を購読し、有効なものを registry に取り込む。"""
     secret = load_key(args.keyfile)
     try:
         subject_hex = npub_to_hex(args.npub)
     except Exception:
         print('npub は有効ではありません', file=sys.stderr)
         sys.exit(1)
-    filt = {'kinds': [COMPROMISE_NOSTR_KIND], 'limit': args.limit}
+    filt = {'kinds': [COMPROMISE_NOSTR_KIND()], 'limit': args.limit}
     sub_id = secrets.token_hex(8)
     events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=secret if args.auth else None)
     registry = args.registry or COMPROMISES_DEFAULT
@@ -1127,7 +1165,7 @@ def cmd_compromise_withdraw(args):
         json.dump(decl, f, indent=2)
     if result == 'updated':
         print(f'侵害宣言を撤回しました: {out}（registry の記録を withdrawn: true に更新）')
-        print('公開済みの宣言は compromise_pub で上書きしてください（kind 30101 の replaceable で撤回が効きます）。')
+        print('公開済みの宣言は compromise_pub で上書きしてください（kind 30108 の replaceable で撤回が効きます）。')
     else:
         print(f'撤回を記録しました: {result}', file=sys.stderr)
 
@@ -2343,16 +2381,25 @@ def cmd_verify_board_decision(args):
 # --- v0.14: board-decision の Nostr 公開（spec §19） ---
 
 # §12 / §13 / §17 の *_pub パターン（parameterized replaceable kind ＋
-# nostr_publish / nostr_request / --auth ヘルパ）の流用。kind 30103 を定義する。
+# nostr_publish / nostr_request / --auth ヘルパ）の流用。kind 30110 を定義する。
 # 決定の有効性は threshold の approvals が証明するものであり、Nostr イベントの
 # 署名者 = publisher（決定の署名者ではない）。決定を保持する任意の仲間が
 # publish できる — keyfile の鍵と決定の関係は問わない（意図的な設計、§19.3）。
 
-DECISION_NOSTR_KIND = 30103
-# 決定前の草案（cosign 回覧中）の Nostr 公開用 kind（spec §21）。
-# parameterized replaceable、nakama 独自割当。d タグは kind 30103 と同一の
-# decision_core_hash（草案→完成の対応付け）。
-DRAFT_NOSTR_KIND = 30104
+def DECISION_NOSTR_KIND() -> int:
+    """board-decision（成立済み）の Nostr kind。既定 30110（v0.23 で 30103 から再マップ）。
+
+    NAKAMA_KIND_DECISION で上書き可能。使用時に環境変数を読んで検証する。"""
+    return _kind_from_env('NAKAMA_KIND_DECISION', 30110)
+
+
+def DRAFT_NOSTR_KIND() -> int:
+    """決定前の草案（cosign 回覧中）の Nostr kind。既定 30111（v0.23 で 30104 から再マップ）。
+
+    NAKAMA_KIND_DRAFT で上書き可能。使用時に環境変数を読んで検証する。
+    parameterized replaceable、nakama 独自割当。d タグは DECISION_NOSTR_KIND() と同一の
+    decision_core_hash（草案→完成の対応付け）。"""
+    return _kind_from_env('NAKAMA_KIND_DRAFT', 30111)
 
 
 def decision_core_hash(d: dict) -> str:
@@ -2386,16 +2433,19 @@ def decision_structure_ok(d: dict) -> bool:
         return False
 
 
-def decision_nostr_event(d: dict, secret: bytes, kind: int = DECISION_NOSTR_KIND) -> dict:
+def decision_nostr_event(d: dict, secret: bytes, kind: int | None = None) -> dict:
     """board-decision を Nostr 公開用イベントとして構築・署名する（純粋、spec §21.4）。
 
-    kind 既定値の 30103 は完成決定（§19）、30104 は決定前の草案（§21）。
+    kind 既定値の 30110 は完成決定（§19）、30111 は決定前の草案（§21）。
+    既定は DECISION_NOSTR_KIND() を使用時に解決する（環境変数上書きに対応）。
     d タグ = decision_core_hash（approvals 追記でもスロット安定）、
     h タグ = board_id、content = 決定 JSON の canonical（approvals を含む最新版）。
     イベントの署名者は publisher（§19.3 — keyfile の鍵をそのまま使う。
     草案も同一の設計判断: 草案の有効性は threshold approvals が証明する）。
     """
     core = decision_core_hash(d)
+    if kind is None:
+        kind = DECISION_NOSTR_KIND()
     content = json.dumps(d, sort_keys=True, separators=(',', ':'),
                          ensure_ascii=False)
     return sign_event(secret, int(time.time()), kind,
@@ -2403,12 +2453,12 @@ def decision_nostr_event(d: dict, secret: bytes, kind: int = DECISION_NOSTR_KIND
 
 
 def board_decision_nostr_event(d: dict, secret: bytes) -> dict:
-    """完成決定 (kind 30103) のイベント構築 — decision_nostr_event の既定値ラッパー（互換用）。"""
+    """完成決定 (kind 30110) のイベント構築 — decision_nostr_event の既定値ラッパー（互換用）。"""
     return decision_nostr_event(d, secret)
 
 
 def verify_board_decision_nostr_event(ev: dict, board_id: str,
-                                      expect_kind: int = DECISION_NOSTR_KIND) -> dict | None:
+                                      expect_kind: int | None = None) -> dict | None:
     """Nostr イベントから board-decision を取り出す三段階検証（純粋）。
 
     1. Nostr イベント署名の検証
@@ -2417,11 +2467,14 @@ def verify_board_decision_nostr_event(ev: dict, board_id: str,
        の再計算一致 ＋ h タグ == content の board_id == 指定 board_id（リレーの
        フィルタが緩い場合の二重チェック）
     threshold の検証はしない（policy が必要）。受理なら決定 dict、無効なら None。
-    草案 (kind 30104) は expect_kind=DRAFT_NOSTR_KIND で検証する（§21）——
+    草案 (kind 30111) は expect_kind=DRAFT_NOSTR_KIND() で検証する（§21）——
     承認不足の草案は正常状態であり、threshold 検証は行わない。
+    既定の expect_kind は DECISION_NOSTR_KIND() を使用時に解決する（環境変数上書きに対応）。
     """
+    if expect_kind is None:
+        expect_kind = DECISION_NOSTR_KIND()
     if ev.get('kind') != expect_kind:
-        return None  # kind が期待と違う（30103/30104 の混入を拒否）
+        return None  # kind が期待と違う（30110/30111 の混入を拒否）
     if not verify_event_sig(ev):
         return None
     try:
@@ -2469,7 +2522,7 @@ def merge_decision_approvals(decisions: list) -> list:
 
 
 def cmd_board_decide_pub(args):
-    """board-decision を Nostr リレーに publish (kind 30103, d タグ = コアハッシュ)。署名者は publisher。"""
+    """board-decision を Nostr リレーに publish (kind 30110, d タグ = コアハッシュ)。署名者は publisher。"""
     secret = load_key(args.keyfile)
     with open(args.decision) as f:
         d = json.load(f)
@@ -2517,7 +2570,7 @@ def save_policy_snapshot(out_dir, policy):
 
 
 def cmd_board_decide_fetch(args):
-    """board の board-decision 公開イベント (kind 30103, #h=board_id) を購読し、有効なものを表示する。
+    """board の board-decision 公開イベント (kind 30110, #h=board_id) を購読し、有効なものを表示する。
 
     --policy <policy.json> 指定時のみ、各決定の threshold 充足・不足を
     表示する（spec §20。policy は verify_board_policy_cert で事前検証し、
@@ -2541,7 +2594,7 @@ def cmd_board_decide_fetch(args):
             print('policy の board_id が取得対象の board_id と一致しません',
                   file=sys.stderr)
             sys.exit(1)
-    filt = {'kinds': [DECISION_NOSTR_KIND], '#h': [args.board_id], 'limit': args.limit}
+    filt = {'kinds': [DECISION_NOSTR_KIND()], '#h': [args.board_id], 'limit': args.limit}
     sub_id = secrets.token_hex(8)
     events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=secret if args.auth else None)
     valid, skipped = [], 0
@@ -2585,7 +2638,7 @@ def cmd_board_decide_fetch(args):
 
 
 def cmd_board_draft_pub(args):
-    """決定前の草案を Nostr リレーに publish (kind 30104, d タグ = コアハッシュ、spec §21)。
+    """決定前の草案を Nostr リレーに publish (kind 30111, d タグ = コアハッシュ、spec §21)。
 
     board_decide_pub と同型。署名者は publisher。各承認者が cosign した版を
     自分のスロットに再公開する方式 B（§21.2）—— 新規の cosign コマンドは不要で、
@@ -2603,21 +2656,21 @@ def cmd_board_draft_pub(args):
         print(f'草案は期限切れです（expires_at {d["payload"]["expires_at"]}）'
               ' — publish しません', file=sys.stderr)
         sys.exit(1)
-    ev = decision_nostr_event(d, secret, kind=DRAFT_NOSTR_KIND)
+    ev = decision_nostr_event(d, secret, kind=DRAFT_NOSTR_KIND())
     accepted, reason = nostr_publish(args.relay, ev, auth_secret=secret if args.auth else None)
     print(f'publish: {"受理" if accepted else "拒否"} ({reason}) id={ev["id"]}')
     sys.exit(0 if accepted else 1)
 
 
 def cmd_board_draft_fetch(args):
-    """board の草案公開イベント (kind 30104, #h=board_id) を購読し、有効なものを表示する（spec §21）。
+    """board の草案公開イベント (kind 30111, #h=board_id) を購読し、有効なものを表示する（spec §21）。
 
-    board_decide_fetch と同型（kinds=[30104]。三段階検証＋同一コアの approvals
+    board_decide_fetch と同型（kinds=[30111]。三段階検証＋同一コアの approvals
     マージ＋ --out の <core_hash>.json 保存）。--policy 指定時のみ各草案の
     threshold 充足・不足を表示するが、草案には「草案（回覧中）」のマーカーをつける
     （§21.5）。草案の時点解決は現行政策のみ — policy-update 決定の草案は扱わず、
-    30103 決定もこの fetch には含まれないため resolve_policy_at は空集合で呼ぶ
-    （§21.5）。成立の公開宣言は kind 30103 の存在（§21.3）。
+    30110 決定もこの fetch には含まれないため resolve_policy_at は空集合で呼ぶ
+    （§21.5）。成立の公開宣言は kind 30110 の存在（§21.3）。
     --out と --policy の両指定時は fetch 時点の政策スナップショットを
     policy-snapshot-<ts>.json として保存する（spec §23）。
     """
@@ -2637,12 +2690,12 @@ def cmd_board_draft_fetch(args):
             print('policy の board_id が取得対象の board_id と一致しません',
                   file=sys.stderr)
             sys.exit(1)
-    filt = {'kinds': [DRAFT_NOSTR_KIND], '#h': [args.board_id], 'limit': args.limit}
+    filt = {'kinds': [DRAFT_NOSTR_KIND()], '#h': [args.board_id], 'limit': args.limit}
     sub_id = secrets.token_hex(8)
     events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=secret if args.auth else None)
     valid, skipped = [], 0
     for ev in events:
-        d = verify_board_decision_nostr_event(ev, args.board_id, expect_kind=DRAFT_NOSTR_KIND)
+        d = verify_board_decision_nostr_event(ev, args.board_id, expect_kind=DRAFT_NOSTR_KIND())
         if d is None:
             skipped += 1
         else:
@@ -2653,7 +2706,7 @@ def cmd_board_draft_fetch(args):
         return
     if policy is not None:
         print('草案（回覧中）の threshold 表示は取得できた草案に基づく暫定です'
-              '（草案は成立の証拠ではありません — 成立の公開宣言は kind 30103）')
+              '（草案は成立の証拠ではありません — 成立の公開宣言は kind 30110）')
     for d in merged:
         ca = time.strftime('%Y-%m-%d', time.localtime(d['created_at']))
         # v0.19 (spec §24.2): 期限切れ草案に [期限切れ] マーカー（表示のみ、
@@ -2684,15 +2737,15 @@ def cmd_board_draft_fetch(args):
 
 
 def cmd_board_fetch_all(args):
-    """board の決定公開イベントを kind 横断 (30103+30104) で 1 回の REQ で購読し、
+    """board の決定公開イベントを kind 横断 (30110+30111) で 1 回の REQ で購読し、
     同一コアの草案・完成を統合表示する（spec §22）。
 
     board_decide_fetch / board_draft_fetch は残し、これは統合ビュー。検証は
     verify_board_decision_nostr_event(ev, board_id, expect_kind=ev['kind']) で
-    kind ホワイトリスト {30103, 30104} のみ受理。検証済み決定のコピーに
+    kind ホワイトリスト {30110, 30111} のみ受理。検証済み決定のコピーに
     nostr_kind を付与して merge_decision_approvals に渡し（新規純粋関数なし）、
-    merged レコードに finalized（30103 を含むか）を付記する。
-    --policy: 成立済みは fetch 集合内の 30103 決定で時点解決（§20.2）、
+    merged レコードに finalized（30110 を含むか）を付記する。
+    --policy: 成立済みは fetch 集合内の 30110 決定で時点解決（§20.2）、
     草案は現行政策のみ（§21.5）。--out は内部マーカーを剥がしたプレーン決定
     JSON を <core_hash>.json で保存（board_cosign / board_read --governance
     --decisions 互換。fetch 時点のスナップショット）。
@@ -2715,13 +2768,13 @@ def cmd_board_fetch_all(args):
             print('policy の board_id が取得対象の board_id と一致しません',
                   file=sys.stderr)
             sys.exit(1)
-    kinds = [DECISION_NOSTR_KIND, DRAFT_NOSTR_KIND]
+    kinds = [DECISION_NOSTR_KIND(), DRAFT_NOSTR_KIND()]
     filt = {'kinds': kinds, '#h': [args.board_id], 'limit': args.limit}
     sub_id = secrets.token_hex(8)
     events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=secret if args.auth else None)
     valid, skipped = [], 0
     for ev in events:
-        if ev.get('kind') not in (DECISION_NOSTR_KIND, DRAFT_NOSTR_KIND):
+        if ev.get('kind') not in (DECISION_NOSTR_KIND(), DRAFT_NOSTR_KIND()):
             skipped += 1
             continue
         d = verify_board_decision_nostr_event(ev, args.board_id,
@@ -2739,23 +2792,23 @@ def cmd_board_fetch_all(args):
         kinds_by_core.setdefault(decision_core_hash(dc), set()).add(dc['nostr_kind'])
     merged = merge_decision_approvals(valid)
     for rec in merged:
-        rec['finalized'] = DECISION_NOSTR_KIND in kinds_by_core[decision_core_hash(rec)]
+        rec['finalized'] = DECISION_NOSTR_KIND() in kinds_by_core[decision_core_hash(rec)]
     if not merged:
-        print(f'{len(events)} 件のイベントを取得: 有効な決定（30103/30104）はありませんでした（{skipped} 件をスキップ）')
+        print(f'{len(events)} 件のイベントを取得: 有効な決定（30110/30111）はありませんでした（{skipped} 件をスキップ）')
         return
     if policy is not None:
         print('threshold 表示は取得できた決定に基づく暫定です'
               '（権威ある判定は board_read --governance）')
         if any(not r.get('finalized') for r in merged):
             print('草案（回覧中）の threshold 表示は取得できた草案に基づく暫定です'
-                  '（草案は成立の証拠ではありません — 成立の公開宣言は kind 30103）')
+                  '（草案は成立の証拠ではありません — 成立の公開宣言は kind 30110）')
     finalized_only = [r for r in merged if r.get('finalized')]
     for rec in merged:
         ca = time.strftime('%Y-%m-%d', time.localtime(rec['created_at']))
         core = decision_core_hash(rec)
         tag = '成立済み' if rec['finalized'] else '草案（回覧中）'
         # v0.19 (spec §24.2): 草案フェーズのみに [期限切れ]。同一コアに期限切れ
-        # 30104 と 30103 が混在した場合は「成立済み」表示が優先（期限は草案
+        # 30111 と 30110 が混在した場合は「成立済み」表示が優先（期限は草案
         # フェーズを殺しただけ — 成立は §20 の不変性ルールで恒久的）。
         expired = (' [期限切れ]'
                    if (not rec['finalized']
@@ -2882,7 +2935,7 @@ def draft_notif_record(notif_dir, core, reason, recipient_hex, sender_npub, now)
 def cmd_board_draft_notify(args):
     """期限間近の草案を発行者（草案イベントの publisher）に NIP-17 DM で通知する（spec §25）。
 
-    board_draft_fetch と同一の REQ（kinds=[30104]・#h=[board_id]、三段階検証＋
+    board_draft_fetch と同一の REQ（kinds=[30111]・#h=[board_id]、三段階検証＋
     同一コアの approvals マージ）を流用。対象は 0 < expires_at - now <= --within
     （既定 86400 = 24h）の草案（reason=expiring_soon）。期限切れは既定で対象外 —
     --include-expired 時のみ対象（reason=expired）。承認者は宛先外（spam 抑制）。
@@ -2921,14 +2974,14 @@ def cmd_board_draft_notify(args):
             print('policy の board_id が取得対象の board_id と一致しません',
                   file=sys.stderr)
             sys.exit(1)
-    filt = {'kinds': [DRAFT_NOSTR_KIND], '#h': [args.board_id], 'limit': args.limit}
+    filt = {'kinds': [DRAFT_NOSTR_KIND()], '#h': [args.board_id], 'limit': args.limit}
     sub_id = secrets.token_hex(8)
     events = nostr_request(args.relay, ['REQ', sub_id, filt],
                            auth_secret=secret if args.auth else None)
     verified = []
     for ev in events:
         d = verify_board_decision_nostr_event(ev, args.board_id,
-                                              expect_kind=DRAFT_NOSTR_KIND)
+                                              expect_kind=DRAFT_NOSTR_KIND())
         if d is None:
             continue
         verified.append((d, ev.get('pubkey', ''), ev.get('created_at', 0)))

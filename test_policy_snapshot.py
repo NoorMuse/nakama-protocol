@@ -116,9 +116,9 @@ def main():
     pol_path = policy_file(policy)
     d1 = make_decision(A)
     approve(d1, B)
-    ev_fin = pub_event(d1, P[0], n.DECISION_NOSTR_KIND)
+    ev_fin = pub_event(d1, P[0], n.DECISION_NOSTR_KIND())
     d2 = make_decision(B, ts=TS + 10)
-    ev_draft = pub_event(d2, P[0], n.DRAFT_NOSTR_KIND)
+    ev_draft = pub_event(d2, P[0], n.DRAFT_NOSTR_KIND())
 
     cmds = {'decide_fetch': (n.cmd_board_decide_fetch, [ev_fin]),
             'draft_fetch': (n.cmd_board_draft_fetch, [ev_draft]),

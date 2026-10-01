@@ -1,7 +1,7 @@
 """鍵スコープの侵害宣言 (spec §13 / v0.8) のオフライン検証。
 
 declare の署名、改ざん・偽造の検出、import（registry 取り込み＋dedup＋--subject）、
-withdraw（撤回→上書き）、compromise_pub（kind 30101 のオフライン構築）、
+withdraw（撤回→上書き）、compromise_pub（kind 30108 のオフライン構築）、
 key_status の評価、旧形式（evidence なし）の後方互換をテストする。
 リレーへの接続は不要。使い方: python3 test_compromise.py
 """
@@ -115,10 +115,10 @@ def main():
     check('7f key_status 行の category が撤回済み',
           len(st['declarations']) == 1 and st['declarations'][0]['category'] == '撤回済み')
 
-    # 8. Nostr 構築（オフライン）: kind=30101、d タグ、id／sig 有効
+    # 8. Nostr 構築（オフライン）: kind=30108、d タグ、id／sig 有効
     fresh = make_declaration(ds, dnpub, snpub, ts=TS + 100)
     ev = n.compromise_nostr_event(fresh, ds)
-    check('8 kind=30101', ev['kind'] == 30101)
+    check('8 kind=30108', ev['kind'] == 30108)
     dtag = [t for t in ev['tags'] if t[0] == 'd']
     check('8 d タグ = subject_hex:declarant_hex',
           len(dtag) == 1 and dtag[0][1] == n.npub_to_hex(snpub) + ':' + n.npub_to_hex(dnpub))

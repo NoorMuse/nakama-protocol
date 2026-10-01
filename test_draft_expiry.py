@@ -197,8 +197,8 @@ def main():
     ok('8: 期限切れ草案の board_draft_pub → 拒否（exit 1、publish せず）')
 
     # 9. board_draft_fetch / board_fetch_all で期限切れ草案に [期限切れ] マーカー
-    ev_expired = n.decision_nostr_event(expired, a[0], kind=n.DRAFT_NOSTR_KIND)
-    ev_live = n.decision_nostr_event(live, a[0], kind=n.DRAFT_NOSTR_KIND)
+    ev_expired = n.decision_nostr_event(expired, a[0], kind=n.DRAFT_NOSTR_KIND())
+    ev_live = n.decision_nostr_event(live, a[0], kind=n.DRAFT_NOSTR_KIND())
     real_req = n.nostr_request
     n.nostr_request = lambda url, req, **k: [ev_expired, ev_live]
     try:
@@ -218,8 +218,8 @@ def main():
         n.nostr_request = real_req
     ok('9: board_draft_fetch / board_fetch_all で期限切れ草案に [期限切れ] マーカー')
 
-    # 10. fetch_all で同一コアに期限切れ 30104 ＋ 30103 混在 → 「成立済み」が優先
-    ev_final = n.decision_nostr_event(expired, a[0], kind=n.DECISION_NOSTR_KIND)
+    # 10. fetch_all で同一コアに期限切れ 30111 ＋ 30110 混在 → 「成立済み」が優先
+    ev_final = n.decision_nostr_event(expired, a[0], kind=n.DECISION_NOSTR_KIND())
     n.nostr_request = lambda url, req, **k: [ev_expired, ev_final]
     try:
         ns = SimpleNamespace(keyfile=kf_a, relay=RELAY, board_id=BOARD_ID,
@@ -231,7 +231,7 @@ def main():
         assert 'マージ後 1 件' in out, '同一コアでマージ'
     finally:
         n.nostr_request = real_req
-    ok('10: 同一コアに期限切れ 30104 ＋ 30103 混在 → 「成立済み」が優先')
+    ok('10: 同一コアに期限切れ 30111 ＋ 30110 混在 → 「成立済み」が優先')
 
     # 11. 純粋関数 draft_is_expired の分離 — 明示 now での判定
     now = int(time.time())

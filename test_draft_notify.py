@@ -49,8 +49,8 @@ def make_draft(signer, expires_at=None, board_id=BOARD_ID, ts=None,
 
 
 def pub_draft_event(d, publisher_secret, created_at=None):
-    """草案 (kind 30104) を publisher_secret で署名した Nostr イベント。"""
-    return n.decision_nostr_event(d, publisher_secret, kind=n.DRAFT_NOSTR_KIND)
+    """草案 (kind 30111) を publisher_secret で署名した Nostr イベント。"""
+    return n.decision_nostr_event(d, publisher_secret, kind=n.DRAFT_NOSTR_KIND())
 
 
 def make_policy(members, threshold=2, board_id=BOARD_ID):

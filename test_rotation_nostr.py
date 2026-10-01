@@ -1,6 +1,6 @@
 """rotation 証明書の Nostr 公開 (spec §17 / v0.12) のオフライン検証。
 
-rotation_nostr_event（kind 30102 のオフライン構築）、verify_rotation_nostr_event
+rotation_nostr_event（kind 30109 のオフライン構築）、verify_rotation_nostr_event
 （三段階検証）、rotation_chain_fetch（チェーン走査・循環/上限ガード）、
 rotate_pub の事前検証（keyfile の鍵 ≠ old_npub → publish しない）、
 rotate_fetch（モックイベントのパース＋ --out の mode 600 保存）をテストする。
@@ -36,7 +36,7 @@ def make_rotation(old, new, ts=TS):
             'old_sig': n.sign_schnorr(old[0], msg).hex()}
 
 
-def pub_event_for(rot, old, ts=None, kind=n.ROTATION_NOSTR_KIND,
+def pub_event_for(rot, old, ts=None, kind=n.ROTATION_NOSTR_KIND(),
                   d_tag=None, signer=None):
     """rotation 証明書を包む Nostr イベントを署名つきで作る（リレー経由相当）。"""
     content = json.dumps(rot, sort_keys=True, separators=(',', ':'))
@@ -70,9 +70,9 @@ def main():
     rot = make_rotation(A, B)
     old_hex = n.npub_to_hex(A[1])
 
-    print('case 1: rotation_nostr_event — kind=30102、d タグ=old_hex、id/sig 有効、content=canonical JSON')
+    print('case 1: rotation_nostr_event — kind=30109、d タグ=old_hex、id/sig 有効、content=canonical JSON')
     ev = n.rotation_nostr_event(rot, A[0])
-    assert ev['kind'] == n.ROTATION_NOSTR_KIND == 30102
+    assert ev['kind'] == n.ROTATION_NOSTR_KIND() == 30109
     assert ev['tags'] == [['d', old_hex]]
     assert n.verify_event_sig(ev), 'Nostr 署名が無効'
     assert json.loads(ev['content']) == rot

@@ -1,10 +1,10 @@
 """cosign 回覧の Nostr 化 (spec §21 / v0.16) のオフライン検証。
 
-decision_nostr_event の kind パラメータ化（30103/30104）、
-verify_board_decision_nostr_event の kind 引数化、DRAFT_NOSTR_KIND=30104 の
+decision_nostr_event の kind パラメータ化（30110/30111）、
+verify_board_decision_nostr_event の kind 引数化、DRAFT_NOSTR_KIND=30111 の
 草案イベント構築・検証、方式 B の往復（cosign 追記 → 自分のスロットに再公開 →
 fetch マージで approvals 増）、board_draft_pub の無効草案拒否、board_draft_fetch
---policy の「草案」マーカー表示、草案 → board_decide_pub（30103）の core_hash 一致
+--policy の「草案」マーカー表示、草案 → board_decide_pub（30110）の core_hash 一致
 をテストする。リレーへの接続は不要（nostr_request / nostr_publish をモック）。
 使い方: python3 test_draft_nostr.py
 """
@@ -81,31 +81,31 @@ def main():
     a, b, c = keypair(), keypair(), keypair()
     d = make_draft(a)
 
-    # 1. draft イベント構築（kind 30104・d タグ=core_hash・h タグ=board_id・署名者 == publisher）
-    ev = n.decision_nostr_event(d, a[0], kind=n.DRAFT_NOSTR_KIND)
-    assert ev['kind'] == 30104
+    # 1. draft イベント構築（kind 30111・d タグ=core_hash・h タグ=board_id・署名者 == publisher）
+    ev = n.decision_nostr_event(d, a[0], kind=n.DRAFT_NOSTR_KIND())
+    assert ev['kind'] == 30111
     dtags = [t[1] for t in ev['tags'] if t[0] == 'd']
     htags = [t[1] for t in ev['tags'] if t[0] == 'h']
     assert dtags == [n.decision_core_hash(d)], 'd タグは core_hash'
     assert htags == [BOARD_ID], 'h タグは board_id'
     assert ev['pubkey'] == a[2], '署名者は publisher'
     assert n.verify_event_sig(ev)
-    ok('draft イベント構築（kind 30104・d=core_hash・h=board_id・署名者=publisher）')
+    ok('draft イベント構築（kind 30111・d=core_hash・h=board_id・署名者=publisher）')
 
     # 2. 正常な draft イベントの検証通過（kind 引数化）
-    back = n.verify_board_decision_nostr_event(ev, BOARD_ID, expect_kind=n.DRAFT_NOSTR_KIND)
+    back = n.verify_board_decision_nostr_event(ev, BOARD_ID, expect_kind=n.DRAFT_NOSTR_KIND())
     assert back is not None and back['decision'] == 'admit'
-    # kind が違えば拒否（既定値 30103 で草案は通らない）
+    # kind が違えば拒否（既定値 30110 で草案は通らない）
     assert n.verify_board_decision_nostr_event(ev, BOARD_ID) is None
-    # kind 30103 イベントを草案期待で拒否
+    # kind 30110 イベントを草案期待で拒否
     ev103 = n.board_decision_nostr_event(d, a[0])
-    assert n.verify_board_decision_nostr_event(ev103, BOARD_ID, expect_kind=n.DRAFT_NOSTR_KIND) is None
-    ok('kind 引数化した verify（30104 通過・既定 30103 で草案拒否・30103 を草案期待で拒否）')
+    assert n.verify_board_decision_nostr_event(ev103, BOARD_ID, expect_kind=n.DRAFT_NOSTR_KIND()) is None
+    ok('kind 引数化した verify（30111 通過・既定 30110 で草案拒否・30110 を草案期待で拒否）')
 
     # 3. 別の publisher の同コア草案 2 イベントの approvals マージ
     d2 = make_draft(a, extra_approvals=(b,))  # 承認 b つきの同コア版
-    ev2 = n.decision_nostr_event(d2, b[0], kind=n.DRAFT_NOSTR_KIND)
-    got = [n.verify_board_decision_nostr_event(e, BOARD_ID, expect_kind=n.DRAFT_NOSTR_KIND)
+    ev2 = n.decision_nostr_event(d2, b[0], kind=n.DRAFT_NOSTR_KIND())
+    got = [n.verify_board_decision_nostr_event(e, BOARD_ID, expect_kind=n.DRAFT_NOSTR_KIND())
            for e in (ev, ev2)]
     assert all(got)
     merged = n.merge_decision_approvals(got)
@@ -122,7 +122,7 @@ def main():
         json.dump(pol, f)
     evs = [ev]
     real_req = n.nostr_request
-    n.nostr_request = lambda url, req, **k: list(evs) if req[2]['kinds'] == [30104] else []
+    n.nostr_request = lambda url, req, **k: list(evs) if req[2]['kinds'] == [30111] else []
     try:
         ns = SimpleNamespace(keyfile=make_keyfile(tmpd, c[0]), relay=RELAY,
                              board_id=BOARD_ID, limit=20, auth=False, out=None,
@@ -156,7 +156,7 @@ def main():
         code, out, _ = run_cmd(n.cmd_board_draft_pub, ns_pub)
         assert code == 0 and published
         ev_rep = published[0][1]
-        assert ev_rep['kind'] == 30104 and ev_rep['pubkey'] == b[2]
+        assert ev_rep['kind'] == 30111 and ev_rep['pubkey'] == b[2]
         # fetch: publisher a の旧版 + publisher b の追記版
         evs = [ev, ev_rep]
         n.nostr_request = lambda url, req, **k: list(evs)
@@ -190,22 +190,22 @@ def main():
     # 7. d タグ改ざんの拒否
     tampered = dict(ev)
     tampered['tags'] = [['d', 'deadbeef' * 4], ['h', BOARD_ID]]
-    tampered = n.sign_event(a[0], int(time.time()), n.DRAFT_NOSTR_KIND,
+    tampered = n.sign_event(a[0], int(time.time()), n.DRAFT_NOSTR_KIND(),
                             tampered['tags'],
                             json.dumps(d, sort_keys=True, separators=(',', ':'),
                                        ensure_ascii=False))
     assert n.verify_board_decision_nostr_event(tampered, BOARD_ID,
-                                              expect_kind=n.DRAFT_NOSTR_KIND) is None
+                                              expect_kind=n.DRAFT_NOSTR_KIND()) is None
     ok('d タグ改ざんの拒否')
 
-    # 8. 草案 → threshold 達成 → board_decide_pub（30103）→ core_hash 一致
+    # 8. 草案 → threshold 達成 → board_decide_pub（30110）→ core_hash 一致
     d_full = make_draft(a, extra_approvals=(b,))
     pol2 = make_policy([a, b, c], threshold=2)
     tmpd = tempfile.mkdtemp()
     pol2_path = os.path.join(tmpd, 'policy2.json')
     with open(pol2_path, 'w') as f:
         json.dump(pol2, f)
-    draft_full = n.decision_nostr_event(d_full, a[0], kind=n.DRAFT_NOSTR_KIND)
+    draft_full = n.decision_nostr_event(d_full, a[0], kind=n.DRAFT_NOSTR_KIND())
     n.nostr_request = lambda url, req, **k: list([draft_full])
     try:
         ns3 = SimpleNamespace(keyfile=make_keyfile(tmpd, c[0]), relay=RELAY,
@@ -227,13 +227,13 @@ def main():
         code, out, _ = run_cmd(n.cmd_board_decide_pub, ns4)
         assert code == 0
         ev103 = published[0][1]
-        assert ev103['kind'] == 30103
+        assert ev103['kind'] == 30110
         d103 = n.verify_board_decision_nostr_event(ev103, BOARD_ID)
         assert d103 is not None
         assert n.decision_core_hash(d103) == core_draft, '草案と完成決定の core_hash 一致'
     finally:
         n.nostr_publish = real_pub
-    ok('草案 → threshold 達成 → board_decide_pub（30103）→ core_hash 一致')
+    ok('草案 → threshold 達成 → board_decide_pub（30110）→ core_hash 一致')
 
     print(f'\n{len(passed)} tests passed.')
 

@@ -1,6 +1,6 @@
 """revocation UX 改善 (spec §12 / v0.7) のオフライン検証。
 
-revoke --reason、revoke_import、revoke_pub（kind 30100 のオフライン構築）、
+revoke --reason、revoke_import、revoke_pub（kind 30107 のオフライン構築）、
 revoke_fetch（モックイベントのパース＋取り込み）をテストする。
 リレーへの接続は不要。使い方: python3 test_revocation.py
 """
@@ -117,10 +117,10 @@ def main():
         'reason="" と旧形式のメッセージが不一致'
     ok('後方互換')
 
-    print('case 7: revoke_pub 構築（オフライン）— kind=30100、d タグ = bond_hash、id/sig 有効')
+    print('case 7: revoke_pub 構築（オフライン）— kind=30107、d タグ = bond_hash、id/sig 有効')
     rev7 = make_revocation(A[0], A[1], reason='互いの合意')
     ev = n.revocation_nostr_event(rev7, A[0])
-    assert ev['kind'] == 30100, f"kind が 30100 でない: {ev['kind']}"
+    assert ev['kind'] == 30107, f"kind が 30107 でない: {ev['kind']}"
     assert ev['tags'] == [['d', BOND_HASH]], f"d タグ不正: {ev['tags']}"
     assert n.verify_event_sig(ev), '構築イベントの id/sig が無効'
     assert json.loads(ev['content']) == rev7, 'content から revocation が復元できない'

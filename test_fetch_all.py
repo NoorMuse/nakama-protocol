@@ -1,7 +1,7 @@
-"""board_fetch_all（30103+30104 横断 fetch、spec §22 / v0.17）のオフライン検証。
+"""board_fetch_all（30110+30111 横断 fetch、spec §22 / v0.17）のオフライン検証。
 
-1 回の REQ で kinds=[30103, 30104] を購読すること、kind 横断の approvals
-マージ（npub dedup）、finalized 判定（30103 あり→成立済み、30104 のみ→草案）、
+1 回の REQ で kinds=[30110, 30111] を購読すること、kind 横断の approvals
+マージ（npub dedup）、finalized 判定（30110 あり→成立済み、30111 のみ→草案）、
 --policy の意味論分離（成立済みは時点解決、草案は現行政策のみ）、--out の
 内部マーカー剥がし、無効イベントのスキップをテストする。
 リレーへの接続は不要（nostr_request をモック）。
@@ -61,7 +61,7 @@ def make_decision(signer, ts=TS, kind='admit', payload=None):
 
 def same_core_variant(signer, ref):
     """ref と同一コアハッシュ（board_id/decision/created_at/payload 一致）の
-    別 approvals 版。30103/30104 の横断マージ用。"""
+    別 approvals 版。30110/30111 の横断マージ用。"""
     d = {'protocol': 'nakama', 'version': 1, 'type': 'board-decision',
          'board_id': ref['board_id'], 'relay': ref['relay'],
          'decision': ref['decision'], 'payload': ref['payload'],
@@ -69,7 +69,7 @@ def same_core_variant(signer, ref):
     return approve(d, signer)
 
 
-def pub_event(d, publisher, kind=n.DECISION_NOSTR_KIND, ts=None):
+def pub_event(d, publisher, kind=n.DECISION_NOSTR_KIND(), ts=None):
     content = json.dumps(d, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
     tags = [['d', n.decision_core_hash(d)], ['h', d['board_id']]]
     return n.sign_event(publisher, ts or int(time.time()), kind, tags, content)
@@ -125,18 +125,18 @@ def main():
             json.dump(pol, f)
         return fp
 
-    print('case 1: 混在 fetch — 30103 と 30104 が受理され、他 kind はスキップ。'
+    print('case 1: 混在 fetch — 30110 と 30111 が受理され、他 kind はスキップ。'
           '1 回の REQ で両 kind を購読')
     d1 = make_decision(A)
     approve(d1, B)
     d2 = make_decision(C, ts=TS + 10)
     ev_fin = pub_event(d1, P[0])
-    ev_draft = pub_event(d2, P[0], kind=n.DRAFT_NOSTR_KIND)
+    ev_draft = pub_event(d2, P[0], kind=n.DRAFT_NOSTR_KIND())
     ev_other = pub_event(d1, P[0], kind=9000)  # whitlist 外
     code, out, err, req = fetch_all([ev_fin, ev_draft, ev_other])
     assert code == 0, (code, err)
     assert req[0] == 'REQ', req
-    assert req[2]['kinds'] == [n.DECISION_NOSTR_KIND, n.DRAFT_NOSTR_KIND], req[2]
+    assert req[2]['kinds'] == [n.DECISION_NOSTR_KIND(), n.DRAFT_NOSTR_KIND()], req[2]
     assert req[2]['#h'] == [BOARD_ID], req[2]
     assert '成立済み' in out, out
     assert '草案（回覧中）' in out, out
@@ -144,24 +144,24 @@ def main():
     assert 'スキップ 1 件' in out, out
     ok('混在 fetch + 他 kind スキップ + 単一 REQ')
 
-    print('case 2: kind 横断マージ — 同一コアの 30103 と 30104 の approvals が '
+    print('case 2: kind 横断マージ — 同一コアの 30110 と 30111 の approvals が '
           'npub dedup で統合される')
     base = make_decision(A)
-    approve(base, B)                      # 30103 版: A, B
-    draft_v = same_core_variant(C, base)  # 30104 版: C → 合計 {A,B,C}
+    approve(base, B)                      # 30110 版: A, B
+    draft_v = same_core_variant(C, base)  # 30111 版: C → 合計 {A,B,C}
     ev1 = pub_event(base, P[0])
-    ev2 = pub_event(draft_v, P[0], kind=n.DRAFT_NOSTR_KIND)
+    ev2 = pub_event(draft_v, P[0], kind=n.DRAFT_NOSTR_KIND())
     code, out, err, _ = fetch_all([ev1, ev2])
     assert code == 0, (code, err)
     assert 'approvals 3 つ' in out, out
     assert 'マージ後 1 件' in out, out
     ok('横断マージ')
 
-    print('case 3: finalized 判定 — 30103 含むコアは成立済み、30104 のみは草案（回覧中）')
+    print('case 3: finalized 判定 — 30110 含むコアは成立済み、30111 のみは草案（回覧中）')
     d_fin = make_decision(A)
     d_draft = make_decision(B, ts=TS + 20)
     code, out, err, _ = fetch_all([pub_event(d_fin, P[0]),
-                                   pub_event(d_draft, P[0], kind=n.DRAFT_NOSTR_KIND)])
+                                   pub_event(d_draft, P[0], kind=n.DRAFT_NOSTR_KIND())])
     assert code == 0, (code, err)
     fin_line = [l for l in out.splitlines() if '成立済み' in l]
     draft_line = [l for l in out.splitlines() if '草案（回覧中）' in l]
@@ -175,11 +175,11 @@ def main():
     pol23 = make_policy([A, B, C], threshold=2)
     pf = policy_file(pol23)
     d_ok = make_decision(A)
-    approve(d_ok, B)                       # 30103、承認 2 → 2/3 充足
+    approve(d_ok, B)                       # 30110、承認 2 → 2/3 充足
     d_draft_pol = make_decision(C, ts=TS + 30)
-    # 30104、承認 1 → 現行政策で 1/3 不足
+    # 30111、承認 1 → 現行政策で 1/3 不足
     evs = [pub_event(d_ok, P[0]),
-           pub_event(d_draft_pol, P[0], kind=n.DRAFT_NOSTR_KIND)]
+           pub_event(d_draft_pol, P[0], kind=n.DRAFT_NOSTR_KIND())]
     code, out, err, _ = fetch_all(evs, policy_path=pf)
     assert code == 0, (code, err)
     assert 'threshold 2/3 充足' in out, out
@@ -188,26 +188,26 @@ def main():
     assert '暫定です' in out, out
     ok('--policy 表示')
 
-    print('case 5: 草案→成立の対応付け — 同一コアの草案と 30103 は 1 レコードに'
+    print('case 5: 草案→成立の対応付け — 同一コアの草案と 30110 は 1 レコードに'
           '統合され二重表示されない')
     base5 = make_decision(A)
     approve(base5, B)
     draft5 = same_core_variant(C, base5)
     code, out, err, _ = fetch_all([pub_event(base5, P[0]),
-                                   pub_event(draft5, P[0], kind=n.DRAFT_NOSTR_KIND)])
+                                   pub_event(draft5, P[0], kind=n.DRAFT_NOSTR_KIND())])
     assert code == 0, (code, err)
     assert out.count('admit') == 1, out   # 決定行は 1 行のみ
     assert '成立済み' in out and '草案（回覧中）' not in out, out
     assert 'マージ後 1 件' in out, out
     ok('草案と成立の統合')
 
-    print('case 6: expect_kind 不一致 — 30104 イベントを 30103 として検証すると拒否')
-    ev304 = pub_event(make_decision(A), P[0], kind=n.DRAFT_NOSTR_KIND)
+    print('case 6: expect_kind 不一致 — 30111 イベントを 30110 として検証すると拒否')
+    ev304 = pub_event(make_decision(A), P[0], kind=n.DRAFT_NOSTR_KIND())
     assert n.verify_board_decision_nostr_event(ev304, BOARD_ID,
-                                               expect_kind=n.DECISION_NOSTR_KIND) is None
+                                               expect_kind=n.DECISION_NOSTR_KIND()) is None
     # sanity: 期待 kind が一致すれば受理
     assert n.verify_board_decision_nostr_event(ev304, BOARD_ID,
-                                               expect_kind=n.DRAFT_NOSTR_KIND) is not None
+                                               expect_kind=n.DRAFT_NOSTR_KIND()) is not None
     ok('expect_kind チェック')
 
     print('case 7: --out — 保存 JSON に内部マーカーがなく、プレーン決定として'
@@ -217,7 +217,7 @@ def main():
     draft7 = same_core_variant(C, base7)
     od = os.path.join(tmpd, 'out7')
     code, out, err, _ = fetch_all([pub_event(base7, P[0]),
-                                   pub_event(draft7, P[0], kind=n.DRAFT_NOSTR_KIND)],
+                                   pub_event(draft7, P[0], kind=n.DRAFT_NOSTR_KIND())],
                                   out_dir=od)
     assert code == 0, (code, err)
     files = os.listdir(od)
@@ -242,7 +242,7 @@ def main():
     tampered = make_decision(C, ts=TS + 50)
     content = json.dumps(tampered, sort_keys=True, separators=(',', ':'),
                          ensure_ascii=False)
-    ev_badd = n.sign_event(P[0], int(time.time()), n.DECISION_NOSTR_KIND,
+    ev_badd = n.sign_event(P[0], int(time.time()), n.DECISION_NOSTR_KIND(),
                            [['d', 'ff' * 16], ['h', BOARD_ID]], content)
     code, out, err, _ = fetch_all([ev_good, ev_badsig, ev_badd])
     assert code == 0, (code, err)

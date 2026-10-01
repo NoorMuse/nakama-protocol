@@ -60,7 +60,7 @@ def make_decision(signer, board_id=BOARD_ID, ts=TS, kind='admit', payload=None):
 def pub_event(d, publisher, ts=None):
     content = json.dumps(d, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
     tags = [['d', n.decision_core_hash(d)], ['h', d['board_id']]]
-    return n.sign_event(publisher, ts or int(time.time()), n.DECISION_NOSTR_KIND,
+    return n.sign_event(publisher, ts or int(time.time()), n.DECISION_NOSTR_KIND(),
                         tags, content)
 
 

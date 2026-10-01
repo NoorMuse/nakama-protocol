@@ -1,7 +1,7 @@
 """board-decision の Nostr 公開 (spec §19 / v0.14) のオフライン検証。
 
 decision_core_hash（approvals 追記でも不変）、board_decision_nostr_event
-（kind 30103、d タグ=コアハッシュ、h タグ=board_id、署名者=publisher）、
+（kind 30110、d タグ=コアハッシュ、h タグ=board_id、署名者=publisher）、
 verify_board_decision_nostr_event（三段階検証）、merge_decision_approvals
 （同一コアの approvals マージ・npub で dedup）、board_decide_fetch
 （モックイベントのパース＋ --out の <core_hash>.json 保存）をテストする。
@@ -42,7 +42,7 @@ def make_decision(signer, board_id=BOARD_ID, ts=TS):
                            'sig': n.sign_schnorr(signer[0], msg).hex()}]}
 
 
-def pub_event_for(d, signer, ts=None, kind=n.DECISION_NOSTR_KIND,
+def pub_event_for(d, signer, ts=None, kind=n.DECISION_NOSTR_KIND(),
                   d_tag=None, h_tag=None):
     """board-decision を包む Nostr イベントを署名つきで作る（リレー経由相当）。"""
     content = json.dumps(d, sort_keys=True, separators=(',', ':'),
@@ -86,9 +86,9 @@ def main():
     assert n.decision_core_hash(d2) == core
     ok('cosign 追記でも d スロット安定')
 
-    print('case 2: board_decision_nostr_event — kind 30103、d/h タグ、署名者は publisher')
+    print('case 2: board_decision_nostr_event — kind 30110、d/h タグ、署名者は publisher')
     ev = n.board_decision_nostr_event(d, C[0])  # publisher は第三者 C（意図的）
-    assert ev['kind'] == n.DECISION_NOSTR_KIND == 30103
+    assert ev['kind'] == n.DECISION_NOSTR_KIND() == 30110
     assert ev['tags'] == [['d', core], ['h', BOARD_ID]]
     assert n.verify_event_sig(ev), 'Nostr 署名が無効'
     assert ev['pubkey'] == C[2], '署名者は publisher（決定の署名者ではない、§19.3）'
