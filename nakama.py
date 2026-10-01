@@ -2571,6 +2571,24 @@ def fetch_threshold_status(d: dict, policy: dict, decisions: list):
     return ok, n, len(eligible)
 
 
+def draft_threshold_line(d: dict, ok: bool, n: int, m: int) -> str:
+    """草案の threshold 表示行（spec §21.5 / §29.4）。純粋。
+
+    n/m は fetch_threshold_status で現行政策のみで判定した値（草案の
+    payload が提案する値は判定に使わない — 提案は効力ではない、§29.2）。
+    policy-update 草案には判定基準と提案値の両方を出す:
+    例 `草案: threshold 2/3 不足（現行規約の判定） — 提案値: threshold 2/5`。
+    """
+    status = '充足（成立可能 — board_decide_pub で成立公開）' if ok else '不足'
+    line = f'草案: threshold {n}/{m} {status}'
+    if d.get('decision') == 'policy-update':
+        p = d.get('payload') or {}
+        elig = p.get('eligible') or []
+        line += (f'（現行規約の判定） — '
+                 f'提案値: threshold {p.get("threshold")}/{len(elig)}')
+    return line
+
+
 def save_policy_snapshot(out_dir, policy):
     """fetch 時点の政策スナップショットを保存する (spec §23)。
 
@@ -2686,8 +2704,10 @@ def cmd_board_draft_fetch(args):
     board_decide_fetch と同型（kinds=[30111]。三段階検証＋同一コアの approvals
     マージ＋ --out の <core_hash>.json 保存）。--policy 指定時のみ各草案の
     threshold 充足・不足を表示するが、草案には「草案（回覧中）」のマーカーをつける
-    （§21.5）。草案の時点解決は現行政策のみ — policy-update 決定の草案は扱わず、
-    30110 決定もこの fetch には含まれないため resolve_policy_at は空集合で呼ぶ
+    （§21.5）。草案の時点解決は現行政策のみ — v0.26（§29）で policy-update
+    草案の回覧を解禁: 判定は現行規約の threshold・eligible のみ（草案の
+    提案する値は使わない）、表示は判定基準と提案値の両方を出す。
+    30110 決定はこの fetch には含まれないため resolve_policy_at は空集合で呼ぶ
     （§21.5）。成立の公開宣言は kind 30110 の存在（§21.3）。
     --out と --policy の両指定時は fetch 時点の政策スナップショットを
     policy-snapshot-<ts>.json として保存する（spec §23）。
@@ -2735,9 +2755,8 @@ def cmd_board_draft_fetch(args):
                   f' (created_at {ca}, approvals {len(d.get("approvals", []))} つ)')
         else:
             ok, n, m = fetch_threshold_status(d, policy, [])
-            status = '充足（成立可能 — board_decide_pub で成立公開）' if ok else '不足'
             print(f'[草案 {decision_core_hash(d)}]{expired} {d["decision"]}'
-                  f' (created_at {ca}, approvals {n} つ, 草案: threshold {n}/{m} {status})')
+                  f' (created_at {ca}, approvals {n} つ, {draft_threshold_line(d, ok, n, m)})')
     print(f'{len(events)} 件のイベントを取得: 有効 {len(valid)} 件、スキップ {skipped} 件、'
           f'マージ後 {len(merged)} 件')
     if args.out:
@@ -2841,9 +2860,8 @@ def cmd_board_fetch_all(args):
                   f' (created_at {ca}, approvals {n} つ, threshold {n}/{m} {status})')
         else:
             ok, n, m = fetch_threshold_status(rec, policy, [])
-            status = '充足（成立可能 — board_decide_pub で成立公開）' if ok else '不足'
             print(f'[{tag} {core}]{expired} {rec["decision"]}'
-                  f' (created_at {ca}, approvals {n} つ, 草案: threshold {n}/{m} {status})')
+                  f' (created_at {ca}, approvals {n} つ, {draft_threshold_line(rec, ok, n, m)})')
     print(f'{len(events)} 件のイベントを取得: 有効 {len(valid)} 件、スキップ {skipped} 件、'
           f'マージ後 {len(merged)} 件')
     if args.out:
@@ -2903,7 +2921,8 @@ def draft_notify_message(d, core, reason, relay, policy=None):
     """DM 平文（kind 14 rumor の content）。形式は spec §25.1 に固定（純粋）。
 
     policy 指定時のみ threshold 行（fetch_threshold_status で判定 —
-    §21.5 と同じく草案は現行政策のみ、policy-update 決定の草案は扱わない）。
+    §21.5 と同じく草案は現行政策のみ。v0.26（§29）で policy-update 草案の
+    回覧を解禁 — 判定は現行規約のみ、提案値は判定に使わない）。
     """
     header = '[nakama] draft expiring soon' if reason == 'expiring_soon' \
         else '[nakama] draft expired'
