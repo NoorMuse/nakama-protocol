@@ -428,6 +428,30 @@ and DM delivery/authorship (`check_dm`'s territory).
 `python3 conformance.py selftest` also covers `check_dm_fetch` with
 reference reports produced in-process by nakama.py's own cmd_dm_fetch
 (offline: dm_incoming monkeypatched, no relay contact).
+
+Board-read report conformance:
+
+    python3 conformance.py check_board_read <report1.txt> [...]
+
+Each file is the saved stdout of `nakama.py board_read` (not the
+`--governance` mode). Verifies the report is internally consistent:
+either the single empty-board line (`投稿はまだありません`), or one
+block per post — a header `--- [YYYY-MM-DD HH:MM:SS] <16 hex>...`
+(optionally suffixed with ` ⚠ compromised?`, the §14.2 advisory note for
+issuers with an active local compromise declaration) followed by the
+post's content (one or more lines; a block ends at the next header).
+The timestamp must be a valid calendar datetime and the author prefix
+16 hex chars; every block must carry at least one content line.
+Explicitly out of scope: the timestamp's timezone/value (the reference
+CLI prints local time), post ordering, author truncation semantics,
+post delivery/authorship (event signature validity is `check_board`'s
+territory), and whether a ` ⚠ compromised?` note is deserved (advisory
+display only — the checker validates the suffix's spelling, not its
+truth).
+
+`python3 conformance.py selftest` also covers `check_board_read` with
+reference reports produced in-process by nakama.py's own cmd_board_read
+(offline: nostr_request monkeypatched, no relay contact).
 """
 
 import json
@@ -2521,6 +2545,95 @@ def check_notif_status_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_board_read: board_read report consistency ----------
+
+# board_read's stdout is a short human-readable listing of kind-9 board
+# posts, and its grammar is fixed (spec §4). check_board_read verifies
+# that a saved report is internally consistent: either the single
+# empty-board line ('投稿はまだありません'), or one block per post — a
+# header '--- [YYYY-MM-DD HH:MM:SS] <author pubkey first 16 hex>...'
+# (optionally suffixed with ' ⚠ compromised?' when the local compromise
+# registry holds an active declaration for the issuer, §14.2) followed by
+# the post's content (one or more lines; blank lines and multi-line
+# content are fine — a block ends at the next header line). The timestamp
+# must parse as a calendar datetime; the author prefix must be 16 hex
+# chars (case-insensitive). Every block must carry at least one content
+# line: a header immediately followed by another header (or EOF) is an
+# empty-content block and is rejected. Explicitly out of scope: the
+# timestamp's timezone/value (the reference CLI prints local time — the
+# checker validates grammar, never the zone or the instant), post
+# ordering (the reference CLI sorts by event created_at), author
+# truncation semantics, post delivery (spec §25.2's claim model), event
+# signature validity (check_board's territory), and whether a
+# ' ⚠ compromised?' note is deserved (advisory display — the checker only
+# validates the suffix's spelling, not its truth).
+
+_BRD_EMPTY = '投稿はまだありません'
+_BRD_HEADER = re.compile(
+    r'^--- \[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] '
+    r'([0-9a-fA-F]{16})\.\.\.( ⚠ compromised\?)?$')
+
+
+def conform_board_read_report(text: str):
+    """Verify a saved `nakama.py board_read` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) == 1 and lines[0] == _BRD_EMPTY:
+        info.append('no posts')
+        return True, errs, info
+    if lines[0] == _BRD_EMPTY:
+        return False, ['empty-report line appears together with '
+                       'post blocks'], info
+    blocks: list[list] = []
+    for j, ln in enumerate(lines):
+        m = _BRD_HEADER.match(ln)
+        if m:
+            blocks.append([j + 1, m.group(1), m.group(2), []])
+            continue
+        if not blocks:
+            return False, [f'line {j + 1}: first line must be a post '
+                           'header or the empty-board line'], info
+        blocks[-1][3].append(ln)
+    for lineno, ts, author, content in blocks:
+        if not _ns_valid_ts(ts):
+            errs.append(f'line {lineno}: invalid display timestamp '
+                        f'{ts!r}')
+        if not content:
+            errs.append(f'line {lineno}: post block has no content '
+                        'lines')
+    if not errs:
+        info.append(f'{len(blocks)} post blocks')
+    return (not errs), errs, info
+
+
+def check_board_read_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_board_read_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- check_dm_fetch: dm_fetch report consistency ----------
 
 # dm_fetch's stdout is a short human-readable listing of decrypted rumors,
@@ -4464,6 +4577,122 @@ def selftest() -> int:
     print(f'--- dm-fetch {dmf_total - dmf_fails}/{dmf_total} passed ---')
     fails += dmf_fails
 
+    # ---------- check_board_read: board_read report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_board_read, with nostr_request monkeypatched to return crafted
+    # kind-9 events (no relay contact); hand-mutated reports that break the
+    # header/content grammar must be rejected.
+    brd_fails = 0
+
+    def _brd_read(events, compromised_npub=None):
+        orig_req = nakama.nostr_request
+        orig_warn = nakama.key_compromise_warnings
+        nakama.nostr_request = lambda *a, **k: events
+        if compromised_npub is not None:
+            nakama.key_compromise_warnings = (
+                lambda n, r=None: ['warn'] if n == compromised_npub else [])
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                nakama.cmd_board_read(SimpleNamespace(
+                    relay='wss://example.invalid', board_id='nakama-abc123',
+                    since=None, limit=20, governance=None, auth=False))
+            return buf.getvalue()
+        finally:
+            nakama.nostr_request = orig_req
+            nakama.key_compromise_warnings = orig_warn
+
+    brd_e2e = []
+    _brd_s_1, _np_brd_1 = _key()
+    _brd_hx_1 = nakama.hexpub_of(_brd_s_1)
+    _brd_s_2, _np_brd_2 = _key()
+    _brd_hx_2 = nakama.hexpub_of(_brd_s_2)
+    _brd_s_c, _np_brd_c = _key()
+    _brd_hx_c = nakama.hexpub_of(_brd_s_c)
+
+    def _brd_ev(secret, hexpub, ts, content):
+        return nakama.sign_event(secret, ts, 9, [['h', 'nakama-abc123']],
+                                 content)
+
+    brd_e2e.append(('no events -> empty line', _brd_read([])))
+    brd_e2e.append(('one event',
+                    _brd_read([_brd_ev(_brd_s_1, _brd_hx_1, 1759276800,
+                                       'hello, board')])))
+    brd_e2e.append(('two events, multi-line incl. blank',
+                    _brd_read([_brd_ev(_brd_s_1, _brd_hx_1, 1759276800,
+                                       'first post'),
+                               _brd_ev(_brd_s_2, _brd_hx_2, 1759363200,
+                                       'line one\n\nline three\n'
+                                       '--- not a header')])))
+    brd_e2e.append(('compromised issuer suffix',
+                    _brd_read([_brd_ev(_brd_s_c, _brd_hx_c, 1759276800,
+                                       'flagged post')],
+                               compromised_npub=_np_brd_c)))
+
+    for name, rep in brd_e2e:
+        ok, errs, info = conform_board_read_report(rep)
+        print(f'board-read-e2e/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        brd_fails += 0 if ok else 1
+
+    # hand-crafted positives
+    bh1 = '--- [2026-10-01 12:00:00] ' + 'ab' * 8 + '...'
+    bh2 = '--- [2026-10-02 01:02:03] ' + 'CD' * 8 + '...'
+    brd_pos = [
+        ('empty report', '投稿はまだありません\n'),
+        ('one block', bh1 + '\nhello\n'),
+        ('multi-line incl. blank', bh1 + '\nline one\n\nline three\n'),
+        ('uppercase hex author', bh2 + '\nupper hex ok\n'),
+        ('content line starting with ---', bh1 + '\n--- not a header\n'),
+        ('compromised suffix',
+         bh1 + ' ⚠ compromised?\nflagged content\n'),
+    ]
+    for name, rep in brd_pos:
+        ok, errs, info = conform_board_read_report(rep)
+        print(f'board-read/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        brd_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    brd_neg = []
+    brd_neg.append(('empty report', ''))
+    brd_neg.append(('empty line plus block',
+                    '投稿はまだありません\n' + bh1 + '\nhello\n'))
+    brd_neg.append(('invalid timestamp',
+                    bh1.replace('2026-10-01 12:00:00',
+                                '2026-13-40 99:99:99') + '\nhello\n'))
+    brd_neg.append(('author not hex',
+                    '--- [2026-10-01 12:00:00] ' + 'zz' * 8 +
+                    '...\nhello\n'))
+    brd_neg.append(('author short',
+                    '--- [2026-10-01 12:00:00] ' + 'ab' * 7 +
+                    '...\nhello\n'))
+    brd_neg.append(('missing ellipsis',
+                    '--- [2026-10-01 12:00:00] ' + 'ab' * 8 +
+                    '\nhello\n'))
+    brd_neg.append(('empty content block', bh1 + '\n' + bh2 + '\nsecond\n'))
+    brd_neg.append(('garbage first line', 'hello\n' + bh1 + '\ncontent\n'))
+    brd_neg.append(('leading blank line', '\n' + bh1 + '\nhello\n'))
+    brd_neg.append(('bad suffix spelling',
+                    bh1 + ' ⚠ compromised!\nhello\n'))
+
+    for name, rep in brd_neg:
+        ok, errs, info = conform_board_read_report(rep)
+        good = not ok
+        print(f'board-read-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            brd_fails += 1
+
+    brd_total = len(brd_e2e) + len(brd_pos) + len(brd_neg)
+    print(f'--- board-read {brd_total - brd_fails}/{brd_total} passed ---')
+    fails += brd_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -4471,7 +4700,7 @@ def selftest() -> int:
     grand = total + dm_total + board_total + dec_total + bond_total \
         + binding_total + live_total + cp_total + rt_total + rv_total \
         + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total \
-        + rl_total + ns_total + dmf_total
+        + rl_total + ns_total + dmf_total + brd_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -4637,6 +4866,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_dm_fetch <report.txt> [...]')
             return 2
         return check_dm_fetch_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_board_read':
+        if len(argv) < 3:
+            print('usage: conformance.py check_board_read <report.txt> [...]')
+            return 2
+        return check_board_read_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -4660,6 +4894,7 @@ def main(argv: list[str]) -> int:
           'check_revoke_list <report.txt> [...] | '
           'check_notif_status <report.txt> [...] | '
           'check_dm_fetch <report.txt> [...] | '
+          'check_board_read <report.txt> [...] | '
           'selftest')
     return 2
 
