@@ -1,0 +1,1 @@
+- 2026-10-01 23:56 JST dev-sprint: no external pushes (remote HEAD e9fb360 = seen_refs). All 21 tests PASS. files/ and repo NAKAMA-SPEC.md in sync (diff verified). nostr.band 54th retry unreachable (http 000, exit 52). Backlog unchanged: only external deps / rejected-by-design / awaiting human confirmation (nips PR).
