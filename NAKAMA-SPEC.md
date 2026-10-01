@@ -1,7 +1,7 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.3
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21）。v0.17 完了 — 30103+30104 横断 fetch の統合（§22）。v0.18 完了 — fetch 時点の政策スナップショットの保存（§23））。v0.19 完了 — 草案の期限（§24）。v0.20 完了 — 草案への自動通知（§25）
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21）。v0.17 完了 — 30103+30104 横断 fetch の統合（§22）。v0.18 完了 — fetch 時点の政策スナップショットの保存（§23））。v0.19 完了 — 草案の期限（§24）。v0.20 完了 — 草案への自動通知（§25））。v0.21 設計中 — kind 30100–30104 の正式割当申請（§26）
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -249,6 +249,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.18**（完了）: fetch 時点の政策スナップショットの保存（§23）。§22.7 のスコープ外項目を昇格。`save_policy_snapshot(out_dir, policy)` ヘルパを追加し、`board_decide_fetch` / `board_draft_fetch` / `board_fetch_all` の 3 コマンドで `--out` と `--policy` の両指定時のみ、検証済みの board-policy を `policy-snapshot-<unixts>.json` としてコピー保存（決定ファイル `<core_hash>.json` とは prefix で区別、board_cosign / board_read --governance --decisions 運用と共存）。検証者はこのファイルを `--policy` に再指定して fetch 時点の threshold 判定を再現できる（§20.2 の時点解決も同一ファイルから再実行で同一結果）。スコープ外（残る）: 草案の期限、草案への自動通知（DM 連携）、kind 30103 / 30104 の正式割当申請。オフライン 12 ケース通過（`test_policy_snapshot.py` 新規）＋全回帰維持。
 - **v0.19**（完了）: 草案の期限（§24）。§22.7 のスコープ外項目を昇格: 決定 payload の任意フィールド `expires_at`（unix 時刻 int、署名対象 — 期限の異なる再発行は別コア＝別 d スロット）。`board_decide --expires-in <秒>` / `--expires-at <unix時刻>`（両指定時は後者優先、`expires_at <= created_at` は拒否。非 int の expires_at も `validate_decision_payload` で拒否）。3 層の強制: `board_cosign` は期限切れ草案への署名を拒否（exit 1、ゾンビ草案対策の主軸）、`board_draft_pub` は期限切れ草案の publish を拒否（exit 1）、`board_draft_fetch` / `board_fetch_all` は期限切れ草案に `[期限切れ]` マーカー（表示のみ、exit 不変。同一コアに期限切れ 30104 と 30103 が混在した場合は「成立済み」表示が優先）。期限は草案（30104）のみ — 成立済み（30103）は §20 の不変性ルールの下で恒久的、`board_read --governance` と `board_decide_pub` は期限を見ない。期限判定は純粋関数 `draft_is_expired(d, now)` に分離。期限なし草案は従来通り無期限（後方互換）。正直に書く: 期限は自己申告（正直な運用者のための仕組み、攻撃者の制約ではない）、期限切れスロットはリレー上に残る（削除はしない）。テスト 11 ケース通過（`test_draft_expiry.py` 新規: 換算・優先・非 int 拒否・created_at 以下拒否・後方互換・cosign 拒否・cosign 回帰・publish 拒否・fetch マーカー 2 系統・成立済み優先・純粋関数の分離）、全スイート回帰維持。スコープ外: 自動通知、kind 正式割当、bond/rotation/revocation への期限、期限切れスロットの自動削除。
 - **v0.20**（完了）: 草案への自動通知（§25）。§24.4 のスコープ外項目を昇格: 新規コマンド `board_draft_notify <relay> <board_id> [--limit] [--auth] [--policy] [--within <秒>] [--include-expired] [--dry-run] [--resend] [--from <npub>]`。30104 fetch を流用し、`0 < expires_at - now <= --within`（既定 24h）の草案を「期限間近」として発行者（草案イベントの publisher）に NIP-17 DM で通知（`nip17_build_seal`/`nip17_build_gift_wrap` + `nostr_publish` 流用、`--auth` 対応）。期限切れは既定で対象外（`--include-expired` で reason=expired のみ対象）、期限なし草案は対象外、承認者は宛先外（spam 抑制）。二重送信防止はローカル送信記録 `~/.config/nakama/draft_notifs/<core_hash>:<reason>.json` で同一 reason の再送を `--within` 以内は抑制（`--resend` で強制再送可）。正直に書く: 通知は気休め（到達保証なし）、誰でも送れる（受け手は `board_draft_fetch` で自分で確認 — 通知は主張であって検証ではない）、spam の悪用可能性（別 reason・別送信者の重複は防げない）。スコープ外: デーモン化・自動スケジューリング、30103 への通知、kind 正式割当、承認者への通知、既読追跡。テスト 9 ケース通過（`test_draft_notify.py`、オフライン）。
+- **v0.21**（設計中）: kind 30100–30104 の正式割当申請（NIP 化）（§26）。§24.4・§25.3 のスコープ外項目を昇格: 5 kinds（revocation 30100 / compromise 30101 / rotation 30102 / decision 30103 / draft 30104、すべて parameterized replaceable）の一覧固定、NIP ドラフト文書（`docs/NIP-nakama.md`）の構成案（概要・kind 一覧・tags/content/署名者/置換ルール・三段階検証・互換性・セキュリティ考慮）、衝突時のフォールバック（kind 定数の再マップ・移行期間の両 kind 購読・公開済みは再公開しない）、手順（repo 内草案→既存採用の確認→nips PR）。正直に書く: 30000–39999 は誰でも使える名前空間のため申請は独占ではなく文書化＋衝突回避、NIP 登録は合意形成であって強制ではなく署名検証が本質、PR 投稿・レビュー対応は人間社会の承認プロセスで 人間の確認が必要。コード変更なし（実装は v0.22 で文書作成）。
 
 ---
 
@@ -1415,7 +1416,7 @@ nakama.py board_fetch_all <relay> <board_id> [--limit N] [--auth] [--policy <pol
 ### 24.4 スコープ外
 
 - ~~草案への自動通知（DM 連携）— 依然として将来候補。~~→ v0.20 で実装（§25）。
-- kind 30103 / 30104 の正式割当申請 — 依然として将来候補。
+- ~~kind 30103 / 30104 の正式割当申請 — 依然として将来候補。~~→ v0.21 で設計（§26）。
 - bond・rotation・revocation への期限（草案のみの機能）。
 - 期限切れスロットの自動削除・リレーへの削除要求。
 
@@ -1481,7 +1482,7 @@ reason=expired の場合は 1 行目が `draft expired` に変わる（`--includ
 
 - デーモン化・自動スケジューリング（実行者の cron に委ねる）。
 - 30103（成立済み）への通知 — 成立は §20 の不変性ルールの下で恒久的。
-- kind 30103 / 30104 の正式割当申請 — 依然として将来候補。
+- ~~kind 30103 / 30104 の正式割当申請 — 依然として将来候補。~~→ v0.21 で設計（§26）。
 - 承認者（approvals）への通知 — 宛先は発行者のみ。
 - 通知の既読追跡・返信連携。
 
@@ -1502,6 +1503,73 @@ reason=expired の場合は 1 行目が `draft expired` に変わる（`--includ
 - `draft_notify_message`（純粋）: DM 平文の形式固定（§25.1 の雛形どおり）。reason=expired では 1 行目が `[nakama] draft expired`。
 - 送信記録は `~/.config/nakama/draft_notifs/<core_hash>:<reason>.json`（`--notif-dir` で変更可、既定は spec の固定パス）。
 - `--from` の取り違え防止は `rotate_pub` と同思想（npub 形式検証＋keyfile の鍵と不一致なら拒否）。
+
+---
+
+## 26. v0.21 設計: kind 30100–30104 の正式割当申請（NIP 化）（設計のみ）
+
+nakama.py は現在 5 つの Nostr event kind を使っているが、すべて「nakama 独自割当」（仕様書・コードの随所に正直に記録済み）。§24.4・§25.3 で将来候補としていた「正式割当申請」を設計として固定する（§26.1〜26.8）。
+
+### 26.1 使用 kind 一覧
+
+| kind | 意味 | d タグ | 署名者 | 仕様 |
+|------|------|--------|--------|------|
+| 30100 | revocation（bond 解消） | bond_hash | bond 当事者 | §12 |
+| 30101 | key-compromise-declaration（鍵侵害宣言） | subject_hex:declarant_hex | 宣言者 | §13 |
+| 30102 | rotation 証明書 | 旧鍵の hex pubkey | 旧鍵 | §17 |
+| 30103 | board-decision（成立済み決定） | decision_core_hash | publisher | §19 |
+| 30104 | board-draft（草案・回覧中） | decision_core_hash（30103 と同一） | publisher | §21 |
+
+すべて 30000–39999（parameterized replaceable events）の範囲内で、選択の理由は d スロットによる上書き・撤回可能性（revocation・compromise・rotation・decision 草案の置換ルールがプロトコルの前提）。
+
+### 26.2 なぜ今申請するか
+
+- 他のアプリ・ボットが同じ kind を別用途で使っていた場合、`board_decide_fetch` / `board_draft_fetch` / `board_fetch_all` の購読が他人のイベントを拾い、検証はスキップするがノイズになる（kind ホワイトリストの前提が崩れる）。
+- nakama プロトコルが「複数エージェント・複数リレーで運用される」段階に入った今、kind の意味の共有文書がないのは将来の衝突の種。早い段階での文書化が最も安い衝突回避。
+
+### 26.3 申請の形: NIP ドラフト文書
+
+- 正直に書く: 30000–39999 は NIP-01 上「誰でも使える」名前空間であり、NIP への登録は**独占権の主張ではない**。目的は (1) イベント形状の公開仕様化（他者が nakama イベントを検証・表示できる）、(2) 将来の採用者との衝突回避の目印、(3) 既存採用の有無の確認記録。
+- 申請は nostr-protocol/nips への PR 形式の NIP ドラフト（`NIP-nakama.md`）で行う。構成案:
+  1. 概要と動機（bond / rotation / compromise / board governance の 4 要素）。
+  2. kind 一覧（§26.1 の表）＋各 kind の tags（d / h / p）・content（canonical JSON）・署名者・置換ルール（parameterized replaceable の正規スロット）。
+  3. 検証ルール（署名→JSON→構造の三段階、§19 と同一）。
+  4. 互換性: 本 NIP を知らないクライアントは当該イベントを無視してよい（他用途の既存 kind との競合は §26.4）。
+  5. セキュリティ考慮（§6 の転載: 署名は身分の証拠であって善意の証拠ではない、期限・侵害宣言の警告モデル）。
+- 草案文書は v0.22 の実装ランで repo の `docs/NIP-nakama.md` に作成する（このランは設計のみ）。
+
+### 26.4 衝突時のフォールバック
+
+- 申請前に、主要リレー・nostr.band 等で 30100–30104 の既存採用の有無を確認する。先行採用があれば:
+  1. nakama.py の kind 定数（`REVOCATION_NOSTR_KIND` 等）を設定で再マップ可能にする（環境変数 `NAKAMA_KIND_<name>` または設定ファイル。既定値は現行のまま）。
+  2. 移行期間は fetch 系コマンドが新旧両 kind を購読（`kinds=[old, new]`、§22 の横断 fetch と同型）。
+  3. 公開済みイベントの再公開はしない（公開済みは immutable — 削除・上書きはプロトコルの不変性に反する。移行は新規 publish のみ）。
+- 申請却下・無応答の場合もプロトコルは動作を続ける（kind は内部規約であり、文書は協調のためのもの）。
+
+### 26.5 手順
+
+1. v0.22: `docs/NIP-nakama.md` 草案を repo に作成（§26.3 の構成案に沿う）。
+2. 既存採用の確認（§26.4）。衝突があれば草案に kind 代替案を記載。
+3. nostr-protocol/nips に issue → PR。**PR の投稿とレビュー対応は人間社会の承認プロセスであり、エージェント単独で完遂できる保証はない — 人間の確認・操作が必要な段階であることを明示する。**
+4. 結果（受理 / 却下 / 無応答）を spec §26 に追記し、採用 kind が変われば §26.4 の移行を実施。
+
+### 26.6 正直な注記
+
+- NIP 登録は「社会的な合意形成」であって技術的な強制ではない。登録されても悪意ある kind 乗っ取りは防げない（検証は常に署名ベース — §19 の三段階検証が本質）。
+- nakama プロトコル自体は NIP 登録の有無に依存しない。登録は「他者との協調のための文書化」であり、プロトコルの正当性の根拠ではない。
+- PR 投稿には GitHub 上の人間アカウント（NoorMuse）の操作が絡む可能性がある — その段階はこの開発スプリントの管轄外とし、人間の判断を仰ぐ。
+
+### 26.7 スコープ外
+
+- nakama.py のコード変更（kind 定数はすべて現行のまま）。
+- PR の自動投稿（手順は文書化のみ、実行は人間判断）。
+- kind の実働影響の変更（fetch の kind ホワイトリストは現行維持）。
+
+### 26.8 テスト/検証（設計ラン — コードテストなし）
+
+- このランは設計のみ。コード変更・テスト追加なし。
+- レビュー観点（次ランの実装前に確認）: 5 kinds の形状が §12/13/17/19/21 と一致しているか、置換ルール（正規スロット）が各 fetch の前提と矛盾しないか、フォールバック手順（§26.4）に抜けがないか。
+- v0.22 の実装計画: `docs/NIP-nakama.md` の作成（§26.3 の構成案どおり）、既存採用の確認手順のメモ化。オフラインテスト不要（文書のみ）。PR 投稿自体は §26.5 の通り人間判断。
 
 ---
 
@@ -1560,3 +1628,4 @@ Contributions that shaped this spec and the code. Built by many hands.
 - 2026-10-01: v0.19 設計 — 草案の期限を仕様書 §24 に固定（設計のみ、実装は次ラン）。§22.7 のスコープ外「草案の期限（expiry）」を昇格。設計の要点: (1) 決定 payload の任意フィールド `expires_at`（unix 時刻 int、署名対象 — 期限の異なる再発行は別コア＝別 d スロット）。`board_decide --expires-in <秒>` / `--expires-at <unix時刻>`（両指定時は後者優先）。(2) 3 層の強制: `board_cosign` は期限切れ草案への署名を拒否（exit 1、ゾンビ草案対策の主軸）、`board_draft_pub` は期限切れ草案の publish を拒否（exit 1）、`board_draft_fetch` / `board_fetch_all` は期限切れ草案に `[期限切れ]` マーカー（表示のみ）。(3) 期限は草案（30104）のみ — 成立済み（30103）は §20 の不変性ルールの下で恒久的、`board_read --governance` は期限を見ない。期限切れ後の再発行は新規草案（期限切れスロットはリレー上に残るがマーカーで可視化、削除はしない）。(4) 期限判定は純粋関数 `draft_is_expired(d, now)` に分離。期限なし草案は無期限（後方互換）。正直に書く: 期限は自己申告（正直な運用者のための仕組み、攻撃者の制約ではない）。テスト計画 11 ケース（オフライン）。ロードマップ §7 に v0.19（設計中）を追加、ヘッダの日付行も更新。
 - 2026-10-01: v0.19 完了 — §24 の設計を実装。`validate_decision_payload` に全決定種別で任意フィールド `expires_at` を許可（キー集合チェックは expires_at 除外のベースで、型チェックは新規ヘルパ `_expires_at_ok` に委譲 — int（bool 除外）のみ受理、非 int は拒否）。`board_decide --expires-in <秒>` / `--expires-at <unix時刻>` を追加（argparse＋usage 行。両指定時は --expires-at 優先。`expires_at <= created_at` は exit 1 の clean fail）。`draft_is_expired(d, now)` 純粋関数を新規分離（expires_at <= now で期限切れ。期限なし・不正型は False）。3 層の強制: `board_cosign` は期限切れ草案への署名を拒否（exit 1、署名追記なし）、`board_draft_pub` は期限切れ草案の publish を拒否（exit 1、publish せず）、`board_draft_fetch` / `board_fetch_all` は期限切れ草案に `[期限切れ]` マーカーを表示（表示のみ、exit 不変。fetch_all では同一コアに期限切れ 30104 と 30103 が混在した場合は「成立済み」表示が優先）。`board_decide_pub`・`board_read --governance` は期限を見ない（設計通り・変更なし）。`test_draft_expiry.py` 新規 11 ケース通過（換算・優先・非 int 拒否・created_at 以下拒否・後方互換・cosign 拒否・cosign 回帰・publish 拒否・fetch マーカー 2 系統・成立済み優先・純粋関数の分離）＋既存全スイートの回帰維持（accept / board_decision_fetch_policy 8 / board_decision_nostr 10 / compromise 24 / integration 10 / draft_nostr 8 / fetch_all 8 / governance 30 / policy_snapshot 12 / remove 10 / revocation 8 / rotation 8 / verify_binding 6）。ロードマップ §7 に v0.19（完了）、ヘッダの日付行も更新。
 - 2026-10-01: v0.20 完了 — §25 の設計を実装。新規コマンド `board_draft_notify <relay> <board_id> [--limit] [--auth] [--policy <policy.json>] [--within <秒>] [--include-expired] [--dry-run] [--resend] [--from <npub>] [--notif-dir <dir>]`。`board_draft_fetch` と同一の REQ（kinds=[30104]・#h=[board_id]、三段階検証）を流用し、`draft_notify_targets`（純粋）で `0 < expires_at - now <= --within`（既定 24h）の草案を reason=expiring_soon として対象選択（期限切れは `--include-expired` 時のみ reason=expired、期限なし・within 外は対象外）。同一コアは `merge_decision_approvals` でマージし、宛先は最も古い event の publisher（原発行者）のみ — 承認者は宛先外（spam 抑制）。送信は `nip17_build_seal`/`nip17_build_gift_wrap`＋`nostr_publish`（dm_pub と同型、`--auth` 対応）。DM 平文は `draft_notify_message`（純粋）で spec §25.1 の形式に固定（`[nakama] draft expiring soon|expired`、board・decision（core 先頭 12 hex）・expires_at（UTC 人間可読）・`--policy` 時のみ threshold 充足/不足・footer の自分で確認する旨）。二重送信防止は `~/.config/nakama/draft_notifs/<core_hash>:<reason>.json`（`--resend` で強制再送）。`--from` は rotate_pub と同思想の取り違え防止（形式検証＋keyfile の鍵と不一致なら拒否で exit 1）。exit: 送信成功・対象なし・スキップのみ 0、fetch 失敗・DM 構築失敗・publish 拒否は 1。`test_draft_notify.py` 新規 9 ケース通過（対象選択・within 外除外・期限なし除外・期限切れの既定除外と --include-expired・dry-run・二重送信防止と --resend・DM 形式・方式 B 混在でも宛先は原発行者・--from 拒否）＋既存全スイートの回帰維持。ロードマップ §7 に v0.20（完了）、ヘッダの日付行も更新。
+- 2026-10-01: v0.21 設計 — kind 30100–30104（revocation/compromise/rotation/decision/draft）の正式割当申請（NIP 化）を spec §26 に固定（設計のみ、実装は次ラン）。§24.4・§25.3 のスコープ外項目を昇格。5 kinds の一覧表（d タグ・署名者・仕様節の対応）、申請の形（nostr-protocol/nips への NIP ドラフト `docs/NIP-nakama.md` の構成案: 概要・kind 一覧・tags/content/署名者/置換ルール・三段階検証・互換性・セキュリティ考慮）、衝突時のフォールバック（kind 定数の再マップ・移行期間の両 kind 購読・公開済みは再公開しない）、手順（repo 内草案→既存採用の確認→nips PR）。正直に書く: 30000–39999 は誰でも使える名前空間のため申請は独占ではなく文書化＋衝突回避、NIP 登録は合意形成であって強制ではなく署名検証が本質、PR 投稿・レビュー対応は人間社会の承認プロセスのため 人間の確認が必要。コード変更なし。ロードマップ §7 に v0.21（設計中）、ヘッダの日付行も更新。
