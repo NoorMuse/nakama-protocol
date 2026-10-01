@@ -1,7 +1,7 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.3
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21）。v0.17 完了 — 30103+30104 横断 fetch の統合（§22）。v0.18 完了 — fetch 時点の政策スナップショットの保存（§23））。v0.19 完了 — 草案の期限（§24）。v0.20 完了 — 草案への自動通知（§25））。v0.21 設計完了 — kind 30100–30104 の正式割当申請（§26）、v0.22 完了 — NIP ドラフト文書の作成（§26）。v0.23 完了 — 既存採用の確認結果と kind 再マップ実装（30100–30104→30107–30111、§26.9・§26.10）。v0.24 完了 — 承認者への草案通知（§27）。v0.25 設計完了 — 通知の既読追跡・返信連携（§28）
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21）。v0.17 完了 — 30103+30104 横断 fetch の統合（§22）。v0.18 完了 — fetch 時点の政策スナップショットの保存（§23））。v0.19 完了 — 草案の期限（§24）。v0.20 完了 — 草案への自動通知（§25））。v0.21 設計完了 — kind 30100–30104 の正式割当申請（§26）、v0.22 完了 — NIP ドラフト文書の作成（§26）。v0.23 完了 — 既存採用の確認結果と kind 再マップ実装（30100–30104→30107–30111、§26.9・§26.10）。v0.24 完了 — 承認者への草案通知（§27）。v0.25 完了 — 通知の既読追跡・返信連携（§28）。v0.26 設計中 — policy-update 決定の草案化（§29）
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -254,6 +254,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.23**（完了）: 既存採用の確認結果と kind 再マップ実装（§26.9・§26.10）。2026-10-01 のリレー調査で 30100–30104 すべてに他者の先行採用を確認（job マーケットプレイス風アプリの 30100、ポルトガル語圏投票アプリの 30100/30101/30102/30104）。nakama イベントは未公開のためクリーンカット: 新ブロック 30107–30111（revocation→30107 / compromise→30108 / rotation→30109 / decision→30110 / draft→30111）。実装: kind 定数 5 つを環境変数上書き可能な関数に変更（`NAKAMA_KIND_REVOCATION` 等、既定 30107–30111。非 int・30000–39999 範囲外は使用時に exit 1 で拒否）、fetch 系の購読 kind・`board_fetch_all` のホワイトリストを定数ベース化、`decision_nostr_event` / `verify_board_decision_nostr_event` の既定 kind を使用時解決に変更。spec の kind 参照を一括更新（§12/13/17/19/21/22/24/25、§26.1 に再マップ注記）。旧 kinds の購読・互換サポートはスコープ外のまま。テスト `test_kind_remap.py` 新規 5 ケース群通過＋全 16 テストファイル回帰維持。
 - **v0.24**（完了）: 承認者への草案通知（§27）。`board_draft_notify --cosigners` を実装: threshold 未達・期限間近の草案について未署名の eligible メンバーに NIP-17 DM（`--policy` 必須、宛先ごとの送信記録 `<core_hash>:<reason>:<recipient_hex>.json`、発行者通知と並行、`--cosigners` なしの既定動作は不変）。テスト `test_draft_cosigners.py` 9 ケース通過＋全 17 スイート回帰維持。
 - **v0.25**（完了）: 通知の既読追跡・返信連携（§28）。§27.3 のスコープ外項目を昇格。NIP-17 に既読の仕組みは存在しないため「既読の検証」ではなく三層で設計: (1) 受信者の自発・手動の ack DM（`[nakama] notif-ack` ヘッダ、seal は受信者の実鍵署名で出所は検証可能だが「読んだ」の証明にはならない）、(2) 行動証拠（30111 の approvals に npub があれば cosigned）、(3) 送信記録の拡張（`gift_wrap_id`/`rumor_id`）。新規コマンド `board_notif_ack`（受信者側の ack 送信）＋ `board_notif_status`（sent/ack/cosigned の突き合わせ表示、exit 常に 0）。自動 ack は設けない（オンライン状態の自動開示＝監視の道具化を拒否）。threshold 達成済み草案への通知は「やらない」で確定（やることがない相手への通知はノイズ）。§28.2 のみ実装完了: `draft_notif_record` に `gift_wrap_id`（kind 1059）・`rumor_id`（seal=kind 14）の保存、`board_draft_notify` の両 call site で `wrap['id']` / `seal['id']` を渡す、旧形式記録は空文字で読み込む後方互換ヘルパー `draft_notif_read_record`。テスト計画ケース 2 完了（`test_draft_notify.py` ケース 9・10 追加、全 11 ケース通過＋全 18 テストファイル回帰維持）。`dm_incoming` の切り出し完了（テスト計画ケース 7 — `test_dm_incoming.py` 7 ケース追加、全 18 ファイル回帰維持）。`board_notif_ack` の実装完了（テスト計画ケース 1 — `test_notif_ack.py` 新規 11 ケース（ヘッダ形式・core 64hex 検証・reason 語彙外拒否・seal は ack 送信者の実鍵署名・--auth 受け渡し・publish 拒否/npub 不正/--from 不一致で exit 1）、全 19 テストファイル回帰維持）。残り: `board_notif_status`（テスト計画ケース 3–6・8–9）。
+- **v0.26**（設計中）: policy-update 決定の草案化（§29）。§21.8・§27.3 のスコープ外項目を昇格。規約変更（policy-update）は最も帰結の重い決定種別なのに現行では回覧フロー（草案→cosign→成立宣言）を経由できない — §21.5 の「草案の時点解決は現行政策のみ」を維持しつつ policy-update 草案の回覧を解禁する。核心判断: policy-update 草案の承認（threshold/eligible 判定）は現行政策の下で行う（憲法改正は現行憲法の手続きで — 草案の提案する新政策は自分自身の承認には適用されない）。フローは既存コマンドの組み合わせ（`board_decide --decision policy-update` → `board_draft_pub`（30111）→ `board_draft_fetch --out` → `board_cosign` → `board_draft_pub`（方式 B）→ 成立宣言 `board_decide_pub`（30110、同一コア＝同一 d スロット））。新規コマンド・新規純粋関数なし。policy-update 草案の fetch 表示は「判定基準: 現行規約 threshold」と「提案値」の両方を表示する設計。実装は次ラン。
 
 ---
 
@@ -1803,6 +1804,74 @@ board_notif_status <board_id> [--relay <relay>] [--policy <policy.json>] [--deci
 
 ---
 
+## 29. v0.26 設計: policy-update 決定の草案化（設計のみ、実装は次ラン）
+
+§21.8 と §27.3 でスコープ外に残していた「policy-update 決定の草案化」を設計として固定する（設計のみ、実装は次ラン）。
+
+### 29.1 問題
+
+- policy-update（規約変更）は board の中で最も帰結の重い決定種別（threshold・eligible を変える）だが、現行では草案の回覧フローを経由できない。§21.5 で「policy-update 決定は草案では扱わない」と固定されていたため、規約変更は `board_decide` で作成して `board_decide_pub` でいきなり完成決定（30110）として公開するしかない。
+- 結果として、最も熟議を要する決定が、最も熟議の支援（草案の公開回覧・cosign による承認の可視化・期限付き回覧）を受けられない。これは設計の逆転である。
+
+### 29.2 核心判断: 草案の承認は現行政策の下で行う
+
+- policy-update 草案の承認（threshold・eligible の判定）は**現行政策**の下で行う。草案が提案する新政策は、自分自身の承認には適用されない。まだ成立していない規約は、手続きの根拠になれない。
+- これは憲法改正が現行憲法の手続きで行われるのと同型。`verify_board_decision` が policy-update の 30110 決定を「適用直前の政策」で検証する（§11.6、v0.6）意味論と一致する。
+- §21.5 の不変条件「草案の時点解決は現行政策のみ」はそのまま維持され、むしろ強化される: policy-update 草案も例外ではない。
+
+### 29.3 フロー（新規コマンドなし）
+
+1. `board_decide --decision policy-update --payload '<threshold/eligible>'`（ローカル JSON の作成 — 既存、決定種別に非依存）。
+2. `board_draft_pub`（30111、d タグ = `decision_core_hash` — 既存。`expires_at` は §24 の回覧期限として使える）。
+3. 承認フローは既存の組み合わせ: `board_draft_fetch --out` → `board_cosign`（approvals 追記）→ `board_draft_pub`（方式 B: 各承認者が自分のスロットに再公開 — §21.2）。`board_cosign` は決定種別に非依存（`BOARD_DECISION_TYPES` 準拠）のため変更不要。
+4. 成立宣言: `board_decide_pub`（30110。同一コア＝同一 d スロットに publish — §19 の意味論通り、草案スロットは完成決定に置き換わる。署名者は publisher）。
+- 新規 CLI コマンドなし、新規純粋関数は書かない（`fetch_threshold_status` / `resolve_policy_at` / `merge_decision_approvals` / `draft_is_expired` を流用）。
+
+### 29.4 時点解決と表示の整理
+
+- `board_draft_fetch --policy` / `board_fetch_all --policy` の草案表示: threshold 判定は現行政策のみ（`resolve_policy_at` に空集合 — §21.5 のまま）。**草案の payload が提案する threshold/eligible の値は判定に使わない**（提案は効力ではない）。
+- policy-update 草案の fetch 表示には「判定基準」と「提案値」の両方を出す設計: 例 `草案: threshold 2/3 不足（現行規約の判定） — 提案値: threshold 2/5`。表示形式は実装ランで確定する。
+- 成立前後の扱い: policy-update が 30110 で成立した後の fetch では、回覧中の草案の threshold 表示は新しい現行政策で再計算される（既存の意味論のまま — 成立した規約が優先）。回覧中の草案の自動リベースはしない（§21 の設計思想: fetch 時の正直な再評価）。
+
+### 29.5 ガバナンス照合への影響
+
+- なし。`verify_board_decision` の policy-update 検証（決定時点＝適用直前の政策、§11.6）は 30110 のみが対象で、草案は governance の照合対象外（既存通り）。kind 9003（Edit Group）のイベント照合（§11）も変わらない。
+
+### 29.6 正直に書く
+
+- 草案段階の「承認」は新規則への合意ではなく「旧規則の下での承認」である。署名者は「この新規則が旧規則の手続きで成立すること」に同意している — 新規則の内容そのものへの同意ではない（内容への同意の記録は、草案の回覧が公開議論の場であることに残る）。
+- 規約変更草案の承認権は旧規約の eligible が持つ。新規約で eligible に入る予定の者は、旧規約で eligible でなければ署名できない。逆に新規約で外される予定の者も旧規約では署名できる（「抵抗の余地」の正直な扱い — プロトコルは強制も排除もしない）。
+- 成立の証明は 30110 のみ（§21.3 と同じ）。草案は検証可能な公開議論の材料であって、効力を持たない。
+- `expires_at` は回覧の期限。成立済み（30110）の `expires_at` は §24 の通り governance では無視される（期限の意味はない）。
+
+### 29.7 スコープ外
+
+- 新規 CLI コマンド、新規純粋関数。
+- 回覧中草案の自動リベース（fetch 時の再評価で足りる）。
+- 成立済み policy-update の差し戻し・無効化（不変性維持 — §20 の方針）。
+- kind 9003（Edit Group）イベントの自動発行（NIP-29 側の実操作は運営者の手続きのまま）。
+- NIP 申請（§26 の人間判断のまま）。
+
+### 29.8 テスト計画（次ラン、オフライン、`nostr_request` / `nostr_publish` をモック）
+
+1. policy-update 草案の pub→fetch 往復（kind 30111、三段階検証）。
+2. 草案の threshold 表示は現行政策のみ: payload が提案する threshold=2/5 でも、現行規約 threshold=3/7 で判定されること。
+3. cosign フロー: 旧 eligible の署名を `board_cosign` で追加 → 再公開 → fetch マージで approvals が統合されること。
+4. 成立: `board_decide_pub` で 30110 を公開 → `resolve_policy_at` が新政策を返す → `verify_board_decision` が新政策で検証されること。
+5. 成立後の草案再評価: policy-update 成立後の fetch で回覧中草案の threshold 表示が新政策で再計算されること。
+6. 期限: `expires_at` 付き policy-update 草案の期限切れで `board_draft_pub` が拒否（§24 の流用、exit 1）。
+7. ガバナンス回帰: 30110 の policy-update 決定の時点解決が不変（v0.6 の 30 ケース回帰）。
+8. 提案値の表示: policy-update 草案の fetch 表示に「判定基準: 現行規約」「提案値:」の両方（表示形式は実装ランで確定）。
+9. 全 20 テストファイルの回帰維持（新規 `test_policy_update_draft.py` を追加）。
+
+### 29.9 実装記録（設計ラン — 実装は次ラン）
+
+- このランは設計のみ。コード変更・テスト追加なし。
+- レビュー観点（次ランの実装前に確認）: §29.2 の核心判断が §11.6（policy-update の検証は適用直前の政策）と矛盾しないか、`board_cosign` の決定種別非依存性に policy-update が実際に適合するか（`validate_decision_payload` の policy-update 分岐は既存）、§29.4 の表示設計が `fetch_threshold_status` のシグネチャで実現可能か。
+- 実装ランでは §21.5・§21.8・§27.3 の「policy-update 決定は草案では扱わない」記述を撤回し、§29 への参照に更新する。`cmd_board_draft_pub` / `cmd_board_draft_fetch` の docstring の同趣旨の注記も更新。
+
+---
+
 ## Contributors
 
 Contributions that shaped this spec and the code. Built by many hands.
@@ -1868,3 +1937,4 @@ Contributions that shaped this spec and the code. Built by many hands.
 - 2026-10-01: v0.25 続行 — `dm_incoming` の切り出しを実装。`cmd_dm_fetch` の fetch＋unwrap ロジックを `dm_incoming(secret, relay, since, auth, limit=500)` に分離、`cmd_dm_fetch` は表示だけの薄いラッパに（`--limit` は透過し既定 20 維持、表示形式・空購読メッセージ・例外の扱いは完全同一）。整列キーは gift wrap の `created_at` のまま（NIP-17 の wrap 時刻は ±2 日のランダム値 — テストで設計通りであることを明示）。ネットワーク失敗は例外を伝播。テスト計画ケース 7 完了: `test_dm_incoming.py` 新規 7 ケース（wrap 時刻の昇順整列・復号不能 wrap の無視・REQ フィルタ・auth 受け渡し・表示形式の回帰・例外伝播）＋全 18 テストファイル回帰維持。ロードマップ §7・§28.8 を更新。残り: `board_notif_ack`、`board_notif_status`（テスト計画ケース 1・3–6・8–9）。
 - 2026-10-01: v0.25 続行 — `board_notif_ack` を実装（spec §28.3・§28.4）。純粋な `notif_ack_message(core, reason, note)`（`[nakama] notif-ack` ヘッダ / `core: <64 hex>` / `reason: <語彙>` / `---` / 任意の自由文、reason 語彙は通知の送信記録と同一の `expiring_soon`/`expired`/`cosign_request`、既定 `cosign_request`）。新規コマンド `board_notif_ack <relay> <npub> --core <64 hex> [--reason 語彙] [--note 自由文] [--auth] [--from NPUB]`（受信者側の ack 送信）。`--core` は 64 hex のみ受付（形式不正は exit 1）、`--reason` は語彙外を exit 1 で拒否（argparse の choices ではなく明示検証 — exit 1 を保証）。送信は `nip17_build_seal`/`nip17_build_gift_wrap` + `nostr_publish` の流用（seal は ack 送信者＝通知の受信者の実鍵署名。`--auth` 対応、`--from` の取り違え防止は §25.1 と同一）。exit: publish 受理で 0、構築失敗・拒否で 1（ack の到達は保証しない — §28.1）。テスト計画ケース 1 完了: `test_notif_ack.py` 新規 11 ケース（ヘッダ形式・note なし形式・reason 語彙 3 種の構築・e2e: publish モック＋復号で seal/rumor の署名者が ack 送信者の実鍵であることの検証・`--auth` の受け渡し・core 形式不正（短い・非 hex・大文字・空）・reason 語彙外・publish 拒否・npub 形式不正・`--from` 不一致で exit 1）通過＋全 19 テストファイル回帰維持。ロードマップ §7・§28.7・§28.8 を更新。残り: `board_notif_status`（テスト計画ケース 3–6・8–9）。
 - 2026-10-01: v0.25 完了 — `board_notif_status` を実装（spec §28.4）。新規コマンド `board_notif_status <board_id> [--relay] [--since] [--limit] [--auth] [--policy <policy.json>] [--decisions <dir>] [--dir <notif-dir>]`。純粋ヘルパ `normalize_notif_core`（32 hex を正とし 64 hex を先頭 32 文字に正規化）/`parse_notif_ack`/`collect_notif_acks`（dedup: 同一 (core, sender, reason) は最初の 1 件）/`load_notif_records`/`notif_cosigned_by_core_from_relay`・`notif_cosigned_by_core_from_decisions`（ローカルの `board_fetch_all --out` 形式）。各記録に sent（UTC）/ ack（`yes(<時刻>)` / `-`）/ cosigned（`--policy` 時のみ `yes` / `-`）を表示。fetch 失敗時は stderr 警告＋記録のみ表示に degrade、exit は常に 0。設計補正: 当初の「`--core` は 64 hex のみ」は記録側の `core_hash`（32 hex）と突き合わせ不能だったため、32 hex を正・64 hex も受付（正規化）に訂正（`notif_ack_message` は格納時に正規化、`test_notif_ack.py` の既存ケースを更新）。テスト計画ケース 3・4・5・6・8・9 完了: `test_notif_status.py` 新規 12 ケース＋全 20 テストファイル回帰維持。v0.25（§28）完了。
+- 2026-10-01: v0.26 設計 — policy-update 決定の草案化を仕様書 §29 に固定（設計のみ、実装は次ラン）。§21.8・§27.3 のスコープ外項目を昇格: 規約変更は最も帰結の重い決定種別なのに現行では回覧フロー（草案→cosign→成立宣言）を経由できなかった。核心判断: policy-update 草案の承認（threshold/eligible 判定）は現行政策の下で行う（憲法改正は現行憲法の手続きで — 草案の提案する新政策は自分自身の承認には適用されない）。§21.5 の「草案の時点解決は現行政策のみ」の不変条件は維持・強化。フローは既存コマンドの組み合わせ（`board_decide --decision policy-update` → `board_draft_pub`（30111）→ `board_draft_fetch --out` → `board_cosign` → `board_draft_pub`（方式 B）→ 成立宣言 `board_decide_pub`（30110、同一コア＝同一 d スロット））。新規コマンド・新規純粋関数なし。policy-update 草案の fetch 表示は「判定基準: 現行規約 threshold」と「提案値」の両方を出す設計。正直な注記: 草案段階の承認は新規則への合意ではなく旧規則の下での承認、承認権は旧規約の eligible が持つ（新規約で外される予定の者も署名できる — 「抵抗の余地」）、成立の証明は 30110 のみ。テスト計画 9 ケース（オフライン）。ロードマップ §7 に v0.26（設計中）、ヘッダの日付行も更新。選定理由: §28.6 のスコープ外は外部依存（NIP-17 rumor reply 標準の確定待ち）か設計で却下済み（自動 ack・threshold 達成済み通知）、§26 系の残り（nips PR 投稿）は人間判断待ちのため、実動可能な次の単位として §21.8/§27.3 を選択。
