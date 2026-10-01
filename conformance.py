@@ -565,6 +565,12 @@ record ordering/delivery (event signature validity is
 with reference reports produced in-process by nakama.py's own
 cmd_board_fetch_all (offline: nostr_request monkeypatched, no relay
 contact).
+
+`python3 conformance.py selftest` also covers `check_pub` with reference
+reports produced in-process by nakama.py's own cmd_rotate_pub /
+cmd_revoke_pub / cmd_compromise_pub / cmd_dm_pub / cmd_board_decide_pub /
+cmd_board_draft_pub (offline: nostr_publish monkeypatched, no relay
+contact).
 """
 
 import json
@@ -3394,6 +3400,72 @@ def check_dm_fetch_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_pub: publish-result line consistency ----------
+
+# Every Nostr publish command (rotate_pub, revoke_pub, compromise_pub,
+# dm_pub, board_decide_pub, board_draft_pub) prints the same single-line
+# result to stdout, and its grammar is fixed (spec §4.3). check_pub verifies
+# that a saved report is internally consistent:
+#   publish: 受理 (<reason>) id=<64 hex>   (relay accepted — exit 0)
+#   publish: 拒否 (<reason>) id=<64 hex>   (relay rejected — exit 1)
+# The verdict is the two-word vocabulary 受理/拒否; the id is 64 hex chars
+# (case-insensitive) — the published event's id; the reason is the relay's
+# free-text response, kept verbatim inside the parens (it may be empty when
+# the relay's OK carries no message — the reference CLI prints it as-is).
+# Explicitly out of scope: whether the relay really accepted the event
+# (claim model — the reference CLI prints the relay's response verbatim),
+# the reason's truth, the id's match with the published event (the event
+# wire checkers' territory: check_rotation, check_revocation,
+# check_compromise, check_dm, check_decision), the exit code (invisible in
+# saved stdout text), and board_create's per-kind lines (a different shape).
+
+_RE_PUB = re.compile(r'^publish: (受理|拒否) \((.*)\) id=([0-9a-fA-F]{64})$')
+
+
+def conform_pub_report(text: str):
+    """Verify a saved `<cmd>_pub` stdout report is internally consistent.
+    Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) != 1:
+        return False, [f'report must be a single publish-result line, '
+                       f'found {len(lines)} lines'], info
+    m = _RE_PUB.match(lines[0])
+    if not m:
+        return False, ['line 1: not a publish-result line '
+                       '(`publish: 受理/拒否 (reason) id=<64 hex>`)'], info
+    verdict, eid = m.group(1), m.group(3)
+    info.append(f'{verdict} id={eid[:16]}…')
+    return (not errs), errs, info
+
+
+def check_pub_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_pub_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 def _key() -> tuple[bytes, str]:
     s = secrets.token_bytes(32)
     return s, nakama.npub_of(s)
@@ -6091,6 +6163,195 @@ def selftest() -> int:
     print(f'--- fetch-all {bfa_total - bfa_fails}/{bfa_total} passed ---')
     fails += bfa_fails
 
+    # ---------- check_pub: publish-result line consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_rotate_pub / cmd_revoke_pub / cmd_compromise_pub / cmd_dm_pub /
+    # cmd_board_decide_pub / cmd_board_draft_pub, with nostr_publish
+    # monkeypatched to return crafted (accepted, reason) pairs (no relay
+    # contact); hand-mutated reports that break the single-line grammar
+    # must be rejected.
+    import io
+    import contextlib
+    import tempfile
+    from types import SimpleNamespace
+
+    pub_fails = 0
+    _pub_now = int(time.time())
+
+    def _pub_signer():
+        s = secrets.token_bytes(32)
+        return (s, nakama.npub_of(s))
+
+    _pub_relay = 'wss://example.invalid'
+
+    def _pub_kf(tmpd, secret):
+        kf = os.path.join(tmpd, 'k.json')
+        with open(kf, 'w') as f:
+            json.dump({'secret_hex': secret.hex()}, f)
+        os.chmod(kf, 0o600)
+        return kf
+
+    def _pub_run(cmd, args, accepted, reason):
+        orig = nakama.nostr_publish
+        nakama.nostr_publish = lambda *a, **k: (accepted, reason)
+        code = None
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    cmd(args)
+                except SystemExit as e:
+                    code = e.code
+            return buf.getvalue(), code
+        finally:
+            nakama.nostr_publish = orig
+
+    pub_e2e = []
+    with tempfile.TemporaryDirectory() as tmpd:
+        _s_old, _np_old = _pub_signer()
+        _s_new, _np_new = _pub_signer()
+        _s_sub, _np_sub = _pub_signer()
+        _pub_kf_path = _pub_kf(tmpd, _s_old)
+
+        _rot = {'protocol': 'nakama', 'version': 1, 'type': 'rotation',
+                'old_npub': _np_old, 'new_npub': _np_new,
+                'created_at': _pub_now, 'reason': 'selftest rotation'}
+        _rot['old_sig'] = nakama.sign_schnorr(
+            _s_old,
+            nakama.rotation_message(_np_old, _np_new, _pub_now)).hex()
+        _rot_path = os.path.join(tmpd, 'rotation.json')
+        with open(_rot_path, 'w') as f:
+            json.dump(_rot, f)
+
+        _bh = 'ab' * 32
+        _rev_msg = nakama.revocation_message(_bh, _np_old, _pub_now,
+                                             'selftest revoke')
+        _rev = {'protocol': 'nakama', 'version': 1, 'type': 'revocation',
+                'bond_hash': _bh, 'revoker': _np_old, 'created_at': _pub_now,
+                'reason': 'selftest revoke',
+                'sig': nakama.sign_schnorr(_s_old, _rev_msg).hex()}
+        _rev_path = os.path.join(tmpd, 'revocation.json')
+        with open(_rev_path, 'w') as f:
+            json.dump(_rev, f)
+
+        _decl = nakama.build_compromise_declaration(
+            _s_old, _np_sub, _pub_now, reason='selftest compromise')
+        _decl_path = os.path.join(tmpd, 'decl.json')
+        with open(_decl_path, 'w') as f:
+            json.dump(_decl, f)
+
+        _wrap = {'id': 'cd' * 32, 'kind': 1059, 'content': 'x'}
+        _wrap_path = os.path.join(tmpd, 'wrap.json')
+        with open(_wrap_path, 'w') as f:
+            json.dump(_wrap, f)
+
+        _dec = {'protocol': 'nakama', 'version': 1,
+                'type': 'board-decision', 'board_id': 'pub-board-001',
+                'relay': _pub_relay, 'decision': 'admit',
+                'payload': {'candidate': _np_sub},
+                'proposer_npub': _np_old, 'approvals': [],
+                'publisher_npub': _np_old, 'created_at': _pub_now}
+        _dec_path = os.path.join(tmpd, 'decision.json')
+        with open(_dec_path, 'w') as f:
+            json.dump(_dec, f)
+
+        _pub_cases = [
+            ('rotate_pub accepted', nakama.cmd_rotate_pub,
+             SimpleNamespace(relay=_pub_relay, rotation=_rot_path,
+                             auth=False, keyfile=_pub_kf_path),
+             True, 'test-accepted', 0),
+            ('revoke_pub accepted', nakama.cmd_revoke_pub,
+             SimpleNamespace(relay=_pub_relay, revocation=_rev_path,
+                             auth=False, keyfile=_pub_kf_path),
+             True, 'test-accepted', 0),
+            ('compromise_pub accepted', nakama.cmd_compromise_pub,
+             SimpleNamespace(relay=_pub_relay, declaration=_decl_path,
+                             auth=False, keyfile=_pub_kf_path),
+             True, 'test-accepted', 0),
+            ('dm_pub accepted', nakama.cmd_dm_pub,
+             SimpleNamespace(relay=_pub_relay, in_file=_wrap_path,
+                             to_npub=None, message=None,
+                             auth=False, keyfile=_pub_kf_path),
+             True, 'test-accepted', 0),
+            ('board_decide_pub accepted', nakama.cmd_board_decide_pub,
+             SimpleNamespace(relay=_pub_relay, decision=_dec_path,
+                             auth=False, keyfile=_pub_kf_path),
+             True, 'test-accepted', 0),
+            ('board_draft_pub accepted', nakama.cmd_board_draft_pub,
+             SimpleNamespace(relay=_pub_relay, draft=_dec_path,
+                             auth=False, keyfile=_pub_kf_path),
+             True, 'test-accepted', 0),
+            ('dm_pub rejected', nakama.cmd_dm_pub,
+             SimpleNamespace(relay=_pub_relay, in_file=_wrap_path,
+                             to_npub=None, message=None,
+                             auth=False, keyfile=_pub_kf_path),
+             False, 'blocked: relay policy test', 1),
+            ('revoke_pub rejected', nakama.cmd_revoke_pub,
+             SimpleNamespace(relay=_pub_relay, revocation=_rev_path,
+                             auth=False, keyfile=_pub_kf_path),
+             False, 'blocked: relay policy test', 1),
+        ]
+        for name, cmd, args, accepted, reason, exp_code in _pub_cases:
+            text, code = _pub_run(cmd, args, accepted, reason)
+            ok, errs, info = conform_pub_report(text)
+            good = ok and code == exp_code and \
+                (('受理' in info[0]) == accepted if ok else False)
+            print(f'check_pub e2e {name}: {"PASS" if good else "FAIL"}')
+            for e in errs:
+                print(f'    - {e}')
+            if not good and ok:
+                print(f'    - exit={code} (expected {exp_code})')
+            pub_fails += 0 if good else 1
+            pub_e2e.append(name)
+
+    pub_pos = [
+        ('accept minimal', 'publish: 受理 (accepted) id=' + 'ab' * 32),
+        ('reject', 'publish: 拒否 (blocked: auth-required) id=' + 'cd' * 32),
+        ('uppercase id', 'publish: 受理 (ok) id=' + 'AB' * 32),
+        ('reason with parens',
+         'publish: 受理 (duplicate: (seen)) id=' + 'ef' * 32),
+        ('reason japanese',
+         'publish: 拒否 (リレーからの OK 応答がありませんでした) id='
+         + '12' * 32),
+        ('empty reason', 'publish: 受理 () id=' + '34' * 32),
+        ('trailing newline', 'publish: 受理 (ok) id=' + '56' * 32 + '\n'),
+    ]
+    for name, text in pub_pos:
+        ok, errs, _info = conform_pub_report(text)
+        print(f'check_pub pos {name}: {"PASS" if ok else "FAIL"}')
+        for e in errs:
+            print(f'    - {e}')
+        pub_fails += 0 if ok else 1
+
+    _pid = 'ab' * 32
+    pub_neg = [
+        ('empty text', ''),
+        ('blank text', '\n'),
+        ('two lines', f'publish: 受理 (ok) id={_pid}\nextra'),
+        ('wrong verdict word', f'publish: 送信 (ok) id={_pid}'),
+        ('english verdict', f'publish: accepted (ok) id={_pid}'),
+        ('missing colon', f'publish 受理 (ok) id={_pid}'),
+        ('missing space after colon', f'publish:受理 (ok) id={_pid}'),
+        ('no parens', f'publish: 受理 ok id={_pid}'),
+        ('id short', f'publish: 受理 (ok) id={"ab" * 31}'),
+        ('id long', f'publish: 受理 (ok) id={"ab" * 32}ab'),
+        ('id not hex', f'publish: 受理 (ok) id={"zz" * 32}'),
+        ('no id part', 'publish: 受理 (ok)'),
+        ('trailing space', f'publish: 受理 (ok) id={_pid} '),
+        ('leading garbage', f'note\npublish: 受理 (ok) id={_pid}'),
+        ('board_create line shape', 'kind 9002: 受理 (ok)'),
+    ]
+    for name, text in pub_neg:
+        ok, _errs, _info = conform_pub_report(text)
+        good = not ok
+        print(f'check_pub neg {name}: {"PASS" if good else "FAIL"}')
+        pub_fails += 0 if good else 1
+
+    pub_total = len(pub_e2e) + len(pub_pos) + len(pub_neg)
+    print(f'--- pub {pub_total - pub_fails}/{pub_total} passed ---')
+    fails += pub_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -6099,7 +6360,7 @@ def selftest() -> int:
         + binding_total + live_total + cp_total + rt_total + rv_total \
         + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total \
         + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total \
-        + bfa_total
+        + bfa_total + pub_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -6288,6 +6549,11 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_board_fetch_all_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_pub':
+        if len(argv) < 3:
+            print('usage: conformance.py check_pub <report.txt> [...]')
+            return 2
+        return check_pub_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -6315,6 +6581,7 @@ def main(argv: list[str]) -> int:
           'check_board_decide_fetch <report.txt> [...] | '
           'check_board_draft_fetch <report.txt> [...] | '
           'check_board_fetch_all <report.txt> [...] | '
+          'check_pub <report.txt> [...] | '
           'selftest')
     return 2
 

@@ -41,3 +41,9 @@
 - selftest 35/35（新規: 実 CLI の in-process E2E 5（nostr_request を monkeypatch、空→空行・1 成立済み・同一コアの草案＋成立済み→マージ済み 1 レコード・期限切れマーカー・policy＋out で 2 免責行＋threshold 行＋policy-update 提案句＋保存行＋スナップショット行）＋正常 craft 6＋却下 24: 成立済み行の [期限切れ]・草案免責行の出現条件 3 件・タグ/句形の不一致 4 件・提案句 3 件 など）、selftest 総計 353/353 PASS、全 21 テストファイル回帰 PASS。
 - ロードマップ §7 に v0.45 を追加。
 - 外部 push なし（remote HEAD=seen_refs=6552490）。
+
+## 2026-10-02 04:35 JST — v0.46 check_pub
+- conformance.py: publish-result 行（§4.3）の一貫性チェッカー第 24 弾・ローカル出力チェッカー第 9 弾（`check_pub`）。`rotate_pub` / `revoke_pub` / `compromise_pub` / `dm_pub` / `board_decide_pub` / `board_draft_pub` は同一の単一行形式 `publish: 受理/拒否 (reason) id=<64 hex>`。検証: 単一行・受理/拒否の二語彙・id 64 hex（大文字可）・理由は任意テキスト（空可 — 参照実装はリレーの応答をそのまま表示）。対象外を明示: リレーの受理/拒否の真偽（主張モデル）・理由の真偽・id と公開イベントの一致（各 check_* イベントチェッカーの管轄）・exit コード（stdout テキストから不可視）・`board_create` の per-kind 行（別文法）。§4.3 に publish-result の表示文法を固定。
+- selftest 30/30（新規: 実 CLI の in-process E2E 8（nostr_publish を monkeypatch、6 コマンドの受理＋dm_pub/revoke_pub の拒否、各 exit コード一致を確認）＋正常 craft 7（受理最小・拒否・大文字 id・理由内括弧・日本語理由・空理由・末尾改行）＋却下 15: 空テキスト・空行のみ・2 行・語彙外判定・英語判定・コロン欠落・コロン後空白欠落・括弧欠落・id 短/長/非 hex・id 部欠落・末尾空白・先頭ゴミ・board_create 行形）、selftest 総計 383/383 PASS、全 21 テストファイル回帰 PASS。
+- ロードマップ §7 に v0.46 を追加。
+- 外部 push なし（remote HEAD=seen_refs=5d620c4）。
