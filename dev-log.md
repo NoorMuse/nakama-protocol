@@ -24,3 +24,8 @@
 - conformance.py: board_read レポート（§4）の一貫性チェッカー第 20 弾・ローカル出力チェッカー第 5 弾（`check_board_read`）。空レポートの単一行（`投稿はまだありません`）または投稿ごとのブロック: `--- [YYYY-MM-DD HH:MM:SS] <16 hex>...` ヘッダ（任意の ` ⚠ compromised?` サフィックス）＋本文 1 行以上（複数行・空行可、次のヘッダでブロック終了）。日時は暦として有効・投稿者 prefix は 16 hex（大文字可）、空コンテンツブロックは却下。対象外を明示: 時刻の値・タイムゾーン・順序、投稿者 prefix の切詰め意味、投稿の到達（§25.2 の主張モデル）、イベントの署名の有効性（check_board の管轄）、サフィックスの真偽（advisory 表示 — checker は綴りのみ検証）。§4 に board_read の表示文法を固定。
 - selftest 20/20（実 CLI の in-process E2E 4: nostr_request を monkeypatch、空→空行・1 投稿・2 投稿＋複数行/空行/`--- not a header` 行・compromised サフィックス（key_compromise_warnings を monkeypatch）＋正常 craft 6＋却下 10）。selftest 総計 266/266 PASS、全 21 テストファイル回帰 PASS。
 - 外部 push なし（remote HEAD=seen_refs=1a7ad3f）。
+
+## 2026-10-02 03:50 JST — v0.43 check_board_decide_fetch
+- conformance.py: board_decide_fetch レポート（§19）の一貫性チェッカー第 21 弾・ローカル出力チェッカー第 6 弾（`check_board_decide_fetch`）。空レポートの単一行または免責行→決定行（`[<32hex>] <種別> (created_at YYYY-MM-DD, approvals n つ[, threshold n/m 充足|不足])`）→フッター→保存行・スナップショット行の固定順。検証: 種別語彙・日付有効・フッターのマージ件数==決定行数・コア重複なし・threshold 句の全行均一・approvals==分子・n≤m・保存行件数一致。対象外: 件数の真偽・コアハッシュの真偽（check_decision 管轄）・充足/不足の意味（advisory）・時刻の値/順序・署名有効性（verify_board_decision_nostr_event 管轄）。§19 に board_decide_fetch の表示文法を固定。
+- selftest 24/24（新規: 実 CLI の in-process E2E 4（nostr_request を monkeypatch、空→空行・1 決定・3 イベント中 1 スキップ・policy＋out で免責行＋threshold 行＋保存行＋スナップショット行）＋正常 craft 6＋却下 14）、総計 290/290 PASS、全 21 テストファイル回帰 PASS。
+- 外部 push なし（remote HEAD=seen_refs=dc26a3d）。

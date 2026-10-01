@@ -452,6 +452,38 @@ truth).
 `python3 conformance.py selftest` also covers `check_board_read` with
 reference reports produced in-process by nakama.py's own cmd_board_read
 (offline: nostr_request monkeypatched, no relay contact).
+
+Board-decide-fetch report conformance:
+
+    python3 conformance.py check_board_decide_fetch <report1.txt> [...]
+
+Each file is the saved stdout of `nakama.py board_decide_fetch` (not the
+--governance mode). Verifies the report is internally consistent: either
+the single no-decisions line (`<N> 件のイベントを取得: 有効な
+board-decision 公開はありませんでした（<M> 件をスキップ）`), or — in
+order — the optional --policy disclaimer line, one line per merged
+decision `[<32 hex core>] <decision> (created_at YYYY-MM-DD, approvals
+<N> つ[, threshold <n>/<m> <充足|不足>])`, and the footer
+`<E> 件のイベントを取得: 有効 <V> 件、スキップ <S> 件、マージ後
+<M> 件`, optionally followed by the --out save line and the
+policy-snapshot line. The core must be 32 hex chars, the decision type
+one of the BOARD_DECISION_TYPES vocabulary, the date a valid calendar
+date, the footer merged count equal to the number of decision lines,
+core hashes distinct, and the threshold clause uniform (present on all
+decision lines iff the disclaimer is present; its approvals count must
+equal the `n` in `n/m` and satisfy `n <= m`). Explicitly out of scope:
+the fetched/valid/skipped counts' truth (only the merged count is
+checkable), the core hash's truth (`check_decision`'s territory), the
+meaning of the 充足/不足 verdict (advisory threshold display —
+`fetch_threshold_status` computes it, the checker only validates its
+spelling and internal arithmetic), the date's value/timezone (the
+reference CLI prints local time), and decision ordering/delivery (event
+signature validity is `verify_board_decision_nostr_event`'s territory).
+
+`python3 conformance.py selftest` also covers `check_board_decide_fetch`
+with reference reports produced in-process by nakama.py's own
+cmd_board_decide_fetch (offline: nostr_request monkeypatched, no relay
+contact).
 """
 
 import json
@@ -2477,6 +2509,15 @@ def _ns_valid_ts(s: str) -> bool:
         return False
 
 
+def _ns_valid_date(s: str) -> bool:
+    """YYYY-MM-DD が暦として有効な日付か（board_decide_fetch 表示用）。"""
+    try:
+        time.strptime(s, '%Y-%m-%d')
+        return True
+    except ValueError:
+        return False
+
+
 def conform_notif_status_report(text: str):
     """Verify a saved `nakama.py board_notif_status` stdout report is
     internally consistent. Returns (ok, errs, info)."""
@@ -2634,7 +2675,161 @@ def check_board_read_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
-# ---------- check_dm_fetch: dm_fetch report consistency ----------
+# ---------- check_board_decide_fetch: board_decide_fetch report consistency ----------
+
+# board_decide_fetch's stdout is a short human-readable listing of
+# published board decisions fetched from a relay (kind 30110, #h=board_id),
+# and its grammar is fixed (spec §19). check_board_decide_fetch verifies
+# that a saved report is internally consistent: either the single
+# no-decisions line, or — in order — the optional --policy disclaimer
+# line, one line per merged decision, the summary footer, and (with
+# --out) the save line plus the policy-snapshot line. Verified: core is
+# 32 hex chars and distinct across lines (merge_decision_approvals emits
+# one line per core), decision type is in BOARD_DECISION_TYPES, the
+# created_at date is a valid calendar date, the footer merged count equals
+# the number of decision lines, the --out save line's count matches the
+# footer, the threshold clause is uniform (all lines iff the disclaimer
+# is present; its approvals count equals the n in n/m and satisfies
+# n <= m), and the optional post-footer lines appear only in their fixed
+# order. Explicitly out of scope: the fetched/valid/skipped counts' truth
+# (only the merged count is checkable from the report), the core hash's
+# truth (check_decision's territory), the 充足/不足 verdict's meaning
+# (advisory display — fetch_threshold_status computes it, the checker
+# only validates spelling and internal arithmetic), the date's
+# value/timezone (the reference CLI prints local time — the checker
+# validates grammar, never the zone or the instant), decision ordering,
+# and event signature validity (verify_board_decision_nostr_event's
+# territory).
+
+_BDF_EMPTY = re.compile(
+    r'^(\d+) 件のイベントを取得: 有効な board-decision 公開はありませんでした'
+    r'（(\d+) 件をスキップ）$')
+_BDF_DISCLAIMER = ('threshold 表示は取得できた決定に基づく暫定です'
+                   '（権威ある判定は board_read --governance）')
+_BDF_LINE_PLAIN = re.compile(
+    r'^\[([0-9a-fA-F]{32})\] (\S+) \(created_at (\d{4}-\d{2}-\d{2}), '
+    r'approvals (\d+) つ\)$')
+_BDF_LINE_POLICY = re.compile(
+    r'^\[([0-9a-fA-F]{32})\] (\S+) \(created_at (\d{4}-\d{2}-\d{2}), '
+    r'approvals (\d+) つ, threshold (\d+)/(\d+) (充足|不足)\)$')
+_BDF_FOOTER = re.compile(
+    r'^(\d+) 件のイベントを取得: 有効 (\d+) 件、スキップ (\d+) 件、'
+    r'マージ後 (\d+) 件$')
+_BDF_SAVED = re.compile(
+    r'^(\d+) 件の決定を (.+)/ に保存しました'
+    r'（board_read --governance --decisions にそのまま渡せます）$')
+_BDF_SNAPSHOT = re.compile(
+    r'^fetch 時点の政策スナップショットを (.+) に保存しました'
+    r'（検証者はこのファイルを --policy に指定して threshold 判定を再現できます）$')
+
+
+def conform_board_decide_fetch_report(text: str):
+    """Verify a saved `nakama.py board_decide_fetch` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) == 1 and _BDF_EMPTY.match(lines[0]):
+        info.append('no published decisions')
+        return True, errs, info
+    if _BDF_EMPTY.match(lines[0]):
+        return False, ['empty-report line appears together with '
+                       'decision lines'], info
+    pos = 0
+    with_policy = False
+    if lines[0] == _BDF_DISCLAIMER:
+        with_policy = True
+        pos = 1
+        info.append('policy threshold display')
+    decs: list[tuple] = []
+    while pos < len(lines):
+        m = (_BDF_LINE_POLICY if with_policy else _BDF_LINE_PLAIN).match(lines[pos])
+        if with_policy and not m:
+            break
+        if not with_policy and not m:
+            break
+        decs.append((pos + 1, m.group(1), m.group(2), m.group(3),
+                     int(m.group(4)), m.groups()[4:] if with_policy else ()))
+        pos += 1
+    if not decs:
+        return False, [f'line {pos + 1}: expected a decision line'], info
+    seen_cores: set[str] = set()
+    for lineno, core, dtype, date, approvals, thr in decs:
+        if dtype not in nakama.BOARD_DECISION_TYPES:
+            errs.append(f'line {lineno}: unknown decision type {dtype!r}')
+        if not _ns_valid_date(date):
+            errs.append(f'line {lineno}: invalid display date {date!r}')
+        if core.lower() in seen_cores:
+            errs.append(f'line {lineno}: duplicate decision core {core}')
+        seen_cores.add(core.lower())
+        if thr:
+            tn, tm = int(thr[0]), int(thr[1])
+            if approvals != tn:
+                errs.append(f'line {lineno}: approvals count {approvals} '
+                            f'does not match threshold numerator {tn}')
+            if tn > tm:
+                errs.append(f'line {lineno}: threshold {tn}/{tm} has '
+                            f'numerator larger than denominator')
+    if pos >= len(lines):
+        return False, errs + [f'line {pos + 1}: missing summary footer'], info
+    fm = _BDF_FOOTER.match(lines[pos])
+    if not fm:
+        return False, [f'line {pos + 1}: expected the summary footer, '
+                       f'got {lines[pos]!r}'], info
+    merged = int(fm.group(4))
+    if merged != len(decs):
+        errs.append(f'line {pos + 1}: footer says merged {merged} '
+                    f'but {len(decs)} decision lines were listed')
+    pos += 1
+    saved = None
+    if pos < len(lines):
+        sm = _BDF_SAVED.match(lines[pos])
+        if sm:
+            saved = sm
+            if int(sm.group(1)) != merged:
+                errs.append(f'line {pos + 1}: save line says {sm.group(1)} '
+                            f'decisions but footer merged count is {merged}')
+            pos += 1
+    if pos < len(lines):
+        if not saved:
+            return False, [f'line {pos + 1}: unexpected line after the '
+                           f'summary footer: {lines[pos]!r}'], info
+        if not _BDF_SNAPSHOT.match(lines[pos]):
+            return False, [f'line {pos + 1}: expected the policy-snapshot '
+                           f'line, got {lines[pos]!r}'], info
+        pos += 1
+    if pos != len(lines):
+        return False, [f'line {pos + 1}: unexpected trailing line '
+                       f'{lines[pos]!r}'], info
+    if not errs:
+        info.append(f'{len(decs)} decision lines, merged {merged}')
+    return (not errs), errs, info
+
+
+def check_board_decide_fetch_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_board_decide_fetch_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
 
 # dm_fetch's stdout is a short human-readable listing of decrypted rumors,
 # but its grammar is fixed (spec §4.1). check_dm_fetch verifies that a
@@ -4693,6 +4888,211 @@ def selftest() -> int:
     print(f'--- board-read {brd_total - brd_fails}/{brd_total} passed ---')
     fails += brd_fails
 
+    # ---------- check_board_decide_fetch: board_decide_fetch report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_board_decide_fetch, with nostr_request monkeypatched to return
+    # crafted kind-30110 decision events (no relay contact); hand-mutated
+    # reports that break the grammar must be rejected.
+    bdf_fails = 0
+
+    def _bdf_kf(tmpd):
+        s = secrets.token_bytes(32)
+        kf = os.path.join(tmpd, 'k.json')
+        with open(kf, 'w') as f:
+            json.dump({'secret_hex': s.hex()}, f)
+        os.chmod(kf, 0o600)
+        return kf
+
+    def _bdf_signer():
+        s = secrets.token_bytes(32)
+        return (s, nakama.npub_of(s), nakama.hexpub_of(s))
+
+    _bdf_relay = 'wss://example.invalid'
+    _bdf_board = 'bdf-board-001'
+
+    def _bdf_approve(d, signer):
+        msg = nakama.board_decision_message(d['board_id'], d['relay'],
+                                            d['decision'], d['payload'],
+                                            d['created_at'])
+        d['approvals'].append({'npub': signer[1],
+                               'sig': nakama.sign_schnorr(signer[0], msg).hex()})
+        return d
+
+    def _bdf_decision(dtype, approvers, ts, payload=None):
+        d = {'protocol': 'nakama', 'version': 1, 'type': 'board-decision',
+             'board_id': _bdf_board, 'relay': _bdf_relay, 'decision': dtype,
+             'payload': payload if payload is not None
+             else {'candidate': approvers[0][1]},
+             'created_at': ts, 'approvals': []}
+        for a in approvers:
+            _bdf_approve(d, a)
+        return d
+
+    def _bdf_event(d, publisher):
+        content = json.dumps(d, sort_keys=True, separators=(',', ':'),
+                             ensure_ascii=False)
+        tags = [['d', nakama.decision_core_hash(d)], ['h', d['board_id']]]
+        return nakama.sign_event(publisher[0], d['created_at'] + 60,
+                                 nakama.DECISION_NOSTR_KIND(), tags, content)
+
+    def _bdf_policy(members, threshold):
+        eligible = [m[1] for m in members]
+        ts = 1760000000
+        msg = nakama.board_policy_message(_bdf_board, _bdf_relay, threshold,
+                                          eligible, ts)
+        return {'protocol': 'nakama', 'version': 1, 'type': 'board-policy',
+                'board_id': _bdf_board, 'relay': _bdf_relay,
+                'threshold': threshold, 'eligible': eligible,
+                'created_at': ts,
+                'signatures': [{'npub': m[1],
+                                'sig': nakama.sign_schnorr(m[0], msg).hex()}
+                               for m in members]}
+
+    def _bdf_run(events, keyfile, policy=None, out=None):
+        orig = nakama.nostr_request
+        nakama.nostr_request = lambda *a, **k: events
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                nakama.cmd_board_decide_fetch(SimpleNamespace(
+                    relay=_bdf_relay, board_id=_bdf_board, limit=20,
+                    auth=False, out=out, policy=policy, keyfile=keyfile))
+            return buf.getvalue()
+        finally:
+            nakama.nostr_request = orig
+
+    bdf_e2e = []
+    with tempfile.TemporaryDirectory() as tmpd:
+        _bdf_kf_path = _bdf_kf(tmpd)
+        bdf_e2e.append(('no events -> empty line',
+                        _bdf_run([], _bdf_kf_path)))
+        _m1, _m2, _m3 = _bdf_signer(), _bdf_signer(), _bdf_signer()
+        _pub = _bdf_signer()
+        _d1 = _bdf_decision('admit', [_m1, _m2], 1760000000)
+        bdf_e2e.append(('one decision', _bdf_run([_bdf_event(_d1, _pub)],
+                                                 _bdf_kf_path)))
+        _bad = nakama.sign_event(_pub[0], 1760000000,
+                                 nakama.DECISION_NOSTR_KIND(),
+                                 [['d', '0' * 32], ['h', _bdf_board]], '{}')
+        _d2 = _bdf_decision('remove', [_m1], 1760010000)
+        bdf_e2e.append(('three events, one skipped',
+                        _bdf_run([_bdf_event(_d1, _pub), _bad,
+                                  _bdf_event(_d2, _pub)], _bdf_kf_path)))
+        _pol = _bdf_policy([_m1, _m2, _m3], 2)
+        _pf = os.path.join(tmpd, 'policy.json')
+        with open(_pf, 'w') as f:
+            json.dump(_pol, f)
+        _outd = os.path.join(tmpd, 'out')
+        _d3 = _bdf_decision('admit', [_m1, _m2], 1760020000)
+        _d4 = _bdf_decision('remove', [_m1], 1760030000)
+        bdf_e2e.append(('policy + out -> disclaimer, thresholds, save lines',
+                        _bdf_run([_bdf_event(_d3, _pub), _bdf_event(_d4, _pub)],
+                                 _bdf_kf_path, policy=_pf, out=_outd)))
+
+    for name, rep in bdf_e2e:
+        ok, errs, info = conform_board_decide_fetch_report(rep)
+        print(f'decide-fetch-e2e/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        bdf_fails += 0 if ok else 1
+
+    # hand-crafted positives
+    _bd_h = 'ab' * 16
+    _bd_dis = ('threshold 表示は取得できた決定に基づく暫定です'
+               '（権威ある判定は board_read --governance）')
+    _bd_l1 = (f'[{_bd_h}] admit (created_at 2026-10-01, approvals 2 つ)')
+    _bd_l1t = (f'[{_bd_h}] admit (created_at 2026-10-01, approvals 2 つ, '
+               f'threshold 2/3 充足)')
+    _bd_l2t = (f'[cd{"ef" * 15}] remove (created_at 2026-10-02, approvals 1 つ, '
+               f'threshold 1/3 不足)')
+    _bd_l2 = f'[cd{"ef" * 15}] remove (created_at 2026-10-02, approvals 1 つ)'
+    _bd_f1 = '2 件のイベントを取得: 有効 2 件、スキップ 0 件、マージ後 1 件'
+    _bd_f2 = '3 件のイベントを取得: 有効 2 件、スキップ 1 件、マージ後 2 件'
+    _bd_save1 = ('1 件の決定を decisions/ に保存しました'
+                 '（board_read --governance --decisions にそのまま渡せます）')
+    _bd_save2 = ('2 件の決定を decisions/ に保存しました'
+                 '（board_read --governance --decisions にそのまま渡せます）')
+    _bd_snap = ('fetch 時点の政策スナップショットを decisions/'
+                'policy-snapshot-1760000000.json に保存しました'
+                '（検証者はこのファイルを --policy に指定して threshold '
+                '判定を再現できます）')
+    bdf_pos = [
+        ('empty report',
+         '2 件のイベントを取得: 有効な board-decision 公開はありませんでした'
+         '（1 件をスキップ）\n'),
+        ('one plain line', _bd_l1 + '\n' + _bd_f1 + '\n'),
+        ('policy display', _bd_dis + '\n' + _bd_l1t + '\n' + _bd_l2t + '\n'
+         + _bd_f2 + '\n'),
+        ('out without policy', _bd_l1 + '\n' + _bd_l2 + '\n' + _bd_f2 + '\n'
+         + _bd_save2 + '\n'),
+        ('out with policy and snapshot',
+         _bd_dis + '\n' + _bd_l1t + '\n' + _bd_l2t + '\n' + _bd_f2 + '\n'
+         + _bd_save2 + '\n' + _bd_snap + '\n'),
+        ('uppercase core hash',
+         ('[' + 'AB' * 16 + '] handover (created_at 2026-09-30, '
+          'approvals 1 つ)\n'
+          '1 件のイベントを取得: 有効 1 件、スキップ 0 件、マージ後 1 件\n')),
+    ]
+    for name, rep in bdf_pos:
+        ok, errs, info = conform_board_decide_fetch_report(rep)
+        print(f'decide-fetch/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        bdf_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    bdf_neg = []
+    bdf_neg.append(('empty report', ''))
+    bdf_neg.append(('empty line plus lines',
+                    '2 件のイベントを取得: 有効な board-decision 公開はありません'
+                    'でした（1 件をスキップ）\n' + _bd_l1 + '\n' + _bd_f1 + '\n'))
+    bdf_neg.append(('invalid date',
+                    _bd_l1.replace('2026-10-01', '2026-13-40') + '\n'
+                    + _bd_f1 + '\n'))
+    bdf_neg.append(('core not hex',
+                    _bd_l1.replace(_bd_h, 'zz' * 16) + '\n' + _bd_f1 + '\n'))
+    bdf_neg.append(('unknown decision type',
+                    _bd_l1.replace('admit', 'banish') + '\n' + _bd_f1 + '\n'))
+    bdf_neg.append(('approvals/threshold mismatch',
+                    _bd_dis + '\n'
+                    + _bd_l1t.replace('approvals 2 つ', 'approvals 3 つ')
+                    + '\n' + _bd_f1 + '\n'))
+    bdf_neg.append(('threshold numerator > denominator',
+                    _bd_dis + '\n' + _bd_l1t.replace('2/3', '6/3') + '\n'
+                    + _bd_f1 + '\n'))
+    bdf_neg.append(('threshold clause without disclaimer',
+                    _bd_l1t + '\n' + _bd_f1 + '\n'))
+    bdf_neg.append(('plain line under disclaimer',
+                    _bd_dis + '\n' + _bd_l1 + '\n' + _bd_f1 + '\n'))
+    bdf_neg.append(('footer merged count mismatch',
+                    _bd_l1 + '\n' + _bd_f1.replace('マージ後 1 件',
+                                                    'マージ後 2 件') + '\n'))
+    bdf_neg.append(('missing footer', _bd_l1 + '\n'))
+    bdf_neg.append(('trailing garbage', _bd_l1 + '\n' + _bd_f1 + '\n'
+                    + 'unexpected\n'))
+    bdf_neg.append(('snapshot without save line',
+                    _bd_dis + '\n' + _bd_l1t + '\n' + _bd_f2 + '\n'
+                    + _bd_snap + '\n'))
+    bdf_neg.append(('duplicate core hash',
+                    _bd_l1 + '\n' + _bd_l1 + '\n'
+                    + '2 件のイベントを取得: 有効 2 件、スキップ 0 件、'
+                      'マージ後 2 件\n'))
+
+    for name, rep in bdf_neg:
+        ok, errs, info = conform_board_decide_fetch_report(rep)
+        good = not ok
+        print(f'decide-fetch-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            bdf_fails += 1
+
+    bdf_total = len(bdf_e2e) + len(bdf_pos) + len(bdf_neg)
+    print(f'--- decide-fetch {bdf_total - bdf_fails}/{bdf_total} passed ---')
+    fails += bdf_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -4700,7 +5100,7 @@ def selftest() -> int:
     grand = total + dm_total + board_total + dec_total + bond_total \
         + binding_total + live_total + cp_total + rt_total + rv_total \
         + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total \
-        + rl_total + ns_total + dmf_total + brd_total
+        + rl_total + ns_total + dmf_total + brd_total + bdf_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -4871,6 +5271,12 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_board_read <report.txt> [...]')
             return 2
         return check_board_read_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_board_decide_fetch':
+        if len(argv) < 3:
+            print('usage: conformance.py check_board_decide_fetch '
+                  '<report.txt> [...]')
+            return 2
+        return check_board_decide_fetch_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
