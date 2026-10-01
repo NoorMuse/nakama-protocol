@@ -328,6 +328,28 @@ parse wire-compatibly with the reference implementation.
 
 `python3 conformance.py selftest` also covers `check_notif_ack`
 with reference acks built by nakama.py's own primitives.
+
+Notif-record conformance:
+
+    python3 conformance.py check_notif_record <record1.json | notif_dir> [...]
+
+Verifies each file is a draft-notification send record as written
+by `board_draft_notify` (spec §25.1 / §27.1 / §28.2): the
+`<core>:<reason>.json` filename for publisher notifications
+(§25.1), the `<core>:<reason>:<recipient_hex>.json` filename for
+--cosigners recipients (§27.1), and the content shape
+(core_hash/reason/recipient_hex/sender_npub/sent_at/gift_wrap_id/
+rumor_id) with filename-content consistency (normalized core,
+reason, recipient suffix). A directory may be given — every
+*.json in it is checked, mirroring `load_notif_records`.
+Passing this proves a second implementation's send logs parse
+wire-compatibly with the reference implementation. Explicitly
+out of scope: whether the DM actually arrived — the record is
+the sender's claim only (spec §25.2).
+
+`python3 conformance.py selftest` also covers
+`check_notif_record` with reference records built by nakama.py's
+own `draft_notif_record` primitive.
 """
 
 import json
@@ -1880,6 +1902,139 @@ def check_notif_ack_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+def conform_notif_record(path: str, rec) -> tuple[bool, list, list]:
+    """Verify a draft-notification send record as written by
+    `draft_notif_record` (spec §25.1 / §27.1 / §28.2).
+
+    The record is the sender's local log of a NIP-17 notification
+    DM: `board_draft_notify` writes
+    `<notif_dir>/<core>:<reason>.json` for the draft publisher
+    (§25.1) and `<core>:<reason>:<recipient_hex>.json` for each
+    --cosigners recipient (§27.1), with fields
+    {core_hash, reason, recipient_hex, sender_npub, sent_at,
+    gift_wrap_id, rumor_id}.
+
+    Checks: the filename is one of the two reference forms (core
+    32 or 64 hex — normalized to 32, the same rule
+    `load_notif_records` applies — reason in NOTIF_ACK_REASONS,
+    optional recipient suffix 64 hex); the JSON is a dict;
+    core_hash normalizes to the filename's core, reason matches
+    the filename's reason, and for cosigner records the
+    recipient_hex field matches the filename suffix; recipient_hex
+    is 64 hex, sender_npub is a valid npub, sent_at is an int (not
+    bool), gift_wrap_id/rumor_id are strings when present (absent
+    is accepted — pre-§28.2 records default to empty in
+    `draft_notif_read_record`). Extra fields are allowed.
+
+    Explicitly out of scope: whether the DM actually arrived —
+    the record is the sender's claim only (spec §25.2), so empty
+    gift_wrap_id/rumor_id and the freshness of sent_at are not
+    failures. Returns (ok, errs, info).
+    """
+    errs: list[str] = []
+    info: list[str] = []
+    name = os.path.basename(path)
+    fn_core = fn_reason = fn_rhx = None
+    if not name.endswith('.json'):
+        errs.append('record filename must end with .json')
+    else:
+        parts = name[:-5].split(':')
+        if len(parts) not in (2, 3):
+            errs.append('filename must be <core>:<reason>.json or '
+                        '<core>:<reason>:<recipient_hex>.json')
+        else:
+            fn_core = nakama.normalize_notif_core(parts[0])
+            if fn_core is None:
+                errs.append('filename core must be 32 or 64 hex '
+                            '(normalized to 32)')
+            fn_reason = parts[1]
+            if fn_reason not in nakama.NOTIF_ACK_REASONS:
+                errs.append(f'filename reason must be one of '
+                            f'{" / ".join(nakama.NOTIF_ACK_REASONS)}')
+                fn_reason = None
+            if len(parts) == 3:
+                fn_rhx = parts[2].lower()
+                if not re.fullmatch(r'[0-9a-f]{64}', fn_rhx):
+                    errs.append('filename recipient suffix must be '
+                                '64 lowercase hex')
+                    fn_rhx = None
+    if not isinstance(rec, dict):
+        return False, errs + ['record is not a JSON object'], info
+    core = nakama.normalize_notif_core(rec.get('core_hash', ''))
+    if core is None:
+        errs.append('core_hash must be 32 or 64 hex (normalized to 32)')
+    elif fn_core is not None and core != fn_core:
+        errs.append('core_hash does not match the filename core')
+    reason = rec.get('reason')
+    if reason not in nakama.NOTIF_ACK_REASONS:
+        errs.append(f'reason must be one of '
+                    f'{" / ".join(nakama.NOTIF_ACK_REASONS)}')
+    elif fn_reason is not None and reason != fn_reason:
+        errs.append('reason does not match the filename reason')
+    rhx = rec.get('recipient_hex')
+    if not isinstance(rhx, str) or not re.fullmatch(r'[0-9a-f]{64}',
+                                                    rhx.lower()):
+        errs.append('recipient_hex must be 64 hex')
+    elif fn_rhx is not None and rhx.lower() != fn_rhx:
+        errs.append('recipient_hex does not match the filename '
+                    'recipient suffix')
+    snpub = rec.get('sender_npub')
+    if not isinstance(snpub, str) or nakama.npub_to_hex(snpub) is None:
+        errs.append('sender_npub must be a valid npub')
+    sent_at = rec.get('sent_at')
+    if not isinstance(sent_at, int) or isinstance(sent_at, bool):
+        errs.append('sent_at must be an int')
+    for f in ('gift_wrap_id', 'rumor_id'):
+        v = rec.get(f)
+        if v is not None and not isinstance(v, str):
+            errs.append(f'{f} must be a string')
+    if rec.get('gift_wrap_id') is None or rec.get('rumor_id') is None:
+        info.append('pre-§28.2 record: gift_wrap_id/rumor_id absent '
+                    '(defaults to empty per draft_notif_read_record)')
+    elif not rec['gift_wrap_id'] and not rec['rumor_id']:
+        info.append('no delivery ids recorded (sender-side claim only, '
+                    '§25.2)')
+    known = {'core_hash', 'reason', 'recipient_hex', 'sender_npub',
+             'sent_at', 'gift_wrap_id', 'rumor_id'}
+    extra = sorted(set(rec) - known)
+    if extra:
+        info.append(f'extra fields allowed: {", ".join(extra)}')
+    if len(errs) == 0:
+        info.insert(0, f'core {core[:12]}... ({reason})')
+        info.insert(1, f'recipient {rhx[:12]}...')
+    return (len(errs) == 0), errs, info
+
+
+def check_notif_record_files(paths: list[str]) -> int:
+    files: list[str] = []
+    for p in paths:
+        if os.path.isdir(p):
+            for fn in sorted(os.listdir(p)):
+                if fn.endswith('.json'):
+                    files.append(os.path.join(p, fn))
+        else:
+            files.append(p)
+    failures = 0
+    for p in files:
+        try:
+            with open(p, encoding='utf-8') as f:
+                rec = json.load(f)
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_notif_record(p, rec)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(files) - failures}/{len(files)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 def _key() -> tuple[bytes, str]:
     s = secrets.token_bytes(32)
     return s, nakama.npub_of(s)
@@ -3022,9 +3177,132 @@ def selftest() -> int:
     print(f'--- ack {ack_total - ack_fails}/{ack_total} passed ---')
     fails += ack_fails
 
+    # Notif-record conformance: records written by nakama.py's
+    # draft_notif_record must verify; malformed, filename-mismatched,
+    # and re-scoped records must be rejected. The record proves
+    # sender-side send-log wire compatibility only — whether the
+    # DM arrived is NOT provable from the record (spec §25.2).
+    rec_fails = 0
+    rec_now = int(time.time())
+    rec_core = 'ab' * 16
+    rec_core2 = 'cd' * 16
+    s_r, np_r = _key()
+    rhex = nakama.hexpub_of(s_r)
+
+    def _mkrec(core, reason, rhx, sender, sent_at, **kw):
+        d = {'core_hash': core, 'reason': reason, 'recipient_hex': rhx,
+             'sender_npub': sender, 'sent_at': sent_at,
+             'gift_wrap_id': 'gw' * 16, 'rumor_id': 'rm' * 16}
+        d.update(kw)
+        return d
+
+    noids = _mkrec(rec_core, 'expired', rhex, np_r, rec_now)
+    del noids['gift_wrap_id']
+    del noids['rumor_id']
+    rec_pos = [
+        ('valid publisher record',
+         f'{rec_core}:expiring_soon.json',
+         _mkrec(rec_core, 'expiring_soon', rhex, np_r, rec_now)),
+        ('valid cosigner record',
+         f'{rec_core}:cosign_request:{rhex}.json',
+         _mkrec(rec_core, 'cosign_request', rhex, np_r, rec_now)),
+        ('pre-§28.2 record (no delivery ids)', f'{rec_core}:expired.json',
+         noids),
+        ('extra fields allowed', f'{rec_core}:expired.json',
+         _mkrec(rec_core, 'expired', rhex, np_r, rec_now,
+                relay='wss://relay.test')),
+        ('64-hex core normalized to 32', f'{rec_core}:expired.json',
+         _mkrec(rec_core + rec_core, 'expired', rhex, np_r, rec_now)),
+    ]
+    for name, fn, rec in rec_pos:
+        ok, errs, info = conform_notif_record(fn, rec)
+        print(f'record/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        rec_fails += 0 if ok else 1
+
+    rec_neg = []
+    rec_neg.append(('filename not .json',
+                    'notjson.txt',
+                    _mkrec(rec_core, 'expired', rhex, np_r, rec_now)))
+    rec_neg.append(('filename single part', f'{rec_core}.json',
+                    _mkrec(rec_core, 'expired', rhex, np_r, rec_now)))
+    rec_neg.append(('filename core not hex', f'zz:expired.json',
+                    _mkrec(rec_core, 'expired', rhex, np_r, rec_now)))
+    rec_neg.append(('filename reason out of vocabulary',
+                    f'{rec_core}:nonsense.json',
+                    _mkrec(rec_core, 'expired', rhex, np_r, rec_now)))
+    rec_neg.append(('filename suffix not hex',
+                    f'{rec_core}:cosign_request:xyz.json',
+                    _mkrec(rec_core, 'cosign_request', rhex, np_r,
+                           rec_now)))
+    rec_neg.append(('core_hash mismatch with filename',
+                    f'{rec_core}:expired.json',
+                    _mkrec(rec_core2, 'expired', rhex, np_r, rec_now)))
+    rec_neg.append(('reason mismatch with filename',
+                    f'{rec_core}:expired.json',
+                    _mkrec(rec_core, 'expiring_soon', rhex, np_r,
+                           rec_now)))
+    rec_neg.append(('recipient suffix mismatch',
+                    f'{rec_core}:cosign_request:{"ef" * 32}.json',
+                    _mkrec(rec_core, 'cosign_request', rhex, np_r,
+                           rec_now)))
+    rec_neg.append(('recipient_hex not hex', f'{rec_core}:expired.json',
+                    _mkrec(rec_core, 'expired', 'nope', np_r, rec_now)))
+    rec_neg.append(('sender_npub invalid', f'{rec_core}:expired.json',
+                    _mkrec(rec_core, 'expired', rhex, 'npub1bogus',
+                           rec_now)))
+    rec_neg.append(('sent_at bool', f'{rec_core}:expired.json',
+                    _mkrec(rec_core, 'expired', rhex, np_r, True)))
+    rec_neg.append(('sent_at not int', f'{rec_core}:expired.json',
+                    _mkrec(rec_core, 'expired', rhex, np_r, 'now')))
+    rec_neg.append(('gift_wrap_id not a string',
+                    f'{rec_core}:expired.json',
+                    _mkrec(rec_core, 'expired', rhex, np_r, rec_now,
+                           gift_wrap_id=42)))
+    rec_neg.append(('record not a JSON object',
+                    f'{rec_core}:expired.json', ['not', 'a', 'dict']))
+
+    for name, fn, rec in rec_neg:
+        ok, errs, info = conform_notif_record(fn, rec)
+        good = not ok
+        print(f'record-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            rec_fails += 1
+
+    # E2E: the real CLI primitive draft_notif_record writes the
+    # record; the whole notif dir must pass check_notif_record_files
+    # (directory expansion included). A corrupted record in the
+    # same dir must be flagged while the good one still passes.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpd:
+        nakama.draft_notif_record(tmpd, rec_core, 'expiring_soon', rhex,
+                                  np_r, rec_now, recipient_file=False,
+                                  gift_wrap_id='ab' * 32,
+                                  rumor_id='cd' * 32)
+        nakama.draft_notif_record(tmpd, rec_core, 'cosign_request', rhex,
+                                  np_r, rec_now, recipient_file=True)
+        rc = check_notif_record_files([tmpd])
+        print(f'record/e2e real draft_notif_record dir: '
+              f'{"PASS" if rc == 0 else "FAIL"}')
+        rec_fails += 0 if rc == 0 else 1
+        bad = os.path.join(tmpd, f'{rec_core}:expired.json')
+        with open(bad, 'w', encoding='utf-8') as f:
+            f.write('{broken json')
+        rc = check_notif_record_files([tmpd])
+        print(f'record/e2e corrupted record flagged: '
+              f'{"PASS (flagged)" if rc == 1 else "FAIL (missed!)"}')
+        rec_fails += 0 if rc == 1 else 1
+
+    rec_total = len(rec_pos) + len(rec_neg) + 2
+    print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
+    fails += rec_fails
+
     grand = total + dm_total + board_total + dec_total + bond_total \
         + binding_total + live_total + cp_total + rt_total + rv_total \
-        + ub_total + pl_total + dr_total + ack_total
+        + ub_total + pl_total + dr_total + ack_total + rec_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -3152,6 +3430,12 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_notif_ack <ack1.txt> [...]')
             return 2
         return check_notif_ack_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_notif_record':
+        if len(argv) < 3:
+            print('usage: conformance.py check_notif_record '
+                  '<record1.json | notif_dir> [...]')
+            return 2
+        return check_notif_record_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -3170,6 +3454,7 @@ def main(argv: list[str]) -> int:
           'check_draft [--policy policy.json] [--now unixts] '
           '<draft.json> [...] | '
           'check_notif_ack <ack1.txt> [...] | '
+          'check_notif_record <record1.json | notif_dir> [...] | '
           'selftest')
     return 2
 
