@@ -75,6 +75,9 @@
   nakama.py board_draft_notify <relay> <board_id> [--limit N] [--auth] [--policy POLICY] [--within SECS] [--include-expired] [--dry-run] [--resend] [--from NPUB] [--cosigners]
       期限間近の草案を発行者に NIP-17 DM で通知（--within 既定 24h、送信記録で二重送信防止、宛先は草案イベントの publisher のみ — spec §25）。
       --cosigners で threshold 未達・期限間近の草案の未署名 eligible 承認者にも通知（--policy 必須 — spec §27）
+  nakama.py board_notif_ack <relay> <npub> --core <core_hash> [--reason 語彙] [--note 自由文] [--auth] [--from NPUB]
+      通知を受け取った側が通知の発行者に自発・手動で ack DM を送る（--reason の既定: cosign_request。
+      語彙は expiring_soon/expired/cosign_request。--core は 64 hex のみ受付 — spec §28）
 """
 import argparse, base64, hashlib, json, os, re, secrets, sys, time
 
@@ -3181,6 +3184,77 @@ def cmd_board_draft_notify(args):
         sys.exit(1)
 
 
+# --- v0.25: 通知の既読追跡・返信連携 — 受信者側の ack 送信 (spec §28.3・§28.4) ---
+
+# ack の reason 語彙は通知の送信記録の reason と同一（突き合わせのキー一致のため）。
+NOTIF_ACK_REASONS = ('expiring_soon', 'expired', 'cosign_request')
+NOTIF_ACK_HEADER = '[nakama] notif-ack'
+
+
+def notif_ack_message(core: str, reason: str, note: str | None = None) -> str:
+    """ack DM 平文（kind 14 rumor の content）。形式は spec §28.3 に固定（純粋）。
+
+    core は 64 hex（§19 の decision_core_hash と同一）、reason は NOTIF_ACK_REASONS。
+    形式の検証は呼び出し側（cmd）が担う。
+    """
+    lines = [NOTIF_ACK_HEADER,
+             f'core: {core}',
+             f'reason: {reason}',
+             '---']
+    if note:
+        lines.append(note)
+    return '\n'.join(lines)
+
+
+def cmd_board_notif_ack(args):
+    """受信者側が通知の発行者に自発・手動で ack DM を送る（spec §28.4）。
+
+    ack は受信者→発行者の通常の NIP-17 DM（§28.1 の判断 5: 返信ではなく新規 DM）。
+    seal は ack 送信者（＝通知の受信者）の実鍵で署名されるため、誰が ack したかは
+    検証可能。ただし「読んだ」ことの証明にはならない（ack は主張 — §28.3）。
+    自動 ack は設けない（§28.1 の判断 2）。
+    exit: publish 受理で 0、構築失敗・拒否で 1（ack の到達は保証しない — §28.1）。
+    """
+    secret = load_key(args.keyfile)
+    from_npub = getattr(args, 'from_npub', None)
+    if from_npub:
+        try:
+            NostrPublicKey.from_npub(from_npub)
+        except Exception:
+            print('--from の npub が不正です', file=sys.stderr)
+            sys.exit(1)
+        if npub_of(secret) != from_npub:
+            print('--from と keyfile の鍵が一致しません（鍵の取り違え防止のため送信しません）',
+                  file=sys.stderr)
+            sys.exit(1)
+    try:
+        recipient_hexpub = NostrPublicKey.from_npub(args.npub).hex()
+    except Exception:
+        print('npub の形式が不正です', file=sys.stderr)
+        sys.exit(1)
+    core = args.core or ''
+    if not re.fullmatch(r'[0-9a-f]{64}', core):
+        print('--core は 64 文字の hex (core_hash) である必要があります',
+              file=sys.stderr)
+        sys.exit(1)
+    reason = args.reason or 'cosign_request'
+    if reason not in NOTIF_ACK_REASONS:
+        print(f'--reason は {"/".join(NOTIF_ACK_REASONS)} のいずれかである必要があります',
+              file=sys.stderr)
+        sys.exit(1)
+    msg = notif_ack_message(core, reason, getattr(args, 'note', None))
+    try:
+        seal = nip17_build_seal(secret, recipient_hexpub, msg)
+        wrap = nip17_build_gift_wrap(seal, recipient_hexpub)
+    except Exception as e:
+        print(f'DM の構築に失敗しました: {e}', file=sys.stderr)
+        sys.exit(1)
+    accepted, r = nostr_publish(args.relay, wrap,
+                                auth_secret=secret if args.auth else None)
+    print(f'publish: {"受理" if accepted else "拒否"} ({r}) id={wrap["id"]}')
+    sys.exit(0 if accepted else 1)
+
+
 # --- v0.4: ガバナンス照合 (spec §9.4: board_read --governance) ---
 
 # 決定種別 → その決定が正当化できる NIP-29 管理イベントの kind。
@@ -3673,6 +3747,13 @@ def main():
     s.add_argument('--from', dest='from_npub', default=None, help='送信者の npub（keyfile の鍵と一致しなければ拒否 — 取り違え防止）')
     s.add_argument('--notif-dir', default=None, help='送信記録のディレクトリ (既定: ~/.config/nakama/draft_notifs)')
     s.add_argument('--cosigners', action='store_true', help='threshold 未達・期限間近の草案について、未署名の eligible 承認者にも通知する（--policy 必須、spec §27）')
+    s = sub.add_parser('board_notif_ack'); s.add_argument('relay'); s.add_argument('npub')
+    s.add_argument('--core', required=True, help='通知対象の core_hash（64 hex — §28.3）')
+    s.add_argument('--reason', default='cosign_request',
+                   help='ack の理由語彙: expiring_soon/expired/cosign_request（既定: cosign_request）')
+    s.add_argument('--note', default=None, help='ack に添える任意の自由文')
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s.add_argument('--from', dest='from_npub', default=None, help='送信者の npub（keyfile の鍵と一致しなければ拒否 — 取り違え防止）')
 
     args = ap.parse_args()
     {'init': cmd_init, 'whoami': cmd_whoami, 'propose': cmd_propose,
@@ -3703,7 +3784,8 @@ def main():
      'board_draft_pub': cmd_board_draft_pub,
      'board_draft_fetch': cmd_board_draft_fetch,
      'board_fetch_all': cmd_board_fetch_all,
-     'board_draft_notify': cmd_board_draft_notify}[args.cmd](args)
+     'board_draft_notify': cmd_board_draft_notify,
+     'board_notif_ack': cmd_board_notif_ack}[args.cmd](args)
 
 
 if __name__ == '__main__':
