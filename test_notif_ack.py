@@ -20,7 +20,8 @@ import nakama as n
 
 RELAY = 'wss://relay.example'
 passed = []
-CORE = 'ab' * 32  # 64 hex
+CORE64 = 'ab' * 32  # 64 hex（後方互換で受付 → 32 hex に正規化）
+CORE = 'ab' * 16    # 32 hex（decision_core_hash 形式 — 正）
 
 
 def keypair():
@@ -62,7 +63,7 @@ def main():
     real_pub = n.nostr_publish
 
     with tempfile.TemporaryDirectory() as tmpd:
-        # 1. ヘッダ形式: 機械可読ヘッダ + 任意の自由文
+        # 1. ヘッダ形式: 機械可読ヘッダ + 任意の自由文（core は 32 hex に正規化）
         m = n.notif_ack_message(CORE, 'expiring_soon', note='今夜 cosign します')
         assert m.split('\n') == ['[nakama] notif-ack', f'core: {CORE}',
                                  'reason: expiring_soon', '---', '今夜 cosign します'], m
@@ -105,8 +106,8 @@ def main():
         assert code == 0 and captured['auth_secret'] == me[0], (code, out, err)
         ok('--auth の auth_secret 受け渡し')
 
-        # 6. --core 形式不正は exit 1（短い / 非 hex / 大文字）
-        for bad in ('ab', 'zz' * 32, 'AB' * 32, '', CORE + '0'):
+        # 6. --core 形式不正は exit 1（短い / 非 hex / 空 / 長すぎ。hex は case-insensitive）
+        for bad in ('ab', 'zz' * 32, '', CORE + '0', CORE64 + '0'):
             code, out, err = run_cmd(n.cmd_board_notif_ack,
                                     base_ns(tmpd, issuer[1], me[0], core=bad))
             assert code == 1 and 'core' in (out + err), (bad, code, out, err)
@@ -146,6 +147,20 @@ def main():
                                 base_ns(tmpd, issuer[1], me[0]))
         assert code == 0 and '受理' in out, (code, out, err)
         ok('受理時の exit 0 と出力')
+
+        # 12. --core は 32 hex を正とし、64 hex も受付（先頭 32 に正規化 — §28.8）
+        n.nostr_publish = fake_pub
+        code, out, err = run_cmd(n.cmd_board_notif_ack,
+                                base_ns(tmpd, issuer[1], me[0], core=CORE))
+        assert code == 0, (code, out, err)
+        rumor = n.nip17_unwrap(captured['wrap'], issuer[0])
+        assert f'core: {CORE}\n' in rumor['content'], rumor['content']
+        code, out, err = run_cmd(n.cmd_board_notif_ack,
+                                base_ns(tmpd, issuer[1], me[0], core=CORE64))
+        assert code == 0, (code, out, err)
+        rumor = n.nip17_unwrap(captured['wrap'], issuer[0])
+        assert f'core: {CORE}\n' in rumor['content'], rumor['content']
+        ok('--core の 32 hex 受付と 64 hex の正規化')
     n.nostr_publish = real_pub
 
     print(f'{len(passed)} cases passed: ' + ', '.join(passed))

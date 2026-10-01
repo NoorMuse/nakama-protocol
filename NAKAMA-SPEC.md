@@ -253,7 +253,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.22**（完了）: NIP ドラフト文書 `docs/NIP-nakama.md` を §26.3 の構成案どおりに作成（commit fcc2f8e）。概要・5 kind の tags/content/署名者/スロット・三段階検証・互換性・セキュリティ考慮・既存採用の確認手順（§26.4）・正直な注記。コード変更なし（文書のみ）。
 - **v0.23**（完了）: 既存採用の確認結果と kind 再マップ実装（§26.9・§26.10）。2026-10-01 のリレー調査で 30100–30104 すべてに他者の先行採用を確認（job マーケットプレイス風アプリの 30100、ポルトガル語圏投票アプリの 30100/30101/30102/30104）。nakama イベントは未公開のためクリーンカット: 新ブロック 30107–30111（revocation→30107 / compromise→30108 / rotation→30109 / decision→30110 / draft→30111）。実装: kind 定数 5 つを環境変数上書き可能な関数に変更（`NAKAMA_KIND_REVOCATION` 等、既定 30107–30111。非 int・30000–39999 範囲外は使用時に exit 1 で拒否）、fetch 系の購読 kind・`board_fetch_all` のホワイトリストを定数ベース化、`decision_nostr_event` / `verify_board_decision_nostr_event` の既定 kind を使用時解決に変更。spec の kind 参照を一括更新（§12/13/17/19/21/22/24/25、§26.1 に再マップ注記）。旧 kinds の購読・互換サポートはスコープ外のまま。テスト `test_kind_remap.py` 新規 5 ケース群通過＋全 16 テストファイル回帰維持。
 - **v0.24**（完了）: 承認者への草案通知（§27）。`board_draft_notify --cosigners` を実装: threshold 未達・期限間近の草案について未署名の eligible メンバーに NIP-17 DM（`--policy` 必須、宛先ごとの送信記録 `<core_hash>:<reason>:<recipient_hex>.json`、発行者通知と並行、`--cosigners` なしの既定動作は不変）。テスト `test_draft_cosigners.py` 9 ケース通過＋全 17 スイート回帰維持。
-- **v0.25**（設計完了・実装中）: 通知の既読追跡・返信連携（§28）。§27.3 のスコープ外項目を昇格。NIP-17 に既読の仕組みは存在しないため「既読の検証」ではなく三層で設計: (1) 受信者の自発・手動の ack DM（`[nakama] notif-ack` ヘッダ、seal は受信者の実鍵署名で出所は検証可能だが「読んだ」の証明にはならない）、(2) 行動証拠（30111 の approvals に npub があれば cosigned）、(3) 送信記録の拡張（`gift_wrap_id`/`rumor_id`）。新規コマンド `board_notif_ack`（受信者側の ack 送信）＋ `board_notif_status`（sent/ack/cosigned の突き合わせ表示、exit 常に 0）。自動 ack は設けない（オンライン状態の自動開示＝監視の道具化を拒否）。threshold 達成済み草案への通知は「やらない」で確定（やることがない相手への通知はノイズ）。§28.2 のみ実装完了: `draft_notif_record` に `gift_wrap_id`（kind 1059）・`rumor_id`（seal=kind 14）の保存、`board_draft_notify` の両 call site で `wrap['id']` / `seal['id']` を渡す、旧形式記録は空文字で読み込む後方互換ヘルパー `draft_notif_read_record`。テスト計画ケース 2 完了（`test_draft_notify.py` ケース 9・10 追加、全 11 ケース通過＋全 18 テストファイル回帰維持）。`dm_incoming` の切り出し完了（テスト計画ケース 7 — `test_dm_incoming.py` 7 ケース追加、全 18 ファイル回帰維持）。`board_notif_ack` の実装完了（テスト計画ケース 1 — `test_notif_ack.py` 新規 11 ケース（ヘッダ形式・core 64hex 検証・reason 語彙外拒否・seal は ack 送信者の実鍵署名・--auth 受け渡し・publish 拒否/npub 不正/--from 不一致で exit 1）、全 19 テストファイル回帰維持）。残り: `board_notif_status`（テスト計画ケース 3–6・8–9）。
+- **v0.25**（完了）: 通知の既読追跡・返信連携（§28）。§27.3 のスコープ外項目を昇格。NIP-17 に既読の仕組みは存在しないため「既読の検証」ではなく三層で設計: (1) 受信者の自発・手動の ack DM（`[nakama] notif-ack` ヘッダ、seal は受信者の実鍵署名で出所は検証可能だが「読んだ」の証明にはならない）、(2) 行動証拠（30111 の approvals に npub があれば cosigned）、(3) 送信記録の拡張（`gift_wrap_id`/`rumor_id`）。新規コマンド `board_notif_ack`（受信者側の ack 送信）＋ `board_notif_status`（sent/ack/cosigned の突き合わせ表示、exit 常に 0）。自動 ack は設けない（オンライン状態の自動開示＝監視の道具化を拒否）。threshold 達成済み草案への通知は「やらない」で確定（やることがない相手への通知はノイズ）。§28.2 のみ実装完了: `draft_notif_record` に `gift_wrap_id`（kind 1059）・`rumor_id`（seal=kind 14）の保存、`board_draft_notify` の両 call site で `wrap['id']` / `seal['id']` を渡す、旧形式記録は空文字で読み込む後方互換ヘルパー `draft_notif_read_record`。テスト計画ケース 2 完了（`test_draft_notify.py` ケース 9・10 追加、全 11 ケース通過＋全 18 テストファイル回帰維持）。`dm_incoming` の切り出し完了（テスト計画ケース 7 — `test_dm_incoming.py` 7 ケース追加、全 18 ファイル回帰維持）。`board_notif_ack` の実装完了（テスト計画ケース 1 — `test_notif_ack.py` 新規 11 ケース（ヘッダ形式・core 64hex 検証・reason 語彙外拒否・seal は ack 送信者の実鍵署名・--auth 受け渡し・publish 拒否/npub 不正/--from 不一致で exit 1）、全 19 テストファイル回帰維持）。残り: `board_notif_status`（テスト計画ケース 3–6・8–9）。
 
 ---
 
@@ -1731,13 +1731,13 @@ ack は kind 14 rumor の content。機械可読ヘッダ＋任意の自由文:
 
 ```
 [nakama] notif-ack
-core: <core_hash の 64 hex>
+core: <core_hash の 32 hex（decision_core_hash 形式）>
 reason: <expiring_soon|expired|cosign_request>
 ---
 （任意の自由文。例: 今夜 cosign します）
 ```
 
-- `core` は §19 の `decision_core_hash(d)` と同一の 64 hex。reason は送信記録の reason と同一語彙。
+- `core` は §19 の `decision_core_hash(d)` と同一の **32 hex**（§28.8 の補正: 当初の「64 hex」記述は記録側の `core_hash` と突き合わせ不能だったため訂正）。`board_notif_ack --core` は 32 hex を正とし、64 hex も受け付けて先頭 32 文字に正規化する（後方互換。hex は case-insensitive）。突き合わせ（`board_notif_status`）・`parse_notif_ack` も同一正規化 `normalize_notif_core` を使う。reason は送信記録の reason と同一語彙。
 - ack の seal（kind 13）は ack 送信者（＝通知の受信者）の実鍵で署名される（§28.1 の `nip17_build_seal` 流用） — **誰が ack したかは検証可能**。ただし「読んだ」ことの証明にはならない（正直に書く: ack は主張であり、NIP-17 seal の署名者が主張の出所）。
 - ack に reply 宛先は不要 — `board_notif_status` が core＋送信者で突き合わせる。
 
@@ -1748,18 +1748,18 @@ board_notif_ack <relay> <npub> --core <core_hash> [--reason <語彙>] [--note <�
 ```
 
 - 受信者側。`<npub>` は通知の発行者（notif DM の rumor の pubkey。§28.1 の実装では rumor.pubkey = 送信者の実鍵のため、そのまま指定できる）。
-- `--core` は 64 hex のみ受付（形式不正は exit 1）。`--reason` の既定は `cosign_request`。
+- `--core` は 32 hex（decision_core_hash）を正とし、64 hex も受付（先頭 32 文字に正規化。§28.8）。形式不正は exit 1。`--reason` の既定は `cosign_request`。
 - 送信は `nip17_build_seal` / `nip17_build_gift_wrap` + `nostr_publish` の流用（`--auth` 対応）。`--from` の取り違え防止は §25.1 と同一。
 - exit コード: publish 受理で exit 0、構築失敗・拒否で exit 1。ack の到達は保証しない（§28.1）。
 
 ```
-board_notif_status <board_id> [--relay <relay>] [--policy <policy.json>] [--since <unix>] [--auth] [--dir <notif-dir>]
+board_notif_status <board_id> [--relay <relay>] [--policy <policy.json>] [--decisions <dir>] [--since <unix>] [--auth] [--dir <notif-dir>]
 ```
 
 - 送信者側の突き合わせ表示。`--dir`（既定 `~/.config/nakama/draft_notifs`）の送信記録を読み、各記録について 3 列を表示:
   - `sent`: sent_at（UTC）
-  - `ack`: 受信 DM の中に core＋送信者（＝記録の recipient）が一致する `[nakama] notif-ack` があれば `yes(<ack 時刻>)`、なければ `-`
-  - `cosigned`: `--policy` 指定時、`board_fetch_all` 相当の 30111 購読（またはローカルの `--decisions`）で同一 core の approvals に recipient の npub があれば `yes`、なければ `-`
+  - `ack`: 受信 DM の中に core（32 hex に正規化）＋送信者（＝記録の recipient）が一致する `[nakama] notif-ack` があれば `yes(<ack 時刻>)`、なければ `-`
+  - `cosigned`: `--policy` 指定時、`board_fetch_all` 相当の 30111 購読（またはローカルの `--decisions` — `board_fetch_all --out` 形式の決定 JSON ディレクトリ）で同一 core の approvals に recipient の npub があれば `yes`、なければ `-`
 - 受信 DM の取得は `cmd_dm_fetch` の fetch＋unwrap ロジックを純粋関数 `dm_incoming(secret, relay, since, auth)` に切り出して流用（コードの重複を避ける。切り出し自体はこの設計の実装ランで行う）。
 - 同一 (core, sender, reason) への複数 ack は最初の 1 件のみ有効（dedup）。reason 不一致・core 形式不正の ack は無視（spam 耐性: 無関係な ack を拾わない）。
 - exit コードは常に 0（表示機能。fetch 失敗時は stderr に警告して記録のみ表示）。
@@ -1779,23 +1779,27 @@ board_notif_status <board_id> [--relay <relay>] [--policy <policy.json>] [--sinc
 - ack への返信スレッド化（NIP-17 rumor の reply 標準が固まるまで保留）。
 - threshold 達成済み草案への通知（§28.1 の判断 4 で確定: やらない）。
 
-### 28.7 テスト計画（オフライン、`nostr_request` / `nostr_publish` をモック。ケース 1・2・7 は実装済み）
+### 28.7 テスト計画（オフライン、`nostr_request` / `nostr_publish` をモック。ケース 1〜9 すべて完了）
 
 1. `board_notif_ack` の DM 構築: ヘッダ形式・core 形式検証・`--reason` 語彙外の拒否（**完了** — `test_notif_ack.py` 新規 11 ケース、§28.8）
 2. 送信記録の拡張: `gift_wrap_id`/`rumor_id` の保存、旧形式記録の読み込み（空文字扱い）（**完了** — `test_draft_notify.py` ケース 9・10、§28.8）
-3. ack の突き合わせ: core＋sender 一致で `yes`、reason 不一致で無視、core 不正で無視
-4. 複数 ack の dedup（最初の 1 件）
-5. cosign 列: approvals に recipient npub があれば `yes`、なければ `-`
-6. `--policy` なしの status（sent/ack のみ）
+3. ack の突き合わせ: core＋sender 一致で `yes`、reason 不一致で無視、core 不正で無視（**完了** — `test_notif_status.py`、§28.8）
+4. 複数 ack の dedup（最初の 1 件）（**完了** — `test_notif_status.py`、§28.8）
+5. cosign 列: approvals に recipient npub があれば `yes`、なければ `-`（**完了** — `test_notif_status.py`、§28.8）
+6. `--policy` なしの status（sent/ack のみ）（**完了** — `test_notif_status.py`、§28.8）
 7. `dm_incoming` 切り出しの回帰: `dm_fetch` の既存動作不変（**完了** — `test_dm_incoming.py` 7 ケース、§28.8）
-8. 記録のない core への ack は status に現れない
-9. exit コード: ack 送信失敗で exit 1、status は常に exit 0
+8. 記録のない core への ack は status に現れない（**完了** — `test_notif_status.py`、§28.8）
+9. exit コード: ack 送信失敗で exit 1、status は常に exit 0（**完了** — `test_notif_status.py`、§28.8）
 
-### 28.8 実装記録（2026-10-01、§28.2・`dm_incoming` 完了）
+### 28.8 実装記録（2026-10-01、§28 完了）
 
 `draft_notif_record` に `gift_wrap_id`（kind 1059 の id）・`rumor_id`（seal = kind 14 の id）の保存を追加（キーワード引数、既定は空文字）。`cmd_board_draft_notify` の発行者通知・cosigner 通知の両 call site で `wrap['id']` / `seal['id']` を渡す（ファイル名は不変）。読み込みは新規ヘルパー `draft_notif_read_record` に集約: 旧形式の記録（両フィールドなし）も読み飛ばさず読み込み、欠けているフィールドは空文字として扱う（後方互換）。`draft_notif_already_sent` は新 reader を使うよう内部整理（動作不変）。`--dry-run` 時は従来通り記録しない。テスト: `test_draft_notify.py` にケース 9（e2e: publish モック＋seal 構築の spy で `gift_wrap_id == wrap['id']` / `rumor_id == seal['id']` を検証、記録なし・壊れた JSON は None）・ケース 10（旧形式 JSON の後方互換: 空文字扱い・二重送信防止は継続）追加、全 11 ケース通過＋全 18 テストファイル回帰維持。残り: `dm_incoming` 切り出し、`board_notif_ack`、`board_notif_status`（テスト計画ケース 1・3–9）。
 
 `dm_incoming` の切り出し: `cmd_dm_fetch` の fetch＋unwrap ロジックを `dm_incoming(secret, relay, since, auth, limit=500)` に分離（`cmd_dm_fetch` は表示だけの薄いラッパに。`--limit` は引数で透過し既存の既定 20 を維持 — 動作は完全同一）。整列キーは旧実装通り gift wrap の `created_at`（NIP-17 の wrap 時刻は ±2 日のランダム値のため rumor 時刻では整列しない点は設計通り、テストで明示）。復号失敗の wrap は無視、ネットワーク失敗は `nostr_request` の例外をそのまま伝播（握りつぶさない）。テスト計画ケース 7 完了: `test_dm_incoming.py` 新規 7 ケース（wrap の created_at 昇順整列・復号不能 wrap の無視・REQ フィルタの kinds/#p/since/limit・auth_secret の受け渡し・`cmd_dm_fetch` 表示形式の回帰・空購読メッセージ・例外伝播）、全 18 テストファイル回帰維持。ロードマップ §7 を更新。残り: `board_notif_ack`、`board_notif_status`（テスト計画ケース 1・3–6・8–9）。
+
+`board_notif_status` の実装: 新規コマンド `board_notif_status <board_id> [--relay] [--since] [--limit] [--auth] [--policy <policy.json>] [--decisions <dir>] [--dir <notif-dir>]`（§28.4）。純粋ヘルパ: `normalize_notif_core`（32 hex を正とし 64 hex を先頭 32 文字に正規化、hex は case-insensitive — 下記の設計補正）、`parse_notif_ack`（ack 平文のパース。ヘッダ不一致・core 不正・reason 語彙外は None＝無視で spam 耐性）、`collect_notif_acks`（rumor → `(core32, 送信者 hex, reason)` → rumor created_at。同一キーの複数 ack は最初の 1 件のみ＝dedup）、`load_notif_records`（`--dir` の `*.json` をファイル名昇順で読み、reason 語彙外・core 不正・壊れた JSON は読み飛ばし。`gift_wrap_id`/`rumor_id` の既定は空文字で後方互換）、`notif_cosigned_by_core_from_relay`（30111 購読・三段階検証・approvals マージ → core → npub 集合）、`notif_cosigned_by_core_from_decisions`（`board_fetch_all --out` 形式のローカル決定 JSON からの同一計算 — オフラインの escape hatch）。表示は各記録に `[reason] <core32> to=<npub> sent=<UTC> ack=yes(<UTC>|-)`（＋ `--policy` 時のみ `cosigned=yes|-`）。`--relay` 未指定・fetch 失敗・policy 無効時は stderr 警告＋記録のみ表示に degrade し、exit は常に 0（表示機能）。ack の注記（「読んだ」の証明ではなく受信者本人の主張）を末尾に表示（§28.5）。
+
+設計補正（§28.3・§28.4 の訂正）: 当初の「`--core` は 64 hex のみ」は記録側の `core_hash`（`decision_core_hash` = 32 hex）と突き合わせ不能な矛盾だった。`board_notif_ack --core` は 32 hex を正とし 64 hex も受付（正規化）、`notif_ack_message` は格納時に正規化、`parse_notif_ack` も同一正規化で読む。`test_notif_ack.py` の既存ケース 1・6 を正規化に合わせて更新（大文字 hex は小文字化して受付 — hex は case-insensitive）。テスト計画ケース 3・4・5・6・8・9 完了: `test_notif_status.py` 新規 12 ケース（正規化単体・パース単体・突き合わせ・64 hex ack の正規化突き合わせ・dedup・cosigned yes/-・`--decisions`・`--policy` なし・記録外 core の非表示・fetch 失敗で exit 0・`--relay` 未指定で exit 0・壊れた記録の読み飛ばし）＋全 20 テストファイル回帰維持。v0.25（§28）完了。
 
 ---
 
@@ -1863,3 +1867,4 @@ Contributions that shaped this spec and the code. Built by many hands.
 - 2026-10-01: v0.25 続行 — §28.2 の設計を実装。`draft_notif_record` に `gift_wrap_id`（kind 1059 の id）・`rumor_id`（seal = kind 14 の id）の保存を追加（既定は空文字のキーワード引数）。`cmd_board_draft_notify` の発行者通知・cosigner 通知の両 call site で `wrap['id']` / `seal['id']` を渡す（記録ファイル名は不変）。読み込みは新規ヘルパー `draft_notif_read_record` に集約 — 旧形式の記録（両フィールドなし）も読み飛ばさず読み込み、欠けているフィールドは空文字として扱う（後方互換）。`draft_notif_already_sent` は新 reader を使うよう内部整理（動作不変）。`--dry-run` 時の非記録は従来通り。テスト計画ケース 2 完了: `test_draft_notify.py` にケース 9（e2e: publish モック＋seal 構築の spy で `gift_wrap_id == wrap['id']` / `rumor_id == seal['id']` を検証、記録なし・壊れた JSON は None）・ケース 10（旧形式 JSON の後方互換: 空文字扱い・二重送信防止は継続）追加、全 11 ケース通過＋全 18 テストファイル回帰維持。ロードマップ §7 を v0.25（設計完了・実装中）に更新。残り: `dm_incoming` 切り出し、`board_notif_ack`、`board_notif_status`（テスト計画ケース 1・3–9）。
 - 2026-10-01: v0.25 続行 — `dm_incoming` の切り出しを実装。`cmd_dm_fetch` の fetch＋unwrap ロジックを `dm_incoming(secret, relay, since, auth, limit=500)` に分離、`cmd_dm_fetch` は表示だけの薄いラッパに（`--limit` は透過し既定 20 維持、表示形式・空購読メッセージ・例外の扱いは完全同一）。整列キーは gift wrap の `created_at` のまま（NIP-17 の wrap 時刻は ±2 日のランダム値 — テストで設計通りであることを明示）。ネットワーク失敗は例外を伝播。テスト計画ケース 7 完了: `test_dm_incoming.py` 新規 7 ケース（wrap 時刻の昇順整列・復号不能 wrap の無視・REQ フィルタ・auth 受け渡し・表示形式の回帰・例外伝播）＋全 18 テストファイル回帰維持。ロードマップ §7・§28.8 を更新。残り: `board_notif_ack`、`board_notif_status`（テスト計画ケース 1・3–6・8–9）。
 - 2026-10-01: v0.25 続行 — `board_notif_ack` を実装（spec §28.3・§28.4）。純粋な `notif_ack_message(core, reason, note)`（`[nakama] notif-ack` ヘッダ / `core: <64 hex>` / `reason: <語彙>` / `---` / 任意の自由文、reason 語彙は通知の送信記録と同一の `expiring_soon`/`expired`/`cosign_request`、既定 `cosign_request`）。新規コマンド `board_notif_ack <relay> <npub> --core <64 hex> [--reason 語彙] [--note 自由文] [--auth] [--from NPUB]`（受信者側の ack 送信）。`--core` は 64 hex のみ受付（形式不正は exit 1）、`--reason` は語彙外を exit 1 で拒否（argparse の choices ではなく明示検証 — exit 1 を保証）。送信は `nip17_build_seal`/`nip17_build_gift_wrap` + `nostr_publish` の流用（seal は ack 送信者＝通知の受信者の実鍵署名。`--auth` 対応、`--from` の取り違え防止は §25.1 と同一）。exit: publish 受理で 0、構築失敗・拒否で 1（ack の到達は保証しない — §28.1）。テスト計画ケース 1 完了: `test_notif_ack.py` 新規 11 ケース（ヘッダ形式・note なし形式・reason 語彙 3 種の構築・e2e: publish モック＋復号で seal/rumor の署名者が ack 送信者の実鍵であることの検証・`--auth` の受け渡し・core 形式不正（短い・非 hex・大文字・空）・reason 語彙外・publish 拒否・npub 形式不正・`--from` 不一致で exit 1）通過＋全 19 テストファイル回帰維持。ロードマップ §7・§28.7・§28.8 を更新。残り: `board_notif_status`（テスト計画ケース 3–6・8–9）。
+- 2026-10-01: v0.25 完了 — `board_notif_status` を実装（spec §28.4）。新規コマンド `board_notif_status <board_id> [--relay] [--since] [--limit] [--auth] [--policy <policy.json>] [--decisions <dir>] [--dir <notif-dir>]`。純粋ヘルパ `normalize_notif_core`（32 hex を正とし 64 hex を先頭 32 文字に正規化）/`parse_notif_ack`/`collect_notif_acks`（dedup: 同一 (core, sender, reason) は最初の 1 件）/`load_notif_records`/`notif_cosigned_by_core_from_relay`・`notif_cosigned_by_core_from_decisions`（ローカルの `board_fetch_all --out` 形式）。各記録に sent（UTC）/ ack（`yes(<時刻>)` / `-`）/ cosigned（`--policy` 時のみ `yes` / `-`）を表示。fetch 失敗時は stderr 警告＋記録のみ表示に degrade、exit は常に 0。設計補正: 当初の「`--core` は 64 hex のみ」は記録側の `core_hash`（32 hex）と突き合わせ不能だったため、32 hex を正・64 hex も受付（正規化）に訂正（`notif_ack_message` は格納時に正規化、`test_notif_ack.py` の既存ケースを更新）。テスト計画ケース 3・4・5・6・8・9 完了: `test_notif_status.py` 新規 12 ケース＋全 20 テストファイル回帰維持。v0.25（§28）完了。

@@ -77,7 +77,11 @@
       --cosigners で threshold 未達・期限間近の草案の未署名 eligible 承認者にも通知（--policy 必須 — spec §27）
   nakama.py board_notif_ack <relay> <npub> --core <core_hash> [--reason 語彙] [--note 自由文] [--auth] [--from NPUB]
       通知を受け取った側が通知の発行者に自発・手動で ack DM を送る（--reason の既定: cosign_request。
-      語彙は expiring_soon/expired/cosign_request。--core は 64 hex のみ受付 — spec §28）
+      語彙は expiring_soon/expired/cosign_request。--core は 32 hex（decision_core_hash）または 64 hex を受付 — spec §28）
+  nakama.py board_notif_status <board_id> [--relay RELAY] [--since UNIX] [--limit N] [--auth] [--policy POLICY] [--decisions DIR] [--dir DIR]
+      送信記録の突き合わせ表示: 各記録に sent（UTC）/ ack（受信 DM の notif-ack と突き合わせ）/
+      cosigned（--policy 時のみ、同一 core の 30111 approvals に recipient の npub）を表示（spec §28）。
+      fetch 失敗時は記録のみ表示。exit は常に 0
 """
 import argparse, base64, hashlib, json, os, re, secrets, sys, time
 
@@ -3194,9 +3198,11 @@ NOTIF_ACK_HEADER = '[nakama] notif-ack'
 def notif_ack_message(core: str, reason: str, note: str | None = None) -> str:
     """ack DM 平文（kind 14 rumor の content）。形式は spec §28.3 に固定（純粋）。
 
-    core は 64 hex（§19 の decision_core_hash と同一）、reason は NOTIF_ACK_REASONS。
+    core は normalize_notif_core で 32 hex（decision_core_hash 形式）に正規化
+    して格納する（突き合わせのキー一致のため、§28.8）。reason は NOTIF_ACK_REASONS。
     形式の検証は呼び出し側（cmd）が担う。
     """
+    core = normalize_notif_core(core) or core
     lines = [NOTIF_ACK_HEADER,
              f'core: {core}',
              f'reason: {reason}',
@@ -3232,9 +3238,9 @@ def cmd_board_notif_ack(args):
     except Exception:
         print('npub の形式が不正です', file=sys.stderr)
         sys.exit(1)
-    core = args.core or ''
-    if not re.fullmatch(r'[0-9a-f]{64}', core):
-        print('--core は 64 文字の hex (core_hash) である必要があります',
+    core = normalize_notif_core(args.core or '')
+    if core is None:
+        print('--core は 32 hex（decision_core_hash）または 64 hex である必要があります',
               file=sys.stderr)
         sys.exit(1)
     reason = args.reason or 'cosign_request'
@@ -3253,6 +3259,226 @@ def cmd_board_notif_ack(args):
                                 auth_secret=secret if args.auth else None)
     print(f'publish: {"受理" if accepted else "拒否"} ({r}) id={wrap["id"]}')
     sys.exit(0 if accepted else 1)
+
+
+    sys.exit(0 if accepted else 1)
+
+
+# --- v0.25: 通知の突き合わせ表示 (spec §28.4) ---
+
+def normalize_notif_core(core: str) -> str | None:
+    """通知系の core を decision_core_hash 形式（32 hex）に正規化する（純粋）。
+
+    32 hex はそのまま、64 hex は先頭 32 文字を取る（後方互換）。それ以外は None。
+    §28.3 の「64 hex のみ」は記録側の core_hash（decision_core_hash = 32 hex）と
+    突き合わせ不能だったため §28.8 で補正: 記録の 32 hex を正とする。
+    """
+    c = (core or '').strip().lower()
+    if re.fullmatch(r'[0-9a-f]{32}', c):
+        return c
+    if re.fullmatch(r'[0-9a-f]{64}', c):
+        return c[:32]
+    return None
+
+
+def parse_notif_ack(content: str) -> dict | None:
+    """ack DM 平文（kind 14 rumor の content）をパースする（純粋、spec §28.3）。
+
+    成功時は {'core': 32hex, 'reason': 語彙}。形式不正（ヘッダ不一致・core 不正・
+    reason 語彙外）は None を返す — 突き合わせで無視する（spam 耐性、§28.4）。
+    """
+    lines = [(l or '').strip() for l in (content or '').split('\n')]
+    if len(lines) < 4 or lines[0] != NOTIF_ACK_HEADER or lines[3] != '---':
+        return None
+    m_core = re.fullmatch(r'core:\s*(\S+)', lines[1])
+    m_reason = re.fullmatch(r'reason:\s*(\S+)', lines[2])
+    if not m_core or not m_reason:
+        return None
+    core = normalize_notif_core(m_core.group(1))
+    reason = m_reason.group(1)
+    if core is None or reason not in NOTIF_ACK_REASONS:
+        return None
+    return {'core': core, 'reason': reason}
+
+
+def collect_notif_acks(rumors: list) -> dict:
+    """受信 rumor から (core32, ack 送信者 hex, reason) → rumor created_at の辞書を作る（純粋）。
+
+    rumors は dm_incoming の返り値（wrap created_at 昇順）想定。同一キーへの
+    複数 ack は最初の 1 件のみ有効（dedup、§28.4）。形式不正の ack は無視。
+    """
+    out = {}
+    for r in rumors:
+        if not isinstance(r, dict):
+            continue
+        p = parse_notif_ack(r.get('content', ''))
+        if p is None:
+            continue
+        key = (p['core'], r.get('pubkey', ''), p['reason'])
+        if key not in out:
+            out[key] = r.get('created_at', 0)
+    return out
+
+
+def load_notif_records(notif_dir: str) -> list:
+    """送信記録ディレクトリの *.json を読み、妥当な記録の dict を返す（ファイル名昇順）。
+
+    core は 32 hex に正規化。reason 語彙外・core 不正・JSON 破損・dict 以外は
+    読み飛ばす。draft_notif_read_record と同じ後方互換（gift_wrap_id / rumor_id
+    の既定は空文字）。発行者通知・承認者通知の両形式に対応（spec §25.1/§27.1）。
+    """
+    out = []
+    try:
+        names = sorted(os.listdir(notif_dir))
+    except OSError:
+        return []
+    for fn in names:
+        if not fn.endswith('.json'):
+            continue
+        try:
+            with open(os.path.join(notif_dir, fn)) as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        core = normalize_notif_core(rec.get('core_hash', ''))
+        if core is None or rec.get('reason') not in NOTIF_ACK_REASONS:
+            continue
+        rec = dict(rec)
+        rec['core_hash'] = core
+        rec.setdefault('gift_wrap_id', '')
+        rec.setdefault('rumor_id', '')
+        out.append(rec)
+    return out
+
+
+def notif_cosigned_by_core_from_decisions(decisions_dir: str) -> dict:
+    """ローカル決定 JSON（board_fetch_all --out 形式）から core → approvals の npub 集合。"""
+    out = {}
+    try:
+        names = sorted(os.listdir(decisions_dir))
+    except OSError:
+        return {}
+    for fn in names:
+        if not fn.endswith('.json'):
+            continue
+        try:
+            with open(os.path.join(decisions_dir, fn)) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        try:
+            core = decision_core_hash(d)
+        except Exception:
+            continue
+        npubs = {a.get('npub') for a in d.get('approvals', [])
+                 if isinstance(a, dict) and a.get('npub')}
+        out.setdefault(core, set()).update(npubs)
+    return out
+
+
+def notif_cosigned_by_core_from_relay(secret: bytes, relay: str, board_id: str,
+                                      limit: int, auth: bool) -> dict:
+    """30111 を購読・検証・マージし、core → approvals の npub 集合を返す（spec §28.4）。"""
+    filt = {'kinds': [DRAFT_NOSTR_KIND()], '#h': [board_id], 'limit': limit}
+    events = nostr_request(relay, ['REQ', secrets.token_hex(8), filt],
+                           auth_secret=secret if auth else None)
+    valid = []
+    for ev in events:
+        d = verify_board_decision_nostr_event(ev, board_id,
+                                             expect_kind=DRAFT_NOSTR_KIND())
+        if d is not None:
+            valid.append(d)
+    out = {}
+    for md in merge_decision_approvals(valid):
+        out[decision_core_hash(md)] = {
+            a.get('npub') for a in md.get('approvals', [])
+            if isinstance(a, dict) and a.get('npub')}
+    return out
+
+
+def cmd_board_notif_status(args):
+    """送信者側の通知突き合わせ表示（spec §28.4）。
+
+    --dir（既定 ~/.config/nakama/draft_notifs）の送信記録を読み、各記録について
+    sent（UTC）/ ack（受信 DM の [nakama] notif-ack と突き合わせ）/
+    cosigned（--policy 時のみ: 同一 core の 30111 approvals に recipient の npub）
+    を表示する。ack 列は「読んだ」の証明ではなく受信者本人の主張の記録（§28.5）。
+    fetch 失敗時は stderr に警告して記録のみ表示。exit は常に 0（表示機能）。
+    """
+    secret = load_key(args.keyfile)
+    notif_dir = getattr(args, 'dir', None) or DRAFT_NOTIFS_DEFAULT
+    records = load_notif_records(notif_dir)
+    relay = getattr(args, 'relay', None)
+    # 1. ack の突き合わせ（dm_incoming を流用）
+    acks = {}
+    if relay:
+        try:
+            rumors = dm_incoming(secret, relay, getattr(args, 'since', None),
+                                 args.auth)
+        except Exception as e:
+            print(f'DM の取得に失敗しました: {e}（送信記録のみ表示します）',
+                  file=sys.stderr)
+            rumors = []
+        acks = collect_notif_acks(rumors)
+    else:
+        print('--relay 未指定のため ack DM の取得を省略します（送信記録のみ表示）',
+              file=sys.stderr)
+    # 2. cosigned 列（--policy 時のみ）
+    cosigned = None
+    if getattr(args, 'policy', None):
+        policy = None
+        try:
+            with open(args.policy) as f:
+                policy = json.load(f)
+            if not verify_board_policy_cert(policy):
+                raise ValueError('n-of-n 署名が無効')
+            if policy.get('board_id') != args.board_id:
+                raise ValueError('board_id が取得対象と一致しません')
+        except Exception as e:
+            print(f'policy の読み込み・検証に失敗しました: {e}'
+                  '（cosigned 列を省略します）', file=sys.stderr)
+        else:
+            try:
+                if getattr(args, 'decisions', None):
+                    cosigned = notif_cosigned_by_core_from_decisions(
+                        args.decisions)
+                elif relay:
+                    cosigned = notif_cosigned_by_core_from_relay(
+                        secret, relay, args.board_id, args.limit, args.auth)
+                else:
+                    print('--relay も --decisions も未指定のため cosigned 列を省略します',
+                          file=sys.stderr)
+            except Exception as e:
+                print(f'30111 の取得に失敗しました: {e}'
+                      '（cosigned 列を省略します）', file=sys.stderr)
+    if not records:
+        print('送信記録はありませんでした')
+    for rec in records:
+        core = rec['core_hash']
+        reason = rec['reason']
+        rhx = rec.get('recipient_hex') or ''
+        rnpub = hex_to_npub(rhx) or '?'
+        sent = rec.get('sent_at')
+        sent_s = (time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(sent)) + ' UTC'
+                  if isinstance(sent, int) and not isinstance(sent, bool)
+                  else '?')
+        ack_ts = acks.get((core, rhx, reason))
+        ack_s = ('yes(' + time.strftime('%Y-%m-%d %H:%M:%S',
+                                        time.gmtime(ack_ts)) + ' UTC)'
+                 if isinstance(ack_ts, int) and not isinstance(ack_ts, bool)
+                 else '-')
+        cols = f'sent={sent_s} ack={ack_s}'
+        if cosigned is not None:
+            cos = ('yes' if rnpub != '?' and rnpub in cosigned.get(core, set())
+                   else '-')
+            cols += f' cosigned={cos}'
+        print(f'[{reason}] {core} to={rnpub} {cols}')
+    if records:
+        print('注: ack は「読んだ」の証明ではなく、受信者本人の主張の記録です（§28.5）')
 
 
 # --- v0.4: ガバナンス照合 (spec §9.4: board_read --governance) ---
@@ -3754,6 +3980,14 @@ def main():
     s.add_argument('--note', default=None, help='ack に添える任意の自由文')
     s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
     s.add_argument('--from', dest='from_npub', default=None, help='送信者の npub（keyfile の鍵と一致しなければ拒否 — 取り違え防止）')
+    s = sub.add_parser('board_notif_status'); s.add_argument('board_id')
+    s.add_argument('--relay', default=None, help='ack DM 取得・30111 購読のリレー（未指定時は送信記録のみ表示）')
+    s.add_argument('--since', type=int, default=None, help='ack DM 取得の since（unix 秒、未指定時は全件）')
+    s.add_argument('--limit', type=int, default=20, help='30111 購読の limit（既定 20）')
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s.add_argument('--policy', default=None, help='運営規約 JSON（指定時のみ cosigned 列を表示）')
+    s.add_argument('--decisions', default=None, help='ローカルの決定 JSON ディレクトリ（board_fetch_all --out 形式。--policy 時の 30111 購読の代わり — spec §28.4）')
+    s.add_argument('--dir', default=None, help='送信記録のディレクトリ (既定: ~/.config/nakama/draft_notifs)')
 
     args = ap.parse_args()
     {'init': cmd_init, 'whoami': cmd_whoami, 'propose': cmd_propose,
@@ -3785,7 +4019,8 @@ def main():
      'board_draft_fetch': cmd_board_draft_fetch,
      'board_fetch_all': cmd_board_fetch_all,
      'board_draft_notify': cmd_board_draft_notify,
-     'board_notif_ack': cmd_board_notif_ack}[args.cmd](args)
+     'board_notif_ack': cmd_board_notif_ack,
+     'board_notif_status': cmd_board_notif_status}[args.cmd](args)
 
 
 if __name__ == '__main__':
