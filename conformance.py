@@ -726,6 +726,31 @@ nakama.py's own `cmd_dm_recv` (offline: real key pairs, in-process
 NIP-44 seal/gift-wrap, temp keyfile + temp giftwrap file — valid,
 multi-line, and tampered-signature failure cases).
 
+Rotation-verify report conformance:
+
+    python3 conformance.py check_verify_rotation <report1.txt> [...]
+
+Verifies a saved `nakama.py verify_rotation` stdout report is internally
+consistent (spec §5.5.3): exactly one line — either the valid verdict
+`rotation は有効です: <old16>... → <new16>...` (the two prefixes are
+the first 16 characters of the old/new npubs; bech32 text, so only
+"16 non-space characters" is checked, like `check_rotate_fetch`'s
+revoker prefixes) or the invalid verdict `rotation は無効です`.
+The `...` ellipsis and the `→` arrow are literal. Trailing blank lines
+tolerated; a leading blank line is rejected. Explicitly out of scope:
+the verdict's truth (the cert's territory — `check_rotation` /
+`verify_rotation_cert`), the npubs' truth, stderr, and the exit code
+(invisible in saved stdout text). The `rotate` command's multi-line
+issuance report is a different grammar — the two checkers reject each
+other's reports. Use this to prove a second implementation's
+`verify_rotation` CLI prints a compatible report.
+
+`python3 conformance.py selftest` also covers
+`check_verify_rotation` with reports produced in-process by
+nakama.py's own `cmd_verify_rotation` (offline: real key pairs, real
+Schnorr-signed rotation certs in temp files — valid, and a
+tampered-new_npub invalid case with exact stdout+exit match).
+
 Board-read report conformance:
 
     python3 conformance.py check_board_read <report1.txt> [...]
@@ -3819,6 +3844,78 @@ def check_dm_recv_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_dm_recv_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_verify_rotation: verify_rotation report consistency ----------
+
+# A saved `nakama.py verify_rotation` stdout report. Its grammar is fixed
+# (spec §5.5.3). check_verify_rotation verifies that the report is internally
+# consistent. Exactly one line, either:
+#   valid:    rotation は有効です: <old16>... → <new16>...
+#   invalid:  rotation は無効です
+# The prefixes are the first 16 characters of the old/new npubs — bech32
+# text, not hex, so only "16 non-space characters" is checked (the same
+# rule as `check_rotate_fetch`'s revoker prefixes, §12.4). The `...`
+# ellipsis and the `→` arrow are literal parts of the reference grammar.
+# Explicitly out of scope: the verdict's truth (the cert's territory:
+# `check_rotation`/`verify_rotation_cert`), the npubs' truth, stderr, and
+# the exit code (invisible in saved stdout text). The `rotate` command's
+# multi-line issuance report (`rotation 証明書: <out>` + the same
+# `<old16>... → <new16>...` arrow line + notes) is a different grammar
+# and is rejected (the two checkers reject each other's reports).
+
+_RE_VR_VALID = re.compile(
+    r'^rotation は有効です: (\S{16})\.\.\. → (\S{16})\.\.\.$')
+_RE_VR_INVALID = re.compile(r'^rotation は無効です$')
+
+
+def conform_verify_rotation_report(text: str):
+    """Verify a saved `nakama.py verify_rotation` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) != 1:
+        return False, [f'report must be a single verdict line, '
+                       f'found {len(lines)} lines'], info
+    m = _RE_VR_INVALID.match(lines[0])
+    if m:
+        info.append('invalid verdict')
+        return (not errs), errs, info
+    m = _RE_VR_VALID.match(lines[0])
+    if not m:
+        return False, ['line 1: not a verify_rotation verdict line '
+                       '(`rotation は有効です: <old16>... → <new16>...` '
+                       'or `rotation は無効です`)'], info
+    old, new = m.group(1), m.group(2)
+    info.append(f'valid verdict: {old}… → {new}…')
+    return (not errs), errs, info
+
+
+def check_verify_rotation_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_verify_rotation_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -7401,6 +7498,127 @@ def selftest() -> int:
     print(f'--- dm-recv {dmr_total - dmr_fails}/{dmr_total} passed ---')
     fails += dmr_fails
 
+    # ---------- check_verify_rotation: verify_rotation report consistency --
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_verify_rotation (offline: real key pairs, real Schnorr-signed
+    # rotation certs written to a temp file — valid, and a tampered
+    # new_npub invalid case); hand-mutated reports that break the
+    # single-verdict-line grammar must be rejected.
+    vrt_fails = 0
+    _vrt_old_s, _vrt_old_np = _key()
+    _vrt_new_s, _vrt_new_np = _key()
+
+    def _vrt_cert(tamper=False):
+        created = 1759280000
+        msg = nakama.rotation_message(_vrt_old_np, _vrt_new_np, created)
+        cert = {
+            'protocol': 'nakama', 'version': 1, 'type': 'rotation',
+            'old_npub': _vrt_old_np, 'new_npub': _vrt_new_np,
+            'created_at': created,
+            'old_sig': nakama.sign_schnorr(_vrt_old_s, msg).hex(),
+        }
+        if tamper:
+            cert = json.loads(json.dumps(cert))
+            cert['new_npub'] = nakama.npub_of(_vrt_old_s)  # old == new
+        return cert
+
+    def _vrt_run(cert):
+        with tempfile.TemporaryDirectory() as td:
+            rp = os.path.join(td, 'rotation.json')
+            with open(rp, 'w') as f:
+                json.dump(cert, f)
+            buf = io.StringIO()
+            code = 0
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    nakama.cmd_verify_rotation(
+                        SimpleNamespace(rotation=rp))
+                except SystemExit as e:
+                    code = e.code if isinstance(e.code, int) else 0
+            return buf.getvalue(), code
+
+    _vrt_e2e = []
+    _rep, _code = _vrt_run(_vrt_cert())
+    _vrt_e2e.append(('valid', _rep, _code, 0,
+                     f'rotation は有効です: {_vrt_old_np[:16]}... → '
+                     f'{_vrt_new_np[:16]}...\n'))
+    _rep, _code = _vrt_run(_vrt_cert(tamper=True))
+    _vrt_e2e.append(('invalid (tampered new_npub)', _rep, _code, 1,
+                     'rotation は無効です\n'))
+    for name, rep, code, want_code, want_rep in _vrt_e2e:
+        exact = (rep == want_rep) and (code == want_code)
+        ok, errs, info = conform_verify_rotation_report(rep)
+        good = exact and ok
+        print(f'verify-rotation-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({ "; ".join(info) })')
+        if not good:
+            if not exact:
+                print(f'    - stdout/exit mismatch: {rep!r} code={code}')
+            for e in errs:
+                print(f'    - {e}')
+            vrt_fails += 1
+
+    # hand-crafted positives
+    _dh_s, _dh_np = _key()
+    dh_vr = _dh_np[:16]  # real npub prefix: 16 bech32 chars
+    vrt_pos = [
+        ('valid line', f'rotation は有効です: {dh_vr}... → {dh_vr}...\n'),
+        ('invalid line', 'rotation は無効です\n'),
+        ('no trailing newline',
+         f'rotation は有効です: {dh_vr}... → {dh_vr}...'),
+        ('trailing blanks',
+         'rotation は無効です\n\n\n'),
+    ]
+    for name, rep in vrt_pos:
+        ok, errs, info = conform_verify_rotation_report(rep)
+        print(f'verify-rotation/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        vrt_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    vrt_neg = []
+    vrt_neg.append(('empty report', ''))
+    vrt_neg.append(('garbage line', 'hello\n'))
+    vrt_neg.append(('two lines', 'rotation は無効です\nrotation は無効です\n'))
+    vrt_neg.append(('missing ellipsis after old prefix',
+                    f'rotation は有効です: {dh_vr} → {dh_vr}...\n'))
+    vrt_neg.append(('missing arrow',
+                    f'rotation は有効です: {dh_vr}... {dh_vr}...\n'))
+    vrt_neg.append(('short old prefix',
+                    f'rotation は有効です: npub1abc... → {dh_vr}...\n'))
+    vrt_neg.append(('short new prefix',
+                    f'rotation は有効です: {dh_vr}... → npub1abc...\n'))
+    vrt_neg.append(('space inside prefix',
+                    'rotation は有効です: npub1abcd efgh... → '
+                    f'{dh_vr}...\n'))
+    vrt_neg.append(('invalid verdict with suffix',
+                    'rotation は無効です: ほげ\n'))
+    vrt_neg.append(('invalid with extra line',
+                    'rotation は無効です\n' + dh_vr + '\n'))
+    vrt_neg.append(('rotate issuance report (different grammar)',
+                    f'rotation 証明書: rotation.json\n'
+                    f'{dh_vr}... → {dh_vr}...\n注意: のこり\n'))
+    vrt_neg.append(('bare arrow line (rotate second line alone)',
+                    f'{dh_vr}... → {dh_vr}...\n'))
+    vrt_neg.append(('leading blank line',
+                    '\nrotation は無効です\n'))
+
+    for name, rep in vrt_neg:
+        ok, errs, info = conform_verify_rotation_report(rep)
+        good = not ok
+        print(f'verify-rotation-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            vrt_fails += 1
+
+    vrt_total = len(_vrt_e2e) + len(vrt_pos) + len(vrt_neg)
+    print(f'--- verify-rotation {vrt_total - vrt_fails}/{vrt_total} '
+          f'passed ---')
+    fails += vrt_fails
+
     # ---------- check_board_read: board_read report consistency ----------
     # Reference reports are produced in-process with nakama.py's own
     # cmd_board_read, with nostr_request monkeypatched to return crafted
@@ -10707,7 +10925,7 @@ def selftest() -> int:
         + bfa_total + pub_total + gov_total + rf_total + rtf_total \
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
         + bj_total + bs_total + bc_total + vbd_total + bvr_total \
-        + bdc_total + bcs_total + dmr_total
+        + bdc_total + bcs_total + dmr_total + vrt_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -11001,6 +11219,12 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_dm_recv <report.txt> [...]')
             return 2
         return check_dm_recv_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_verify_rotation':
+        if len(argv) < 3:
+            print('usage: conformance.py check_verify_rotation '
+                  '<report.txt> [...]')
+            return 2
+        return check_verify_rotation_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -11046,6 +11270,7 @@ def main(argv: list[str]) -> int:
           'check_board_decide <report.txt> [...] | '
           'check_board_cosign <report.txt> [...] | '
           'check_dm_recv <report.txt> [...] | '
+          'check_verify_rotation <report.txt> [...] | '
           'selftest')
     return 2
 
