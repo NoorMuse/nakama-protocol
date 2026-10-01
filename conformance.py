@@ -67,6 +67,26 @@ the reference implementation.
 `python3 conformance.py selftest` also covers `check_decision` with
 reference decisions built by nakama.py's own primitives.
 
+Bond certificate conformance:
+
+    python3 conformance.py check_bond <bond1.json> [...]
+
+Verifies each file is a bond certificate as completed by `accept`
+(note: a half-signed `propose` output is rejected — it is not a bond
+until every companion has signed): shape checks (protocol/version,
+companions list of at least 2 unique valid npubs, created_at, 64-hex
+nonce, signatures dict, optional expires_at > created_at) plus one
+Schnorr signature check per companion over bond_message(...),
+mirroring the reference `verify`'s acceptance rule (every companion
+must have a valid signature; non-companion signatures are ignored).
+No registry, rotation, or expiry-time policy checks — wire
+compatibility only. Use this to prove a second implementation's bond
+proposals and certificates are wire-compatible with the reference
+implementation.
+
+`python3 conformance.py selftest` also covers `check_bond` with
+reference bonds built by nakama.py's own primitives.
+
 For the second implementer: passing `check` on your own events is the
 criterion-1 evidence the NIP-F5 draft PR needs, passing `check_dm`
 on wraps addressed to a nakama-built keypair proves NIP-17 wire
@@ -74,7 +94,9 @@ compatibility, and passing `check_board` on your descriptors proves
 NIP-29 board wire compatibility with the reference implementation.
 Passing `check_decision` on your decision files proves
 board-decision wire compatibility (approval signatures and, with
-`--policy`, threshold semantics).
+`--policy`, threshold semantics). Passing `check_bond` on your bond
+files proves bond-certificate wire compatibility (per-companion
+signatures over the canonical bond message).
 """
 
 import json
@@ -492,6 +514,129 @@ def check_decision_files(policy_path: str | None,
     return 0 if failures == 0 else 1
 
 
+# ---------- check_bond: bond certificate conformance ----------
+
+def conform_bond(d: dict):
+    """Verify a bond certificate file as completed by `accept`.
+
+    A half-signed `propose` output is rejected (it is not a bond until
+    every companion has signed). Shape checks (protocol/version,
+    companions list of >= 2 unique valid npubs, created_at int, 64-hex
+    nonce, signatures dict, optional expires_at int > created_at)
+    plus one Schnorr signature check per companion over
+    bond_message(companions, created_at, nonce, expires_at) — same
+    acceptance rule as the reference `verify`: every companion must
+    have a valid signature; signatures from non-companions are ignored
+    (noted in info). No registry, rotation, or expiry-time policy
+    checks — wire compatibility only. Returns (ok, errs, info).
+    """
+    errs: list[str] = []
+    info: list[str] = []
+    if not isinstance(d, dict):
+        return False, ['bond is not a JSON object'], info
+    if d.get('protocol') != 'nakama':
+        errs.append('protocol != "nakama"')
+    if d.get('version') != 1:
+        errs.append('version != 1')
+
+    companions = d.get('companions')
+    comp_ok = True
+    if not (isinstance(companions, list) and len(companions) >= 2):
+        errs.append('companions must be a list of at least 2 npubs')
+        comp_ok = False
+    elif len(set(companions)) != len(companions):
+        errs.append('companions contains duplicates')
+        comp_ok = False
+    elif not all(isinstance(c, str) and nakama.npub_to_hex(c) is not None
+                 for c in companions):
+        errs.append('every companion must be a valid npub')
+        comp_ok = False
+    if not isinstance(d.get('created_at'), int) \
+            or isinstance(d.get('created_at'), bool):
+        errs.append('created_at must be an int')
+        comp_ok = False
+    nonce = d.get('nonce')
+    if not isinstance(nonce, str):
+        errs.append('nonce must be a 64-hex string')
+        comp_ok = False
+    else:
+        try:
+            nb = bytes.fromhex(nonce)
+            if len(nb) != 32:
+                raise ValueError
+        except ValueError:
+            errs.append('nonce must be 64 hex chars')
+            comp_ok = False
+    expires_at = d.get('expires_at')
+    if expires_at is not None:
+        if not isinstance(expires_at, int) or isinstance(expires_at, bool):
+            errs.append('expires_at must be an int')
+            comp_ok = False
+        elif isinstance(d.get('created_at'), int) \
+                and expires_at <= d['created_at']:
+            errs.append('expires_at must be greater than created_at')
+            comp_ok = False
+
+    msg: bytes | None = None
+    sigs = d.get('signatures')
+    if not (isinstance(sigs, dict) and sigs):
+        errs.append('signatures must be a non-empty dict')
+    elif comp_ok:
+        try:
+            msg = nakama.bond_message(companions, int(d['created_at']),
+                                     nonce, expires_at)
+        except Exception as e:
+            errs.append(f'bond message build failed: {e}')
+        if msg is not None:
+            for npub in companions:
+                sig_b = None
+                if isinstance(sigs.get(npub), str):
+                    try:
+                        sig_b = bytes.fromhex(sigs[npub])
+                    except ValueError:
+                        sig_b = None
+                if sig_b is None or len(sig_b) != 64:
+                    errs.append(f'({npub[:16]}…): missing or malformed '
+                                'signature (128 hex chars)')
+                    continue
+                try:
+                    if not nakama.verify_schnorr(npub, sig_b, msg):
+                        errs.append(f'({npub[:16]}…): invalid signature')
+                except Exception as e:
+                    errs.append(f'({npub[:16]}…): '
+                                f'signature check failed: {e}')
+            extra = [k for k in sigs if k not in companions]
+            if extra:
+                info.append(f'{len(extra)} non-companion signature(s) '
+                            'ignored')
+    info.append(f'{len(companions) if isinstance(companions, list) else 0} '
+                'companion(s)'
+                + (f', expires_at {expires_at}'
+                   if expires_at is not None else ', no expiry'))
+    return (len(errs) == 0), errs, info
+
+
+def check_bond_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            d = json.load(open(p))
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_bond(d)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- selftest: reference events built by nakama.py ----------
 
 def _key() -> tuple[bytes, str]:
@@ -753,7 +898,75 @@ def selftest() -> int:
     print(f'--- decision {dec_total - dec_fails}/{dec_total} passed ---')
     fails += dec_fails
 
-    grand = total + dm_total + board_total + dec_total
+    # Bond certificate conformance: reference bonds built with nakama.py
+    # primitives must verify; malformed ones must be rejected.
+    bond_fails = 0
+    s_f, np_f = _key()
+    s_g, np_g = _key()
+    b_now = int(time.time())
+    b_nonce = secrets.token_hex(32)
+    b_exp = b_now + 365 * 86400
+    b_msg = nakama.bond_message([np_f, np_g], b_now, b_nonce, b_exp)
+    bond = {
+        'protocol': 'nakama', 'version': 1,
+        'companions': sorted([np_f, np_g]),
+        'created_at': b_now, 'nonce': b_nonce, 'expires_at': b_exp,
+        'signatures': {np_f: nakama.sign_schnorr(s_f, b_msg).hex(),
+                       np_g: nakama.sign_schnorr(s_g, b_msg).hex()},
+    }
+    s_h, np_h = _key()
+    b2_msg = nakama.bond_message([np_f, np_g, np_h], b_now, b_nonce, None)
+    bond3 = {
+        'protocol': 'nakama', 'version': 1,
+        'companions': sorted([np_f, np_g, np_h]),
+        'created_at': b_now, 'nonce': b_nonce,
+        'signatures': {n_: nakama.sign_schnorr(s_, b2_msg).hex()
+                       for n_, s_ in ((np_f, s_f), (np_g, s_g), (np_h, s_h))},
+    }
+
+    bond_pos = [('2-party with expiry', bond),
+                ('3-party, no expiry (backward compat)', bond3)]
+    for name, bb in bond_pos:
+        ok, errs, info = conform_bond(bb)
+        print(f'bond/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        bond_fails += 0 if ok else 1
+
+    bond_neg = []
+    bad_sig = json.loads(json.dumps(bond))
+    bad_sig['signatures'][np_f] = '00' * 128
+    bond_neg.append(('tampered signature', bad_sig))
+    missing = json.loads(json.dumps(bond))
+    del missing['signatures'][np_g]
+    bond_neg.append(('missing signature', missing))
+    bad_nonce = json.loads(json.dumps(bond))
+    bad_nonce['nonce'] = 'ff' * 32
+    bond_neg.append(('nonce mismatch (sigs no longer match)', bad_nonce))
+    bad_exp = json.loads(json.dumps(bond))
+    bad_exp['expires_at'] = bad_exp['created_at']
+    bond_neg.append(('expires_at <= created_at', bad_exp))
+    bad_npub = json.loads(json.dumps(bond))
+    bad_npub['companions'] = sorted([np_f, 'npub1invalid'])
+    bond_neg.append(('non-npub companion', bad_npub))
+    bad_ver = json.loads(json.dumps(bond))
+    bad_ver['version'] = 2
+    bond_neg.append(('wrong version', bad_ver))
+
+    for name, bb in bond_neg:
+        ok, errs, info = conform_bond(bb)
+        good = not ok
+        print(f'bond-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            bond_fails += 1
+
+    bond_total = len(bond_pos) + len(bond_neg)
+    print(f'--- bond {bond_total - bond_fails}/{bond_total} passed ---')
+    fails += bond_fails
+
+    grand = total + dm_total + board_total + dec_total + bond_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -789,12 +1002,18 @@ def main(argv: list[str]) -> int:
                   '<decision.json> [...]')
             return 2
         return check_decision_files(policy_path, rest)
+    if len(argv) >= 2 and argv[1] == 'check_bond':
+        if len(argv) < 3:
+            print('usage: conformance.py check_bond <bond.json> [...]')
+            return 2
+        return check_bond_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
           'check_dm <recipient_secret_hex> <wrap.json> [...] | '
           'check_board <descriptor.json> [...] | '
           'check_decision [--policy policy.json] <decision.json> [...] | '
+          'check_bond <bond.json> [...] | '
           'selftest')
     return 2
 
