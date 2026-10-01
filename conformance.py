@@ -751,6 +751,35 @@ nakama.py's own `cmd_verify_rotation` (offline: real key pairs, real
 Schnorr-signed rotation certs in temp files — valid, and a
 tampered-new_npub invalid case with exact stdout+exit match).
 
+Revocation-verify report conformance:
+
+    python3 conformance.py check_verify_revocation <report1.txt> [...]
+
+Verifies a saved `nakama.py verify_revocation` stdout report is internally
+consistent (spec §12.5): exactly one line — either the valid verdict
+`revocation は有効です — bond <bond16>... は <revoker16>... により解消されました。`
+(the bond prefix is the first 16 hex chars of the revocation's
+bond_hash; the revoker prefix is the first 16 characters of the
+revoker's npub — bech32 text, so only "16 non-space characters" is
+checked, like `check_verify_rotation`'s prefixes; the `...` ellipsis
+and the `—` em dash are literal) or the invalid verdict
+`revocation は無効です`. Trailing blank lines tolerated; a leading
+blank line is rejected. Explicitly out of scope: the verdict's truth
+(the revocation event's territory — `check_revocation` /
+`verify_revocation_event`), the bond_hash/revoker truth, stderr, and
+the exit code (invisible in saved stdout text). The `verify_rotation`
+verdict lines and the `revoke` multi-line issuance report are
+different grammars — `check_verify_revocation` rejects the former;
+the latter is a future checker candidate. Use this to prove a second
+implementation's `verify_revocation` CLI prints a compatible report.
+
+`python3 conformance.py selftest` also covers
+`check_verify_revocation` with reports produced in-process by
+nakama.py's own `cmd_propose` + `cmd_accept` (real bond) +
+`cmd_verify_revocation` (offline: real key pairs, real Schnorr-signed
+revocation events in a temp file — valid, and a tampered-signature
+invalid case with exact stdout+exit match).
+
 Board-policy creation report conformance:
 
     python3 conformance.py check_board_policy <report1.txt> [...]
@@ -4170,6 +4199,89 @@ def check_verify_rotation_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_verify_rotation_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_verify_revocation: verify_revocation report consistency ----------
+
+# A saved `nakama.py verify_revocation` stdout report. Its grammar is fixed
+# (spec §12.5). check_verify_revocation verifies that the report is internally
+# consistent. Exactly one line:
+#   valid:   revocation は有効です — bond <bond16>... は <revoker16>... により解消されました。
+#   invalid: revocation は無効です
+# <bond16> is the first 16 hex chars of the revocation's bond_hash (the
+# reference CLI truncates the lowercase hexdigest — the checker accepts
+# upper case too, like check_revoke_fetch's bond prefix). <revoker16> is
+# the first 16 characters of the revoker's npub — bech32 text, so only
+# "16 non-space characters" is checked, like check_verify_rotation's
+# prefixes. The `...` ellipsis and the `—` em dash are literal. Trailing
+# blank lines tolerated; a leading blank line is rejected. No arithmetic
+# rules (a verdict is a 2-vocabulary fixed sentence plus two truncated
+# display prefixes). Explicitly out of scope: the verdict's truth (the
+# revocation event's territory — `check_revocation` / `verify_revocation_event`
+# on the event JSON itself), the bond_hash/revoker truth, stderr, and the
+# exit code (invisible in saved stdout text). The `verify_rotation` verdict
+# lines (`rotation は有効です: <old16>... → <new16>...` /
+# `rotation は無効です`) are a different grammar — the two checkers reject
+# each other's reports. The `revoke` issuance report (`revocation イベント:
+# <out> — bond <16>... の解消を宣言しました。` + registry lines) is a
+# different grammar too and is a future checker candidate. Use this to
+# prove a second implementation's `verify_revocation` CLI prints a
+# compatible report.
+
+_RE_VRV_VALID = re.compile(
+    r'^revocation は有効です — bond ([0-9a-fA-F]{16})\.\.\. は '
+    r'(\S{16})\.\.\. により解消されました。$')
+_RE_VRV_INVALID = re.compile(r'^revocation は無効です$')
+
+
+def conform_verify_revocation_report(text: str):
+    """Verify a saved `nakama.py verify_revocation` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) != 1:
+        return False, [f'report must be a single verdict line, '
+                       f'found {len(lines)} lines'], info
+    m = _RE_VRV_INVALID.match(lines[0])
+    if m:
+        info.append('invalid verdict')
+        return (not errs), errs, info
+    m = _RE_VRV_VALID.match(lines[0])
+    if not m:
+        return False, ['line 1: not a verify_revocation verdict line '
+                       '(`revocation は有効です — bond <16hex>... は '
+                       '<revoker16>... により解消されました。` or '
+                       '`revocation は無効です`)'], info
+    bond, revoker = m.group(1), m.group(2)
+    info.append(f'valid verdict: bond {bond}… revoker {revoker}…')
+    return (not errs), errs, info
+
+
+def check_verify_revocation_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_verify_revocation_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -8885,6 +8997,163 @@ def selftest() -> int:
           f'passed ---')
     fails += vrt_fails
 
+    # ---------- check_verify_revocation: verify_revocation report consistency
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_propose + cmd_accept (real bond) + cmd_verify_revocation
+    # (offline: real key pairs + temp keyfiles, real Schnorr-signed
+    # revocation events — valid, and a tampered-signature invalid case);
+    # hand-mutated reports that break the single-verdict-line grammar must
+    # be rejected, as must the sibling verify_rotation verdict lines and
+    # the revoke issuance report.
+    vrv_fails = 0
+    _vrv_sa, _vrv_npa = _key()
+    _vrv_sb, _vrv_npb = _key()
+
+    def _vrv_bond(tmpd):
+        # offline: real key pairs + temp keyfiles, propose -> accept -> bond
+        kfa = os.path.join(tmpd, 'key_a.json')
+        nakama.save_key(kfa, _vrv_sa)
+        kfb = os.path.join(tmpd, 'key_b.json')
+        nakama.save_key(kfb, _vrv_sb)
+        ppath = os.path.join(tmpd, 'proposal.json')
+        bpath = os.path.join(tmpd, 'bond.json')
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            nakama.cmd_propose(SimpleNamespace(
+                npub=_vrv_npb, keyfile=kfa, out=ppath,
+                expires_days=30, no_expiry=False, markdown=False))
+            nakama.cmd_accept(SimpleNamespace(
+                proposal=ppath, from_b64=None, keyfile=kfb, out=bpath,
+                markdown=False, compromise_registry=tmpd))
+        with open(bpath) as f:
+            return json.load(f), bpath
+
+    def _vrv_rev(bond, tamper=False):
+        bh = nakama.bond_hash(bond)
+        created = 1759280000
+        msg = nakama.revocation_message(bh, _vrv_npa, created)
+        rev = {
+            'protocol': 'nakama', 'version': 1, 'type': 'revocation',
+            'bond_hash': bh, 'revoker': _vrv_npa, 'created_at': created,
+            'sig': nakama.sign_schnorr(_vrv_sa, msg).hex(),
+        }
+        if tamper:
+            sig = rev['sig']
+            rev['sig'] = sig[:-1] + ('0' if sig[-1] != '0' else '1')
+        return rev
+
+    def _vrv_run(rev, bpath):
+        with tempfile.TemporaryDirectory() as td:
+            rp = os.path.join(td, 'revocation.json')
+            with open(rp, 'w') as f:
+                json.dump(rev, f)
+            buf = io.StringIO()
+            code = 0
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    nakama.cmd_verify_revocation(
+                        SimpleNamespace(revocation=rp, bond=bpath))
+                except SystemExit as e:
+                    code = e.code if isinstance(e.code, int) else 0
+            return buf.getvalue(), code
+
+    _vrv_e2e = []
+    with tempfile.TemporaryDirectory() as _vrv_td:
+        _vrv_bond_d, _vrv_bpath = _vrv_bond(_vrv_td)
+        _vrv_bh16 = nakama.bond_hash(_vrv_bond_d)[:16]
+        _vrv_rev_ok = _vrv_rev(_vrv_bond_d)
+        _rep, _code = _vrv_run(_vrv_rev_ok, _vrv_bpath)
+        _vrv_e2e.append(('valid', _rep, _code, 0,
+                         f'revocation は有効です — bond {_vrv_bh16}... は '
+                         f'{_vrv_npa[:16]}... により解消されました。\n'))
+        _rep, _code = _vrv_run(_vrv_rev(_vrv_bond_d, tamper=True),
+                               _vrv_bpath)
+        _vrv_e2e.append(('invalid (tampered sig)', _rep, _code, 1,
+                         'revocation は無効です\n'))
+    for name, rep, code, want_code, want_rep in _vrv_e2e:
+        exact = (rep == want_rep) and (code == want_code)
+        ok, errs, info = conform_verify_revocation_report(rep)
+        good = exact and ok
+        print(f'verify-revocation-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        if not good:
+            if not exact:
+                print(f'    - stdout/exit mismatch: {rep!r} code={code}')
+            for e in errs:
+                print(f'    - {e}')
+            vrv_fails += 1
+
+    # hand-crafted positives
+    _vrv_bh = '0123456789abcdef' * 4  # 64 lowercase hex
+    _vrv_rp = _vrv_npa[:16]  # real npub prefix: 16 bech32 chars
+    vrv_pos = [
+        ('valid line',
+         f'revocation は有効です — bond {_vrv_bh[:16]}... は '
+         f'{_vrv_rp}... により解消されました。\n'),
+        ('invalid line', 'revocation は無効です\n'),
+        ('no trailing newline',
+         f'revocation は有効です — bond {_vrv_bh[:16]}... は '
+         f'{_vrv_rp}... により解消されました。'),
+        ('trailing blanks', 'revocation は無効です\n\n\n'),
+    ]
+    for name, rep in vrv_pos:
+        ok, errs, info = conform_verify_revocation_report(rep)
+        print(f'verify-revocation/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        vrv_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    vrv_neg = []
+    vrv_neg.append(('empty report', ''))
+    vrv_neg.append(('garbage line', 'hello\n'))
+    vrv_neg.append(('two verdict lines',
+                    'revocation は無効です\nrevocation は無効です\n'))
+    vrv_neg.append(('missing ellipsis after bond prefix',
+                    f'revocation は有効です — bond {_vrv_bh[:16]} は '
+                    f'{_vrv_rp}... により解消されました。\n'))
+    vrv_neg.append(('colon instead of em dash',
+                    f'revocation は有効です: bond {_vrv_bh[:16]}... は '
+                    f'{_vrv_rp}... により解消されました。\n'))
+    vrv_neg.append(('short bond prefix',
+                    f'revocation は有効です — bond 0123456789abcde... は '
+                    f'{_vrv_rp}... により解消されました。\n'))
+    vrv_neg.append(('non-hex bond prefix',
+                    f'revocation は有効です — bond zzzzzzzzzzzzzzzz... は '
+                    f'{_vrv_rp}... により解消されました。\n'))
+    vrv_neg.append(('space inside revoker prefix',
+                    f'revocation は有効です — bond {_vrv_bh[:16]}... は '
+                    f'npub1abcd efghijkl... により解消されました。\n'))
+    vrv_neg.append(('invalid verdict with suffix',
+                    'revocation は無効です: ほげ\n'))
+    vrv_neg.append(('verify_rotation valid verdict (different grammar)',
+                    f'rotation は有効です: {_vrv_rp}... → {_vrv_rp}...\n'))
+    vrv_neg.append(('verify_rotation invalid verdict (different grammar)',
+                    'rotation は無効です\n'))
+    vrv_neg.append(('revoke issuance report (future checker candidate)',
+                    f'revocation イベント: revocation.json — bond '
+                    f'{_vrv_bh[:16]}... の解消を宣言しました。\n'))
+    vrv_neg.append(('wrong verb',
+                    f'revocation は成功です — bond {_vrv_bh[:16]}... は '
+                    f'{_vrv_rp}... により解消されました。\n'))
+    vrv_neg.append(('leading blank line',
+                    '\nrevocation は無効です\n'))
+
+    for name, rep in vrv_neg:
+        ok, errs, info = conform_verify_revocation_report(rep)
+        good = not ok
+        print(f'verify-revocation-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            vrv_fails += 1
+
+    vrv_total = len(_vrv_e2e) + len(vrv_pos) + len(vrv_neg)
+    print(f'--- verify-revocation {vrv_total - vrv_fails}/{vrv_total} '
+          f'passed ---')
+    fails += vrv_fails
+
     # ---------- check_board_policy: board_policy creation-report consistency
     # Reference reports are produced in-process with nakama.py's own
     # cmd_board_policy (offline: real key pair, temp keyfile, 3 eligible
@@ -13529,9 +13798,9 @@ def selftest() -> int:
         + bfa_total + pub_total + gov_total + rf_total + rtf_total \
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
         + bj_total + bs_total + bc_total + vbd_total + bvr_total \
-        + bdc_total + bcs_total + dmr_total + vrt_total + bpl_total \
+        + bdc_total + bcs_total + dmr_total + dms_total + vrt_total + bpl_total \
         + bps_total + vbp_total + vrf_total + pr_total + ac_total \
-        + ch_total + ck_total
+        + ch_total + ck_total + vrv_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -13836,6 +14105,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_verify_rotation_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_verify_revocation':
+        if len(argv) < 3:
+            print('usage: conformance.py check_verify_revocation '
+                  '<report.txt> [...]')
+            return 2
+        return check_verify_revocation_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_board_policy':
         if len(argv) < 3:
             print('usage: conformance.py check_board_policy '
@@ -13926,6 +14201,7 @@ def main(argv: list[str]) -> int:
           'check_dm_recv <report.txt> [...] | '
           'check_dm_send <report.txt> [...] | '
           'check_verify_rotation <report.txt> [...] | '
+          'check_verify_revocation <report.txt> [...] | '
           'check_board_policy <report.txt> [...] | '
           'check_board_policy_sign <report.txt> [...] | '
           'check_verify_board_policy <report.txt> [...] | '
