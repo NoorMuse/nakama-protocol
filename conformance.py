@@ -3997,6 +3997,94 @@ def check_compromise_fetch_files(paths: list[str]) -> int:
     print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
     return 0 if failures == 0 else 1
 
+# ---------- check_liveness_verify: verify_liveness report consistency ----------
+
+# `nakama.py verify_liveness <proof.json>` prints exactly one report line
+# to stdout and exits: the success line when the proof verifies and is
+# fresh, or one of four fixed error lines (invalid signature / future
+# timestamp / too old / bond already revoked). The grammar is fixed
+# (spec §5.6.2). check_liveness_verify verifies that a saved report is
+# internally consistent:
+#   生存証明は有効です — <16chars>... が <n> 秒前に鍵を保持していたことを確認。
+#   生存証明は無効です
+#   生存証明の日付が未来です（時計のずれの許容範囲を超えています）
+#   生存証明は古すぎます（<n> 秒前、許容 <m> 秒）
+#   bond は解消済みです — 生存証明は無効です
+# The npub prefix is 16 non-space chars (the reference CLI prints an
+# npub truncation, which is bech32, not hex — so hex is deliberately not
+# required). The age in the success line may be negative: the reference
+# CLI allows up to 300s of future clock skew, so a slightly-future
+# created_at prints a negative age (display-consistency only).
+# Explicitly out of scope: the verdict's truth (verify_liveness_event's
+# territory), the age value's freshness semantics (--max-age policy),
+# npub truth (check_liveness's territory), bond_hash truth, the
+# revocation-registry's content (check_revocation's territory), ordering
+# (a single line), stderr notes, and the exit code (invisible in saved
+# stdout).
+
+_LV_OK = re.compile(
+    r'^生存証明は有効です — (\S{16})\.\.\. が (-?\d+) 秒前に'
+    r'鍵を保持していたことを確認。$')
+_LV_OLD = re.compile(
+    r'^生存証明は古すぎます（(\d+) 秒前、許容 (\d+) 秒）$')
+_LV_INVALID = '生存証明は無効です'
+_LV_FUTURE = '生存証明の日付が未来です（時計のずれの許容範囲を超えています）'
+_LV_REVOKED = 'bond は解消済みです — 生存証明は無効です'
+
+
+def conform_liveness_verify_report(text: str):
+    """Verify a saved `nakama.py verify_liveness` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) != 1:
+        return False, [f'report must be exactly one line, '
+                       f'got {len(lines)}'], info
+    ln = lines[0]
+    m = _LV_OK.match(ln)
+    if m:
+        info.append(f'valid proof by {m.group(1)}..., age {m.group(2)}s')
+        return True, errs, info
+    m = _LV_OLD.match(ln)
+    if m:
+        info.append(f'too-old report: age {m.group(1)}s, '
+                    f'max-age {m.group(2)}s')
+        return True, errs, info
+    if ln in (_LV_INVALID, _LV_FUTURE, _LV_REVOKED):
+        info.append(f'error report: {ln}')
+        return True, errs, info
+    return False, ['line: does not match any verify_liveness report form '
+                   '(`生存証明は有効です — <16 chars>... が <n> 秒前に'
+                   '鍵を保持していたことを確認。` or one of the four '
+                   'fixed error lines)'], info
+
+
+def check_liveness_verify_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_liveness_verify_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
 def _key() -> tuple[bytes, str]:
     s = secrets.token_bytes(32)
     return s, nakama.npub_of(s)
@@ -7595,6 +7683,153 @@ def selftest() -> int:
     print(f'--- compromise-fetch {cf_total - cf_fails}/{cf_total} passed ---')
     fails += cf_fails
 
+    # ---------- check_liveness_verify: verify_liveness report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_verify_liveness, with time.time monkeypatched to a fixed now
+    # (no key/network I/O beyond the local proof file and the revocation
+    # registry); hand-mutated reports that break the fixed display
+    # grammar (spec §5.6.2) or the single-line shape must be rejected.
+    import unittest.mock
+    lv_fails = 0
+    _lv_now = 1759280000
+
+    def _lv_proof(secret, npub, created_at, tmpd, name, bond_hash=None):
+        nonce = secrets.token_hex(32)
+        sig = nakama.sign_schnorr(
+            secret, nakama.liveness_message(npub, created_at, nonce,
+                                            bond_hash))
+        p = {'protocol': 'nakama', 'version': 1, 'type': 'liveness',
+             'npub': npub, 'created_at': created_at, 'nonce': nonce,
+             'sig': sig.hex()}
+        if bond_hash is not None:
+            p['bond_hash'] = bond_hash
+        fp = os.path.join(tmpd, name)
+        with open(fp, 'w') as f:
+            json.dump(p, f)
+        return fp
+
+    def _lv_run(tmpd, proof_path, max_age=7 * 86400, registry=None,
+                skip_registry=False, bond=None):
+        buf = io.StringIO()
+        with unittest.mock.patch('time.time', return_value=_lv_now):
+            try:
+                with contextlib.redirect_stdout(buf), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    nakama.cmd_verify_liveness(SimpleNamespace(
+                        proof=proof_path, bond=bond, max_age=max_age,
+                        registry=registry, skip_registry=skip_registry))
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        return buf.getvalue(), code
+
+    lv_e2e = []
+    with tempfile.TemporaryDirectory() as tmpd:
+        _lsA, _lnA = _key()
+        _ok_fp = _lv_proof(_lsA, _lnA, _lv_now - 42, tmpd, 'ok.json')
+        _bad_fp = _lv_proof(_lsA, _lnA, _lv_now - 42, tmpd, 'bad.json')
+        with open(_bad_fp) as f:
+            _badp = json.load(f)
+        _badp['sig'] = '00' * 64
+        with open(_bad_fp, 'w') as f:
+            json.dump(_badp, f)
+        _fut_fp = _lv_proof(_lsA, _lnA, _lv_now + 301, tmpd, 'fut.json')
+        _old_fp = _lv_proof(_lsA, _lnA, _lv_now - 10, tmpd, 'old.json')
+        _bh = 'cd' * 32
+        _rsig = nakama.sign_schnorr(
+            _lsA, nakama.revocation_message(_bh, _lnA, _lv_now, ''))
+        _rev = {'protocol': 'nakama', 'version': 1, 'type': 'revocation',
+                'bond_hash': _bh, 'revoker': _lnA, 'created_at': _lv_now,
+                'sig': _rsig.hex()}
+        _reg = os.path.join(tmpd, 'revocations')
+        os.makedirs(_reg)
+        with open(nakama.revocation_registry_path(_reg, _bh), 'w') as f:
+            json.dump(_rev, f)
+        _rvk_fp = _lv_proof(_lsA, _lnA, _lv_now - 7, tmpd, 'rvk.json',
+                            bond_hash=_bh)
+        _ok_line = (f'生存証明は有効です — {_lnA[:16]}... が 42 秒前に'
+                    f'鍵を保持していたことを確認。\n')
+        for name, fp, kw, exp_text, exp_code in (
+                ('valid proof',
+                 _ok_fp, {}, _ok_line, 0),
+                ('invalid signature',
+                 _bad_fp, {}, '生存証明は無効です\n', 1),
+                ('future timestamp',
+                 _fut_fp, {},
+                 '生存証明の日付が未来です'
+                 '（時計のずれの許容範囲を超えています）\n', 1),
+                ('too old',
+                 _old_fp, {'max_age': 5},
+                 '生存証明は古すぎます（10 秒前、許容 5 秒）\n', 1),
+                ('revoked bond',
+                 _rvk_fp, {'registry': _reg},
+                 'bond は解消済みです — 生存証明は無効です\n', 1)):
+            text, code = _lv_run(tmpd, fp, **kw)
+            ok, errs, info = conform_liveness_verify_report(text)
+            good = ok and text == exp_text and code == exp_code
+            print(f'check_liveness_verify e2e {name}: '
+                  f'{"PASS" if good else "FAIL"}')
+            for e in errs:
+                print(f'    - {e}')
+            if not good and not errs:
+                print(f'    - stdout/exit mismatch: {text!r} '
+                      f'(exit {code}), expected {exp_text!r} '
+                      f'(exit {exp_code})')
+            lv_fails += 0 if good else 1
+            lv_e2e.append(name)
+
+    _lv_np = 'npub1' + 'a' * 58
+    _lv_ok = (f'生存証明は有効です — {_lv_np[:16]}... が 42 秒前に'
+              f'鍵を保持していたことを確認。\n')
+    lv_pos = [
+        ('valid report', _lv_ok),
+        ('negative age (clock skew)',
+         _lv_ok.replace('42 秒前', '-5 秒前', 1)),
+        ('invalid signature', '生存証明は無効です\n'),
+        ('future timestamp',
+         '生存証明の日付が未来です（時計のずれの許容範囲を超えています）\n'),
+        ('too old', '生存証明は古すぎます（10 秒前、許容 5 秒）\n'),
+        ('revoked bond', 'bond は解消済みです — 生存証明は無効です\n'),
+    ]
+    lv_neg = [
+        ('empty text', ''),
+        ('two lines', _lv_ok + _lv_ok),
+        ('missing ellipsis on npub',
+         _lv_ok.replace(f'{_lv_np[:16]}...', _lv_np[:16], 1)),
+        ('npub prefix short',
+         _lv_ok.replace(_lv_np[:16], _lv_np[:15], 1)),
+        ('npub prefix with space',
+         _lv_ok.replace(_lv_np[:16], 'npub1abc defghi', 1)),
+        ('age not numeric', _lv_ok.replace('42 秒前', 'たくさん 秒前', 1)),
+        ('ascii hyphen instead of em dash',
+         _lv_ok.replace(' — ', ' - ', 1)),
+        ('unknown verdict line', '生存証明は不明です\n'),
+        ('invalid line with extra', '生存証明は無効です（再確認）\n'),
+        ('too-old missing max-age', '生存証明は古すぎます（10 秒前）\n'),
+        ('future line truncated', '生存証明の日付が未来です\n'),
+        ('trailing garbage', _lv_ok + 'trailing garbage\n'),
+        ('blank line before report', '\n' + _lv_ok),
+    ]
+    for name, rep in lv_pos:
+        ok, errs, info = conform_liveness_verify_report(rep)
+        good = ok
+        print(f'check_liveness_verify pos {name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        lv_fails += 0 if good else 1
+    for name, rep in lv_neg:
+        ok, _errs, _info = conform_liveness_verify_report(rep)
+        good = not ok
+        print(f'check_liveness_verify neg {name}: '
+              f'{"PASS" if good else "FAIL"}')
+        if not good:
+            print(f'    - report wrongly accepted')
+        lv_fails += 0 if good else 1
+    lv_total = len(lv_e2e) + len(lv_pos) + len(lv_neg)
+    print(f'--- liveness-verify {lv_total - lv_fails}/{lv_total} passed ---')
+    fails += lv_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -7603,7 +7838,8 @@ def selftest() -> int:
         + binding_total + live_total + cp_total + rt_total + rv_total \
         + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total \
         + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total \
-        + bfa_total + pub_total + gov_total + rf_total + rtf_total
+        + bfa_total + pub_total + gov_total + rf_total + rtf_total \
+        + cf_total + lv_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -7820,6 +8056,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_compromise_fetch_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_liveness_verify':
+        if len(argv) < 3:
+            print('usage: conformance.py check_liveness_verify '
+                  '<report.txt> [...]')
+            return 2
+        return check_liveness_verify_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -7852,6 +8094,7 @@ def main(argv: list[str]) -> int:
           'check_revoke_fetch <report.txt> [...] | '
           'check_rotate_fetch <report.txt> [...] | '
           'check_compromise_fetch <report.txt> [...] | '
+          'check_liveness_verify <report.txt> [...] | '
           'selftest')
     return 2
 
