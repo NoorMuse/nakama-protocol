@@ -100,6 +100,10 @@ signatures over the canonical bond message). Passing `check_binding`
 on your binding files proves platform-binding wire compatibility
 (key-to-handle claims, the handle-to-key half of the bond-exchange
 UX).
+Passing `check_liveness` on your liveness proofs (optionally with
+`--bond`) proves liveness-proof wire compatibility (signature over
+the canonical liveness message, bond linkage, and freshness
+semantics).
 
 Platform-binding certificate conformance:
 
@@ -118,6 +122,31 @@ the reference implementation.
 
 `python3 conformance.py selftest` also covers `check_binding` with
 reference bindings built by nakama.py's own primitives.
+
+Liveness proof conformance:
+
+    python3 conformance.py check_liveness [--bond bond.json] \
+        [--max-age secs] [--now unixts] <liveness.json> [...]
+
+Verifies each file is a liveness proof as written by `liveness`
+(spec §5.6.1): shape checks (protocol/version/type, valid npub,
+created_at int, 64-hex nonce, 128-hex sig, optional 64-hex
+bond_hash) plus the Schnorr signature over
+liveness_message(npub, created_at, nonce, bond_hash?), mirroring
+the reference `verify_liveness_event` acceptance rule. With
+`--bond bond.json`, the prover must be a bond companion and the
+proof's bond_hash must equal bond_hash(bond). Freshness mirrors
+`verify_liveness`: created_at must not be more than 300s in the
+future (clock-skew tolerance) and age must be <= max_age (default
+7 days). The revocation-registry check is a local-operational
+step outside wire compatibility. Use this to prove a second
+implementation's liveness proofs are wire-compatible with the
+reference implementation.
+
+`python3 conformance.py selftest` also covers `check_liveness` with
+reference proofs built by nakama.py's own primitives (pass
+`--now` to the checker for deterministic freshness checks in
+your own tests).
 """
 
 import json
@@ -747,6 +776,129 @@ def check_binding_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_liveness: liveness proof conformance ----------
+
+def conform_liveness(p: dict, bond: dict | None = None,
+                     max_age: int = 7 * 86400,
+                     now: int | None = None):
+    """Verify a liveness proof as written by `liveness` (spec §5.6.1).
+
+    Shape checks (protocol/version/type, valid npub, created_at int,
+    64-hex nonce, 128-hex sig, optional 64-hex bond_hash) plus the
+    Schnorr signature over liveness_message(npub, created_at, nonce,
+    bond_hash?) — same acceptance rule as the reference
+    `verify_liveness_event`. With bond given, additionally requires
+    the prover npub to be a bond companion and the proof's
+    bond_hash to equal bond_hash(bond), mirroring the reference.
+    Freshness mirrors `verify_liveness`: created_at must not be more
+    than 300s in the future (clock-skew tolerance) and age must be
+    <= max_age. The revocation-registry check is local-operational
+    and out of scope — wire compatibility only.
+    Returns (ok, errs, info).
+    """
+    if now is None:
+        now = int(time.time())
+    errs: list[str] = []
+    info: list[str] = []
+    if not isinstance(p, dict):
+        return False, ['liveness proof is not a JSON object'], info
+    if p.get('protocol') != 'nakama':
+        errs.append('protocol != "nakama"')
+    if p.get('version') != 1:
+        errs.append('version != 1')
+    if p.get('type') != 'liveness':
+        errs.append('type != "liveness"')
+    shape_ok = True
+    npub = p.get('npub')
+    if not isinstance(npub, str) or nakama.npub_to_hex(npub) is None:
+        errs.append('npub must be a valid npub')
+        shape_ok = False
+    if not isinstance(p.get('created_at'), int) \
+            or isinstance(p.get('created_at'), bool):
+        errs.append('created_at must be an int')
+        shape_ok = False
+    nonce = p.get('nonce')
+    if not isinstance(nonce, str) \
+            or not re.fullmatch(r'[0-9a-f]{64}', nonce):
+        errs.append('nonce must be 64 hex chars (32 bytes)')
+        shape_ok = False
+    sig_hex = p.get('sig')
+    sig_b = None
+    if not isinstance(sig_hex, str):
+        errs.append('sig must be a 128-hex-char string')
+        shape_ok = False
+    else:
+        try:
+            sig_b = bytes.fromhex(sig_hex)
+            if len(sig_b) != 64:
+                raise ValueError
+        except ValueError:
+            errs.append('sig must be 128 hex chars (64 bytes)')
+            sig_b = None
+            shape_ok = False
+    bh = p.get('bond_hash')
+    if bh is not None and not (isinstance(bh, str)
+                               and re.fullmatch(r'[0-9a-f]{64}', bh)):
+        errs.append('bond_hash must be 64 hex chars when present')
+        shape_ok = False
+    if shape_ok:
+        try:
+            msg = nakama.liveness_message(npub, int(p['created_at']),
+                                          nonce, bh)
+            if not nakama.verify_schnorr(npub, sig_b, msg):
+                errs.append('invalid signature over '
+                            'liveness_message(npub, created_at, nonce, '
+                            'bond_hash?)')
+        except Exception as e:
+            errs.append(f'signature check failed: {e}')
+    if bond is not None and not errs:
+        companions = bond.get('companions') or []
+        if npub not in companions:
+            errs.append('prover npub is not a bond companion')
+        elif bh != nakama.bond_hash(bond):
+            errs.append('bond_hash does not match bond_hash(bond)')
+    if shape_ok:
+        ca = p['created_at']
+        if ca > now + 300:
+            errs.append('created_at is more than 300s in the future')
+        elif now - ca > max_age:
+            errs.append(f'proof too old ({now - ca}s > max_age {max_age}s)')
+    info.append(npub if isinstance(npub, str) else '?')
+    if isinstance(p.get('created_at'), int) \
+            and not isinstance(p.get('created_at'), bool):
+        info.append(f'age {now - p["created_at"]}s')
+    return (len(errs) == 0), errs, info
+
+
+def check_liveness_files(bond_path: str | None, max_age: int,
+                         now: int | None, paths: list[str]) -> int:
+    bond = None
+    if bond_path is not None:
+        try:
+            bond = json.load(open(bond_path))
+        except Exception as e:
+            print(f'FAIL (bond unreadable: {e})')
+            return 1
+    failures = 0
+    for p_ in paths:
+        try:
+            p = json.load(open(p_))
+        except Exception as e:
+            print(f'{p_}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_liveness(p, bond, max_age, now)
+        if ok:
+            print(f"{p_}: PASS ({'; '.join(info)})")
+        else:
+            print(f'{p_}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- selftest: reference events built by nakama.py ----------
 
 def _key() -> tuple[bytes, str]:
@@ -1134,8 +1286,99 @@ def selftest() -> int:
           f'{binding_total} passed ---')
     fails += binding_fails
 
+    # Liveness proof conformance: reference proofs built with
+    # nakama.py primitives must verify; malformed, stale, future,
+    # and bond-mismatched ones must be rejected. --now is passed
+    # explicitly for deterministic freshness checks.
+    live_fails = 0
+    s_j, np_j = _key()
+    s_k, np_k = _key()
+    s_m, np_m = _key()
+    lv_now = int(time.time())
+    lv_nonce = secrets.token_hex(32)
+    live = {
+        'protocol': 'nakama', 'version': 1, 'type': 'liveness',
+        'npub': np_j, 'created_at': lv_now, 'nonce': lv_nonce,
+        'sig': nakama.sign_schnorr(
+            s_j, nakama.liveness_message(np_j, lv_now, lv_nonce, None)
+        ).hex(),
+    }
+    # minimal bond for the --bond linkage cases
+    lv_bond = {
+        'protocol': 'nakama', 'version': 1,
+        'companions': sorted([np_j, np_k]),
+        'created_at': lv_now, 'nonce': secrets.token_hex(32),
+    }
+    lv_bh = nakama.bond_hash(lv_bond)
+    live_bonded = dict(live)
+    live_bonded['bond_hash'] = lv_bh
+    live_bonded['sig'] = nakama.sign_schnorr(
+        s_j, nakama.liveness_message(np_j, lv_now, lv_nonce, lv_bh)
+    ).hex()
+
+    live_pos = [('valid liveness (no bond)', live, None, 7 * 86400),
+                ('valid liveness with bond linkage',
+                 live_bonded, lv_bond, 7 * 86400)]
+    for name, pp, bb, ma in live_pos:
+        ok, errs, info = conform_liveness(pp, bb, ma, lv_now)
+        print(f'liveness/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        live_fails += 0 if ok else 1
+
+    live_neg = []
+    bad_sig = json.loads(json.dumps(live))
+    bad_sig['sig'] = '00' * 128
+    live_neg.append(('tampered signature', bad_sig, None, 7 * 86400))
+    bad_type = json.loads(json.dumps(live))
+    bad_type['type'] = 'aliveness'
+    live_neg.append(('wrong type', bad_type, None, 7 * 86400))
+    bad_nonce = json.loads(json.dumps(live))
+    bad_nonce['nonce'] = 'zz' * 32
+    live_neg.append(('nonce not hex', bad_nonce, None, 7 * 86400))
+    no_sig = json.loads(json.dumps(live))
+    del no_sig['sig']
+    live_neg.append(('missing sig', no_sig, None, 7 * 86400))
+    other_bond = {
+        'protocol': 'nakama', 'version': 1,
+        'companions': sorted([np_k, np_m]),
+        'created_at': lv_now, 'nonce': secrets.token_hex(32),
+    }
+    live_neg.append(('--bond: prover not a companion',
+                     live_bonded, other_bond, 7 * 86400))
+    other_hash_bond = dict(lv_bond)
+    other_hash_bond['nonce'] = secrets.token_hex(32)
+    live_neg.append(('--bond: bond_hash mismatch',
+                     live_bonded, other_hash_bond, 7 * 86400))
+    future = json.loads(json.dumps(live))
+    future['created_at'] = lv_now + 601
+    future['sig'] = nakama.sign_schnorr(
+        s_j, nakama.liveness_message(np_j, future['created_at'],
+                                     lv_nonce, None)).hex()
+    live_neg.append(('future-dated beyond 300s skew',
+                     future, None, 7 * 86400))
+    stale = json.loads(json.dumps(live))
+    stale['created_at'] = lv_now - 61
+    stale['sig'] = nakama.sign_schnorr(
+        s_j, nakama.liveness_message(np_j, stale['created_at'],
+                                     lv_nonce, None)).hex()
+    live_neg.append(('older than max_age', stale, None, 60))
+
+    for name, pp, bb, ma in live_neg:
+        ok, errs, info = conform_liveness(pp, bb, ma, lv_now)
+        good = not ok
+        print(f'liveness-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            live_fails += 1
+
+    live_total = len(live_pos) + len(live_neg)
+    print(f'--- liveness {live_total - live_fails}/{live_total} passed ---')
+    fails += live_fails
+
     grand = total + dm_total + board_total + dec_total + bond_total \
-        + binding_total
+        + binding_total + live_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -1181,6 +1424,36 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_binding <binding.json> [...]')
             return 2
         return check_binding_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_liveness':
+        bond_path = None
+        max_age = 7 * 86400
+        now = None
+        rest = argv[2:]
+        while rest and rest[0].startswith('--'):
+            opt = rest[0]
+            if opt == '--bond' and len(rest) >= 2:
+                bond_path, rest = rest[1], rest[2:]
+            elif opt == '--max-age' and len(rest) >= 2:
+                try:
+                    max_age = int(rest[1])
+                except ValueError:
+                    print('--max-age must be an int (seconds)')
+                    return 2
+                rest = rest[2:]
+            elif opt == '--now' and len(rest) >= 2:
+                try:
+                    now = int(rest[1])
+                except ValueError:
+                    print('--now must be an int (unix time)')
+                    return 2
+                rest = rest[2:]
+            else:
+                break
+        if not rest:
+            print('usage: conformance.py check_liveness [--bond bond.json] '
+                  '[--max-age secs] [--now unixts] <liveness.json> [...]')
+            return 2
+        return check_liveness_files(bond_path, max_age, now, rest)
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -1189,6 +1462,8 @@ def main(argv: list[str]) -> int:
           'check_decision [--policy policy.json] <decision.json> [...] | '
           'check_bond <bond.json> [...] | '
           'check_binding <binding.json> [...] | '
+          'check_liveness [--bond bond.json] [--max-age secs] [--now unixts] '
+          '<liveness.json> [...] | '
           'selftest')
     return 2
 
