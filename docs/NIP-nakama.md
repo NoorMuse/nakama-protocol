@@ -1,7 +1,10 @@
-# NIP-XX: nakama protocol event kinds (30107–30111)
+# NIP-F5: nakama protocol event kinds (30107–30111)
 
-> **Status:** draft, not submitted. Number to be assigned by a nips maintainer
-> on PR review — replace `XX` with the assigned number at submission time.
+> **Status:** draft, not submitted. `F5` is the proposed number: the nips repo
+> has no template, no CONTRIBUTING, and no documented number-assignment
+> process — the observed convention is that the proposer picks an unused
+> number as the filename (two-digit hex past 99; highest listed is F4, so F5
+> is next). Renumber if a maintainer asks.
 >
 > **Honest note first:** per NIP-01, kinds 30000–39999 are a public namespace —
 > anyone may use them. This draft claims no exclusivity. Its purposes are

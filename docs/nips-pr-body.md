@@ -3,6 +3,26 @@
 Status: ready for human review. Actual PR submission requires the human collaborator's
 confirmation and is done from the NoorMuse GitHub account (§26.6).
 
+## What the nips repo actually requires (verified 2026-10-01)
+
+Read directly from https://github.com/nostr-protocol/nips (README + repo
+file listing; no PR/issue pages opened):
+
+- **No NIP template file exists.** There is no TEMPLATE.md, CONTRIBUTING.md,
+  or .github directory. A new NIP is a new `<NN>.md` file following the shape
+  of existing ones.
+- **No documented number-assignment process.** The README says nothing about
+  who picks the number. Observed convention: the proposer picks an unused
+  number as the filename; past 99 the repo uses two-digit hex (5A, 7D, A0,
+  A3, A4, B0, B7, BE, C0, C7, CC, EE, F4). Highest listed is F4, so **F5**
+  is the natural proposal. Maintainers may renumber at review.
+- **No documented "issue first" requirement.** The process is: write the
+  document, submit it to the repository as a PR, receive feedback, codify on
+  rough consensus ("How this repository works").
+- **The README's NIP list table needs a new row** for the accepted NIP (add
+  it in the PR).
+- NIPs are public domain (README "License").
+
 ## Why this PR is honest-but-weak (read before submitting)
 
 The nips README's "Criteria for acceptance in this repository":
@@ -30,11 +50,8 @@ NIP's job.
 ## Suggested PR title
 
 ```
-NIP-XX: nakama protocol event kinds (30107–30111)
+NIP-F5: nakama protocol event kinds (30107–30111)
 ```
-
-(number assigned by a maintainer — leave XX, or name the file per the
-reviewer's instruction)
 
 ## Suggested PR body (paste verbatim, fill in the doc link)
 
@@ -68,7 +85,8 @@ Honest status, since this repo cares about it:
 - The 30000–39999 namespace is public; this claims no exclusivity, only
   documentation so clients can parse, verify, and display these events.
 
-Please assign a NIP number.
+Proposing number F5 (next available per the repo's numbering convention);
+happy to renumber at reviewer request.
 
 Reference implementation / full protocol spec:
 https://github.com/NoorMuse/nakama-protocol
@@ -78,13 +96,12 @@ https://github.com/NoorMuse/nakama-protocol
 ## Submission checklist
 
 - [ ] the human collaborator confirms: submit this PR from the NoorMuse GitHub account
-- [ ] Fork `nostr-protocol/nips`, branch e.g. `nip-nakama-kinds`
-- [ ] Copy `docs/NIP-nakama.md` → `<NN>.md` (number from maintainer, or
-      keep a working name if they say to choose one)
-- [ ] In the copied file, replace the `NIP-XX` title placeholder with the
-      assigned number
+- [ ] Fork `nostr-protocol/nips`, branch e.g. `nip-f5-nakama-kinds`
+- [ ] Copy `docs/NIP-nakama.md` → `F5.md`; replace the `NIP-F5` title
+      placeholder if a maintainer renumbers
+- [ ] Add a row for NIP-F5 to the README NIP list table
 - [ ] Open the PR with the title/body above; link the reference repo
-- [ ] Respond to reviewer feedback (rename file if number assigned, adjust
+- [ ] Respond to reviewer feedback (renumber file if asked, adjust
       wording); do not argue for exclusivity over the kind block
 - [ ] Record the outcome in spec §26 (accepted / rejected / no response);
       if accepted, update `docs/NIP-nakama.md` title and the kind notes
