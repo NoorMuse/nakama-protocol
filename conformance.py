@@ -407,6 +407,32 @@ report.
 nakama.py's own `cmd_board_decide` (offline: real Schnorr-signed
 draft decisions written to a temp keyfile).
 
+Board-cosign report conformance:
+
+    python3 conformance.py check_board_cosign <report1.txt> [...]
+
+Verifies a saved `nakama.py board_cosign` stdout report is internally
+consistent (spec §9.8): exactly one line — `board-decision: <out> —
+承認署名 <n> つ`. Checks: the single line, the fixed `board-decision:`
+prefix (a separate grammar from board_decide's `board-decision 案:`
+creation line and the verify_board_decision verdict line — the three
+grammars reject each other's reports), a non-empty out file name, and
+the report's only internal arithmetic — a successful cosign always
+reports at least 1 approval signature (a `0 つ` claim is
+self-contradictory). Trailing blank lines tolerated. Explicitly out of
+scope: the payload's validity (`validate_decision_payload`'s
+territory), the approval signatures' validity
+(`verify_board_decision`'s territory), the out file's existence and
+content (`check_decision`'s territory), stderr, and the exit code. Use
+this to prove a second implementation's `board_cosign` CLI prints a
+compatible report.
+
+`python3 conformance.py selftest` also covers
+`check_board_cosign` with reports produced in-process by
+nakama.py's own `cmd_board_cosign` (offline: a real Schnorr-signed
+draft built with `cmd_board_decide`, then cosigned by a second and a
+third key — fresh, duplicate-signature, and --out cases).
+
 Compromise declaration conformance:
 
     python3 conformance.py check_compromise <decl1.json> [...]
@@ -5199,6 +5225,82 @@ def check_board_decide_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_board_decide_report(text)
+        if ok:
+            print(f'{p}: PASS ({ "; ".join(info) })')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_board_cosign: board_cosign report consistency ----------
+
+# board_cosign's stdout is a single-line report naming the (possibly
+# re-saved) decision file and the total approval signature count, and
+# its grammar is fixed (spec §9.8):
+#
+#   board-decision: <out> — 承認署名 <n> つ
+#
+# check_board_cosign verifies that a saved report is internally
+# consistent. Checks: exactly 1 line (trailing blank lines tolerated);
+# the fixed `board-decision:` prefix — a separate grammar from
+# board_decide's `board-decision 案:` creation line (§9.7) and from the
+# verify_board_decision verdict line (§9.6); the three grammars are
+# rejected across checkers; a non-empty out file name; n is a
+# non-negative integer, and the report's only internal arithmetic: a
+# successful cosign always reports at least 1 approval (the reference
+# either appends its own signature or was already signed — a `0 つ`
+# claim is self-contradictory, mirroring check_verify_board_decision's
+# n >= t rule). Out of scope: the payload's validity
+# (validate_decision_payload's territory), the approval signatures'
+# validity (verify_board_decision's territory), the out file's
+# existence and content (check_decision's territory), stderr (the
+# duplicate-approval and tampering warnings live there, not in
+# stdout), and the exit code. Use this to prove a second
+# implementation's board_cosign CLI prints a compatible report.
+
+_RE_BCOSIGN = re.compile(r'^board-decision: (.+?) — 承認署名 (\d+) つ$')
+
+
+def conform_board_cosign_report(text: str):
+    """Verify a saved `nakama.py board_cosign` stdout report is
+    internally consistent. Returns (ok, errors, info)."""
+    info = []
+    lines = [l for l in text.split('\n') if l.strip() != '']
+    if len(lines) != 1:
+        return False, [f'expected exactly 1 report line, found {len(lines)}'], \
+            info
+    m = _RE_BCOSIGN.match(lines[0])
+    if not m:
+        return False, ['line does not match the board_cosign report form'], \
+            info
+    out, n_s = m.group(1), m.group(2)
+    if not out.strip():
+        return False, ['out file name is empty'], info
+    n = int(n_s)
+    if n < 1:
+        return False, [f'approval count {n} is self-contradictory: a '
+                       'successful board_cosign always reports at least 1'], \
+            info
+    info.append(f'out={out}')
+    info.append(f'approvals={n}')
+    return True, [], info
+
+
+def check_board_cosign_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_board_cosign_report(text)
         if ok:
             print(f'{p}: PASS ({ "; ".join(info) })')
         else:
@@ -10233,6 +10335,135 @@ def selftest() -> int:
           f'passed ---')
     fails += bdc_fails
 
+    # ---------- check_board_cosign: board_cosign report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_board_decide + cmd_board_cosign (offline: a draft admit decision
+    # created with one temp keyfile, then cosigned by a second and a
+    # third key — fresh, duplicate-signature, and --out-to-new-file
+    # cases); hand-mutated reports that break the one-line grammar must
+    # be rejected.
+    bcs_fails = 0
+    _bcs_s_a, _bcs_npub_a = _key()
+    _bcs_s_b, _bcs_npub_b = _key()
+    _bcs_s_c, _bcs_npub_c = _key()
+
+    def _bcs_make_draft(tmpd):
+        kf = os.path.join(tmpd, 'key-a.json')
+        nakama.save_key(kf, _bcs_s_a)
+        dec = os.path.join(tmpd, 'draft.json')
+        ns = SimpleNamespace(
+            keyfile=kf, board_id='bcs-board',
+            relay='wss://relay.example', decision='admit',
+            payload=json.dumps({'candidate': _bcs_npub_b}), out=dec,
+            expires_in=None, expires_at=None, old_moderators=None)
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            nakama.cmd_board_decide(ns)
+        return dec
+
+    def _bcs_cosign(key_bytes, decision_path, out=None):
+        buf = io.StringIO()
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmpd:
+            kf = os.path.join(tmpd, 'key.json')
+            nakama.save_key(kf, key_bytes)
+            ns = SimpleNamespace(keyfile=kf, decision=decision_path,
+                                 out=out)
+            code = 0
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(err):
+                try:
+                    nakama.cmd_board_cosign(ns)
+                except SystemExit as e:
+                    code = e.code if isinstance(e.code, int) else 0
+        return buf.getvalue(), err.getvalue(), code
+
+    with tempfile.TemporaryDirectory() as _bcs_tmpd:
+        _bcs_draft = _bcs_make_draft(_bcs_tmpd)
+        _bcs_e2e = []
+        # fresh cosign by a second key: 1 (creator) + 1 = 2
+        _rep, _err, _code = _bcs_cosign(_bcs_s_b, _bcs_draft)
+        _bcs_e2e.append(('fresh cosign (2)', _rep, _err, _code, 0,
+                         f'board-decision: {_bcs_draft} — 承認署名 2 つ\n',
+                         ''))
+        # duplicate cosign by the same key: stderr warning, count unchanged
+        _rep, _err, _code = _bcs_cosign(_bcs_s_b, _bcs_draft)
+        _bcs_e2e.append(('duplicate cosign (2)', _rep, _err, _code, 0,
+                         f'board-decision: {_bcs_draft} — 承認署名 2 つ\n',
+                         '既に承認署名済みです'))
+        # third key with --out to a new file: 3
+        _bcs_new = os.path.join(_bcs_tmpd, 'draft-3.json')
+        _rep, _err, _code = _bcs_cosign(_bcs_s_c, _bcs_draft,
+                                       out=_bcs_new)
+        _bcs_e2e.append(('third key --out (3)', _rep, _err, _code, 0,
+                         f'board-decision: {_bcs_new} — 承認署名 3 つ\n',
+                         ''))
+    for name, rep, err, code, want_code, want_rep, want_err_sub in _bcs_e2e:
+        exact = (rep == want_rep) and (code == want_code) and \
+            (want_err_sub in err)
+        ok, errs, info = conform_board_cosign_report(rep)
+        good = exact and ok
+        print(f'board-cosign-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({ "; ".join(info) })')
+        if not good:
+            if not exact:
+                print(f'    - stdout/stderr/exit mismatch: {rep!r} '
+                      f'code={code} stderr={err!r}')
+            for e in errs:
+                print(f'    - {e}')
+            bcs_fails += 1
+
+    bcs_pos = [
+        ('two approvals', 'board-decision: d.json — 承認署名 2 つ\n'),
+        ('one approval', 'board-decision: d.json — 承認署名 1 つ\n'),
+        ('no trailing newline', 'board-decision: d.json — 承認署名 3 つ'),
+        ('trailing blanks', 'board-decision: d.json — 承認署名 2 つ\n\n  \n'),
+        ('out with spaces', 'board-decision: /tmp/my dir/dec draft.json '
+                            '— 承認署名 5 つ\n'),
+        ('large count', 'board-decision: d.json — 承認署名 100 つ\n'),
+    ]
+    bcs_neg = [
+        ('empty text', ''),
+        ('two reports', 'board-decision: d.json — 承認署名 2 つ\n'
+                        'board-decision: d.json — 承認署名 2 つ\n'),
+        ('board_decide creation line', 'board-decision 案: d.json — 決定 '
+                                       '"admit"、あなたの承認署名 1 つ\n'
+                                       + _BD_LINE2 + '\n'),
+        ('verify_board_decision valid line',
+         'board-decision は有効です: 承認署名 1/2（決定 "admit"）\n'),
+        ('verify_board_decision invalid line',
+         'board-decision は無効です: 承認署名 1/2（threshold 未達または署名不正）\n'),
+        ('zero approvals (self-contradictory)',
+         'board-decision: d.json — 承認署名 0 つ\n'),
+        ('non-numeric count', 'board-decision: d.json — 承認署名 数つ\n'),
+        ('empty out', 'board-decision:  — 承認署名 2 つ\n'),
+        ('missing prefix colon', 'board-decision d.json — 承認署名 2 つ\n'),
+        ('missing separator', 'board-decision: d.json 承認署名 2 つ\n'),
+        ('missing counter word', 'board-decision: d.json — 承認署名 2\n'),
+        ('leading garbage', '前置き\nboard-decision: d.json — 承認署名 2 つ\n'),
+        ('trailing garbage', 'board-decision: d.json — 承認署名 2 つ\nおまけ\n'),
+    ]
+    for name, rep in bcs_pos:
+        ok, errs, info = conform_board_cosign_report(rep)
+        good = ok
+        print(f'check_board_cosign pos {name}: '
+              f'{"PASS" if good else "FAIL"} ({ "; ".join(info) })')
+        for e in errs:
+            print(f'    - {e}')
+        bcs_fails += 0 if good else 1
+    for name, rep in bcs_neg:
+        ok, _errs, _info = conform_board_cosign_report(rep)
+        good = not ok
+        print(f'check_board_cosign neg {name}: '
+              f'{"PASS" if good else "FAIL"}')
+        if not good:
+            print(f'    - report wrongly accepted')
+        bcs_fails += 0 if good else 1
+    bcs_total = len(_bcs_e2e) + len(bcs_pos) + len(bcs_neg)
+    print(f'--- board-cosign {bcs_total - bcs_fails}/{bcs_total} '
+          f'passed ---')
+    fails += bcs_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -10244,7 +10475,7 @@ def selftest() -> int:
         + bfa_total + pub_total + gov_total + rf_total + rtf_total \
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
         + bj_total + bs_total + bc_total + vbd_total + bvr_total \
-        + bdc_total
+        + bdc_total + bcs_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -10527,6 +10758,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_board_decide_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_board_cosign':
+        if len(argv) < 3:
+            print('usage: conformance.py check_board_cosign '
+                  '<report.txt> [...]')
+            return 2
+        return check_board_cosign_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -10570,6 +10807,7 @@ def main(argv: list[str]) -> int:
           'check_verify_board_decision <report.txt> [...] | '
           'check_board_verify <report.txt> [...] | '
           'check_board_decide <report.txt> [...] | '
+          'check_board_cosign <report.txt> [...] | '
           'selftest')
     return 2
 
