@@ -106,7 +106,9 @@ the canonical liveness message, bond linkage, and freshness
 semantics). Passing `check_compromise` on your declaration files
 proves compromise-declaration wire compatibility (declarant
 signature over the canonical compromise message, withdrawn
-semantics).
+semantics). Passing `check_rotation` on your rotation files
+proves rotation-certificate wire compatibility (old-key signature
+over the canonical rotation message; self-rotations rejected).
 
 Platform-binding certificate conformance:
 
@@ -172,6 +174,26 @@ wire-compatible with the reference implementation.
 
 `python3 conformance.py selftest` also covers `check_compromise`
 with reference declarations built by nakama.py's own primitives.
+
+Rotation certificate conformance:
+
+    python3 conformance.py check_rotation <rotation1.json> [...]
+
+Verifies each file is a rotation certificate as written by `rotate`
+(spec §5.5): shape checks (protocol/version/type, valid old/new
+npubs, created_at int, 128-hex old_sig) plus the OLD key's Schnorr
+signature over rotation_message(old_npub, new_npub, created_at),
+mirroring the reference `verify_rotation_cert` signature rule. The
+degenerate self-rotation (old_npub == new_npub) is rejected — a key
+migrating to itself is not a rotation, and `rotate` refuses to emit
+one (CLI-level guard). Chain resolution (rotation_chain_fetch,
+created_at ordering across a chain) is a local-operational step
+outside wire compatibility. Use this to prove a second
+implementation's rotation certificates are wire-compatible with the
+reference implementation.
+
+`python3 conformance.py selftest` also covers `check_rotation`
+with reference certificates built by nakama.py's own primitives.
 """
 
 import json
@@ -1011,6 +1033,75 @@ def conform_compromise(d: dict):
     return (len(errs) == 0), errs, info
 
 
+def conform_rotation(d: dict):
+    """Verify a rotation certificate as written by `rotate` (spec §5.5).
+
+    Shape checks (protocol/version/type, valid old/new npubs,
+    created_at int, 128-hex old_sig) plus the OLD key's Schnorr
+    signature over rotation_message(old_npub, new_npub, created_at) —
+    the same signature rule as the reference `verify_rotation_cert`.
+    The degenerate self-rotation (old_npub == new_npub) is rejected:
+    a key migrating to itself proves no migration, and `rotate`
+    refuses to emit one (stricter than the bare reference check,
+    which only guards this at creation time — same stance as
+    `conform_bond`'s expires_at > created_at rule). Chain resolution
+    (rotation_chain_fetch, created_at ordering across a chain) is a
+    local-operational step outside wire compatibility.
+    Returns (ok, errs, info).
+    """
+    errs: list[str] = []
+    info: list[str] = []
+    if not isinstance(d, dict):
+        return False, ['rotation certificate is not a JSON object'], info
+    if d.get('protocol') != 'nakama':
+        errs.append('protocol != "nakama"')
+    if d.get('version') != 1:
+        errs.append('version != 1')
+    if d.get('type') != 'rotation':
+        errs.append('type != "rotation"')
+    shape_ok = True
+    old = d.get('old_npub')
+    new = d.get('new_npub')
+    for label, v in (('old_npub', old), ('new_npub', new)):
+        if not isinstance(v, str) or nakama.npub_to_hex(v) is None:
+            errs.append(f'{label} must be a valid npub')
+            shape_ok = False
+    if shape_ok and old == new:
+        errs.append('old_npub == new_npub: self-rotation is degenerate '
+                    '(not a migration)')
+        shape_ok = False
+    if not isinstance(d.get('created_at'), int) \
+            or isinstance(d.get('created_at'), bool):
+        errs.append('created_at must be an int')
+        shape_ok = False
+    sig_hex = d.get('old_sig')
+    sig_b = None
+    if not isinstance(sig_hex, str):
+        errs.append('old_sig must be a 128-hex-char string')
+        shape_ok = False
+    else:
+        try:
+            sig_b = bytes.fromhex(sig_hex)
+            if len(sig_b) != 64:
+                raise ValueError
+        except ValueError:
+            errs.append('old_sig must be 128 hex chars (64 bytes)')
+            sig_b = None
+            shape_ok = False
+    if shape_ok:
+        try:
+            msg = nakama.rotation_message(old, new, int(d['created_at']))
+            if not nakama.verify_schnorr(old, sig_b, msg):
+                errs.append('invalid signature: the OLD key must sign '
+                            'rotation_message(old_npub, new_npub, '
+                            'created_at)')
+        except Exception as e:
+            errs.append(f'signature check failed: {e}')
+    if isinstance(old, str) and isinstance(new, str):
+        info.append(f'{old[:12]}... -> {new[:12]}...')
+    return (len(errs) == 0), errs, info
+
+
 def check_compromise_files(paths: list[str]) -> int:
     failures = 0
     for p in paths:
@@ -1021,6 +1112,27 @@ def check_compromise_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_compromise(d)
+        if ok:
+            print(f"{p}: PASS ({'; '.join(info)})")
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+def check_rotation_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            d = json.load(open(p))
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_rotation(d)
         if ok:
             print(f"{p}: PASS ({'; '.join(info)})")
         else:
@@ -1583,8 +1695,86 @@ def selftest() -> int:
     print(f'--- compromise {cp_total - cp_fails}/{cp_total} passed ---')
     fails += cp_fails
 
+    # Rotation certificate conformance: reference certificates built
+    # with nakama.py's own primitives must verify; tampered,
+    # wrong-signer, wrong-type, malformed, and degenerate ones must be
+    # rejected. The signature must come from the OLD key (the party
+    # authorizing the migration) — a signature by the new key proves
+    # nothing about the old key's custody and is rejected.
+    rt_fails = 0
+    s_p, np_p = _key()
+    s_q, np_q = _key()
+    rt_now = int(time.time())
+    rotc = {
+        'protocol': 'nakama', 'version': 1, 'type': 'rotation',
+        'old_npub': np_p, 'new_npub': np_q, 'created_at': rt_now,
+    }
+    rotc['old_sig'] = nakama.sign_schnorr(
+        s_p, nakama.rotation_message(np_p, np_q, rt_now)).hex()
+    rotc_extra = json.loads(json.dumps(rotc))
+    rotc_extra['note'] = 'extra unknown field tolerated'
+
+    rt_pos = [('valid rotation', rotc),
+              ('valid rotation with extra field', rotc_extra)]
+    for name, dd in rt_pos:
+        ok, errs, info = conform_rotation(dd)
+        print(f'rotation/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        rt_fails += 0 if ok else 1
+
+    rt_neg = []
+    bad_sig = json.loads(json.dumps(rotc))
+    bad_sig['old_sig'] = '00' * 128
+    rt_neg.append(('tampered signature', bad_sig))
+    wrong_signer = json.loads(json.dumps(rotc))
+    wrong_signer['old_sig'] = nakama.sign_schnorr(
+        s_q, nakama.rotation_message(np_p, np_q, rt_now)).hex()
+    rt_neg.append(('sig from the new key instead of the old key',
+                   wrong_signer))
+    old_changed = json.loads(json.dumps(rotc))
+    _, np_r = _key()
+    old_changed['old_npub'] = np_r
+    rt_neg.append(('old_npub changed after signing', old_changed))
+    new_changed = json.loads(json.dumps(rotc))
+    new_changed['new_npub'] = np_r
+    rt_neg.append(('new_npub changed after signing', new_changed))
+    self_rot = json.loads(json.dumps(rotc))
+    self_rot['new_npub'] = np_p
+    self_rot['old_sig'] = nakama.sign_schnorr(
+        s_p, nakama.rotation_message(np_p, np_p, rt_now)).hex()
+    rt_neg.append(('self-rotation (old == new)', self_rot))
+    bad_type = json.loads(json.dumps(rotc))
+    bad_type['type'] = 'key-change'
+    rt_neg.append(('wrong type', bad_type))
+    bad_old = json.loads(json.dumps(rotc))
+    bad_old['old_npub'] = 'npub1invalid'
+    rt_neg.append(('invalid old_npub', bad_old))
+    bad_new = json.loads(json.dumps(rotc))
+    bad_new['new_npub'] = 'npub1invalid'
+    rt_neg.append(('invalid new_npub', bad_new))
+    bad_ca = json.loads(json.dumps(rotc))
+    bad_ca['created_at'] = 'not-a-time'
+    rt_neg.append(('created_at not an int', bad_ca))
+    no_sig = json.loads(json.dumps(rotc))
+    del no_sig['old_sig']
+    rt_neg.append(('missing old_sig', no_sig))
+
+    for name, dd in rt_neg:
+        ok, errs, info = conform_rotation(dd)
+        good = not ok
+        print(f'rotation-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            rt_fails += 1
+
+    rt_total = len(rt_pos) + len(rt_neg)
+    print(f'--- rotation {rt_total - rt_fails}/{rt_total} passed ---')
+    fails += rt_fails
+
     grand = total + dm_total + board_total + dec_total + bond_total \
-        + binding_total + live_total + cp_total
+        + binding_total + live_total + cp_total + rt_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -1665,6 +1855,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_compromise <decl1.json> [...]')
             return 2
         return check_compromise_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_rotation':
+        if len(argv) < 3:
+            print('usage: conformance.py check_rotation <rotation1.json> [...]')
+            return 2
+        return check_rotation_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -1676,6 +1871,7 @@ def main(argv: list[str]) -> int:
           'check_liveness [--bond bond.json] [--max-age secs] [--now unixts] '
           '<liveness.json> [...] | '
           'check_compromise <decl.json> [...] | '
+          'check_rotation <rotation.json> [...] | '
           'selftest')
     return 2
 
