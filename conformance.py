@@ -350,6 +350,25 @@ the sender's claim only (spec §25.2).
 `python3 conformance.py selftest` also covers
 `check_notif_record` with reference records built by nakama.py's
 own `draft_notif_record` primitive.
+
+Key-status report conformance:
+
+    python3 conformance.py check_key_status [--exit-code N] <report1.txt> [...]
+
+Each file is the saved stdout of `nakama.py key_status`. Verifies the
+report is internally consistent: the header's declaration/withdrawn
+counts match the listed rows, every row's category is in the §13.3
+vocabulary (with 撤回済み only on withdrawn rows), the verdict's
+counted-declarant number matches the counted categories
+(自分自身 / 直接の仲間 / subject を知る仲間), the verdict agrees with
+its threshold, and complete/stale migration lines agree on the
+rotated vs latest-declaration dates. With `--exit-code N`, also ties
+each verdict to the CLI's exit code (suspected → 1, else 0).
+Explicitly out of scope: whether the declarations really exist —
+that is the registry's claim, not the report's.
+
+`python3 conformance.py selftest` also covers `check_key_status` with
+reference reports produced in-process by nakama.py's own cmd_key_status.
 """
 
 import json
@@ -2035,6 +2054,218 @@ def check_notif_record_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_key_status: key_status report consistency ----------
+
+# key_status's stdout is a human-readable report, but its sections follow a
+# fixed grammar (spec §13.5 / §14.3). check_key_status verifies that a saved
+# report is internally consistent: row counts match the header, withdrawn
+# counts match, every category is in the §13.3 vocabulary, the verdict's
+# counted-declarant number matches the counted categories
+# (自分自身 / 直接の仲間 / subject を知る仲間), the verdict agrees with the
+# threshold, and complete/stale migration lines agree on the rotated vs
+# latest-declaration dates. Explicitly out of scope: whether the declarations
+# really exist, bond-graph membership, and the exit code — unless
+# --exit-code is given, which ties each verdict to the CLI's exit code.
+
+_KEY_STATUS_CATS = ('自分自身', '直接の仲間', 'subject を知る仲間', '参考情報', '撤回済み')
+_KEY_STATUS_COUNTED = ('自分自身', '直接の仲間', 'subject を知る仲間')
+
+_RE_KS_HDR = re.compile(
+    r'^subject: (\S+)\.\.\. の侵害宣言: (\d+) 件（有効な宣言、撤回済み (\d+) 件を除く）$')
+_RE_KS_ROW = re.compile(
+    r'^  (\S+)\.\.\.  \[(.+?)\] \((\d{4})-(\d{2})-(\d{2})\)(（撤回済み）)?(  理由: (.*))?$')
+_RE_KS_INVALID = re.compile(r'^  ※ 署名無効な宣言 (\d+) 件は無視しました$')
+_RE_KS_MIG_C = re.compile(
+    r'^migration: complete \((.+?)\) — rotated at (\d{4}-\d{2}-\d{2}), '
+    r'after latest declaration at (\d{4}-\d{2}-\d{2})( — .*)?$')
+_RE_KS_MIG_S = re.compile(
+    r'^migration: stale \((.+?)\) — rotation は (\d{4}-\d{2}-\d{2})、'
+    r'最新の宣言は (\d{4}-\d{2}-\d{2}) より新しい。今回の移行の証拠になりません$')
+_RE_KS_MIG_B = re.compile(r'^migration: broken — (.+) \(link (\d+)\)$')
+_RE_KS_CNT1 = re.compile(
+    r'^反証あり: subject の新しい生存証明（(\d+) 秒前）が宣言より新しい — 判断はあなたに委ねます。$')
+_RE_KS_CNT2 = re.compile(r'^生存証明は宣言より古いため反証になりません。$')
+_RE_KS_CNT3 = re.compile(r'^生存証明は無効または期限切れです（反証として使えません）。$')
+_RE_KS_VERDICT_SUS = re.compile(
+    r'^判定: 疑わしい（compromised suspected）— bond graph 内の宣言者 (\d+) 人 ≥ 閾値 (\d+)$')
+_RE_KS_VERDICT_WARN = re.compile(
+    r'^判定: 宣言はあるが閾値未満（(\d+) / (\d+)）— 警告として扱ってください。$')
+_RE_KS_VERDICT_NONE = re.compile(r'^判定: 侵害宣言はありません。$')
+_RE_KS_ARROW_SEG = re.compile(r'^[a-z0-9]{12}\.\.\.$')
+
+
+def _ks_valid_date(s: str) -> bool:
+    try:
+        time.strptime(s, '%Y-%m-%d')
+        return True
+    except ValueError:
+        return False
+
+
+def conform_key_status_report(text: str, exit_code: int | None = None):
+    """Verify a saved `nakama.py key_status` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    m = _RE_KS_HDR.match(lines[0])
+    if not m:
+        return False, ['header line does not match key_status grammar'], info
+    subj_prefix, n_str, w_str = m.groups()
+    if len(subj_prefix) != 16:
+        errs.append(f'subject npub prefix is {len(subj_prefix)} chars, want 16')
+    n_decl, n_withdrawn = int(n_str), int(w_str)
+    rows = []
+    i = 1
+    while i < len(lines):
+        rm = _RE_KS_ROW.match(lines[i])
+        if not rm:
+            break
+        decl_prefix, cat, yy, mm, dd, wd, _r, reason = rm.groups()
+        if len(decl_prefix) != 16:
+            errs.append(f'line {i + 1}: declarant npub prefix is '
+                        f'{len(decl_prefix)} chars, want 16')
+        if cat not in _KEY_STATUS_CATS:
+            errs.append(f'line {i + 1}: unknown category [{cat}] '
+                        f'(want one of {_KEY_STATUS_CATS})')
+        if not _ks_valid_date(f'{yy}-{mm}-{dd}'):
+            errs.append(f'line {i + 1}: invalid date {yy}-{mm}-{dd}')
+        is_wd = wd is not None
+        if is_wd and cat != '撤回済み':
+            errs.append(f'line {i + 1}: marked （撤回済み） but category is '
+                        f'[{cat}] (want [撤回済み])')
+        if not is_wd and cat == '撤回済み':
+            errs.append(f'line {i + 1}: category [撤回済み] without '
+                        f'（撤回済み） marker')
+        rows.append({'withdrawn': is_wd, 'category': cat})
+        i += 1
+    if len(rows) != n_decl:
+        errs.append(f'header says {n_decl} declarations but '
+                    f'{len(rows)} rows listed')
+    wd_rows = sum(1 for r in rows if r['withdrawn'])
+    if wd_rows != n_withdrawn:
+        errs.append(f'header says {n_withdrawn} withdrawn but {wd_rows} rows '
+                    f'marked （撤回済み）')
+    active = [r for r in rows if not r['withdrawn']]
+    suspected_count = sum(1 for r in active
+                          if r['category'] in _KEY_STATUS_COUNTED)
+    if i < len(lines) and _RE_KS_INVALID.match(lines[i]):
+        k = int(_RE_KS_INVALID.match(lines[i]).group(1))
+        if k < 1:
+            errs.append(f'line {i + 1}: invalid-declaration note with '
+                        f'count {k} (< 1)')
+        info.append(f'{k} invalid ignored')
+        i += 1
+    if i < len(lines) and lines[i].startswith('migration: '):
+        mc = _RE_KS_MIG_C.match(lines[i])
+        ms = _RE_KS_MIG_S.match(lines[i])
+        mb = _RE_KS_MIG_B.match(lines[i])
+        if not (mc or ms or mb):
+            errs.append(f'line {i + 1}: unrecognized migration line')
+        else:
+            kind = 'complete' if mc else 'stale' if ms else 'broken'
+            if kind != 'broken':
+                mg = mc or ms
+                arrow = mg.group(1)
+                if any(not _RE_KS_ARROW_SEG.match(s)
+                       for s in arrow.split(' -> ')):
+                    errs.append(f'line {i + 1}: migration arrow malformed: '
+                                f'{arrow!r}')
+                rot_d, decl_d = mg.group(2), mg.group(3)
+                if not _ks_valid_date(rot_d):
+                    errs.append(f'line {i + 1}: invalid rotated date {rot_d}')
+                if not _ks_valid_date(decl_d):
+                    errs.append(f'line {i + 1}: invalid declaration date '
+                                f'{decl_d}')
+                if kind == 'stale' and rot_d >= decl_d:
+                    errs.append(f'line {i + 1}: stale but rotated {rot_d} >= '
+                                f'latest declaration {decl_d}')
+                if kind == 'complete' and rot_d < decl_d:
+                    errs.append(f'line {i + 1}: complete but rotated {rot_d} '
+                                f'< latest declaration {decl_d}')
+            info.append(f'migration {kind}')
+        i += 1
+    cnt1 = i < len(lines) and _RE_KS_CNT1.match(lines[i])
+    if cnt1 or (i < len(lines) and
+                (_RE_KS_CNT2.match(lines[i]) or _RE_KS_CNT3.match(lines[i]))):
+        if cnt1 and not active:
+            errs.append('counter-evidence 反証あり but no active declarations')
+        info.append('counter-evidence section')
+        i += 1
+    if i >= len(lines):
+        errs.append('missing 判定 verdict line')
+    else:
+        v = lines[i]
+        if any(ln != '' for ln in lines[i + 1:]):
+            errs.append('verdict is not the final line')
+        ms = _RE_KS_VERDICT_SUS.match(v)
+        mw = _RE_KS_VERDICT_WARN.match(v)
+        mn = _RE_KS_VERDICT_NONE.match(v)
+        if not (ms or mw or mn):
+            errs.append(f'verdict line unrecognized: {v!r}')
+        elif ms:
+            s, t = int(ms.group(1)), int(ms.group(2))
+            if s != suspected_count:
+                errs.append(f'verdict says {s} counted declarants but report '
+                            f'has {suspected_count}')
+            if s < t:
+                errs.append(f'verdict says suspected but {s} < threshold {t}')
+            info.append(f'suspected ({s} >= {t})')
+            if exit_code is not None and exit_code != 1:
+                errs.append(f'suspected verdict requires exit code 1, '
+                            f'got {exit_code}')
+        elif mw:
+            s, t = int(mw.group(1)), int(mw.group(2))
+            if s != suspected_count:
+                errs.append(f'verdict says {s} counted declarants but report '
+                            f'has {suspected_count}')
+            if s >= t:
+                errs.append(f'verdict says below threshold but '
+                            f'{s} >= threshold {t}')
+            if not active:
+                errs.append('verdict says declarations below threshold but '
+                            'no active declarations')
+            info.append(f'below threshold ({s} / {t})')
+            if exit_code is not None and exit_code != 0:
+                errs.append(f'below-threshold verdict requires exit code 0, '
+                            f'got {exit_code}')
+        else:
+            if active:
+                errs.append(f'verdict says no declarations but '
+                            f'{len(active)} active rows listed')
+            info.append('no declarations')
+            if exit_code is not None and exit_code != 0:
+                errs.append(f'no-declaration verdict requires exit code 0, '
+                            f'got {exit_code}')
+    return (not errs), errs, info
+
+
+def check_key_status_files(paths: list[str], exit_code: int | None) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_key_status_report(text, exit_code)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 def _key() -> tuple[bytes, str]:
     s = secrets.token_bytes(32)
     return s, nakama.npub_of(s)
@@ -3296,13 +3527,251 @@ def selftest() -> int:
               f'{"PASS (flagged)" if rc == 1 else "FAIL (missed!)"}')
         rec_fails += 0 if rc == 1 else 1
 
+    # ---------- check_key_status: key_status report consistency ----------
+    # Real key_status reports are produced in-process with nakama.py's own
+    # cmd_key_status (throwaway keyfiles + registry + bonds) and must pass;
+    # hand-mutated reports that break the grammar or the internal
+    # consistency (counts, categories, verdict/threshold, migration dates,
+    # exit code) must be rejected.
+    ks_fails = 0
+    import tempfile
+    import io
+    import contextlib
+    from types import SimpleNamespace
+
+    def _ks_keyfile(secret, tmpd, name):
+        kf = os.path.join(tmpd, name)
+        with open(kf, 'w') as f:
+            json.dump({'secret_hex': secret.hex()}, f)
+        os.chmod(kf, 0o600)
+        return kf
+
+    def _ks_run(npub, keyfile, registry, threshold=2, bonds=(),
+                rotation=(), liveness=None, max_age=7 * 86400):
+        args = SimpleNamespace(npub=npub, threshold=threshold,
+                               bond=list(bonds), liveness=liveness,
+                               max_age=max_age, registry=registry,
+                               rotation=list(rotation), keyfile=keyfile)
+        buf = io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(buf):
+            try:
+                nakama.cmd_key_status(args)
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 1
+        return buf.getvalue(), code
+
+    def _ks_hdr(npb, n, m):
+        return (f'subject: {npb[:16]}... の侵害宣言: {n} 件'
+                f'（有効な宣言、撤回済み {m} 件を除く）')
+
+    def _ks_row(npb, cat, date, wd=False, reason=None):
+        s = f'  {npb[:16]}...  [{cat}] ({date})'
+        if wd:
+            s += '（撤回済み）'
+        if reason:
+            s += f'  理由: {reason}'
+        return s
+
+    ks_e2e = []
+    with tempfile.TemporaryDirectory() as tmpd:
+        s_me, np_me = _key()
+        s_sub, np_sub = _key()
+        s_sub2, np_sub2 = _key()
+        s_c, np_c = _key()      # companion (直接の仲間)
+        s_out, np_out = _key()  # outsider (参考情報)
+        ks_now = int(time.time())
+        keyfile_me = _ks_keyfile(s_me, tmpd, 'me.json')
+        reg = os.path.join(tmpd, 'registry')
+
+        rep, code = _ks_run(np_sub, keyfile_me, reg)
+        ks_e2e.append(('empty registry -> no declarations', rep, code))
+
+        bondf = os.path.join(tmpd, 'bond.json')
+        with open(bondf, 'w') as f:
+            json.dump({'protocol': 'nakama', 'version': 1, 'type': 'bond',
+                       'companions': [np_me, np_c],
+                       'created_at': ks_now - 1000, 'nonce': 'aa' * 32}, f)
+
+        decl_c = nakama.build_compromise_declaration(
+            s_c, np_sub, ks_now - 100, reason='conformance selftest')
+        nakama.import_compromise_event(decl_c, reg)
+        rep, code = _ks_run(np_sub, keyfile_me, reg, bonds=[bondf])
+        ks_e2e.append(('one companion declaration -> below threshold',
+                       rep, code))
+
+        decl_me = nakama.build_compromise_declaration(
+            s_me, np_sub, ks_now - 90, reason='self report')
+        nakama.import_compromise_event(decl_me, reg)
+        rep, code = _ks_run(np_sub, keyfile_me, reg, bonds=[bondf])
+        ks_e2e.append(('two counted declarations -> suspected', rep, code))
+
+        decl_o = nakama.build_compromise_declaration(s_out, np_sub,
+                                                     ks_now - 80)
+        nakama.import_compromise_event(decl_o, reg)
+        decl_o_wd = nakama.build_compromise_declaration(
+            s_out, np_sub, ks_now - 80, withdrawn=True)
+        nakama.import_compromise_event(decl_o_wd, reg)
+        rep, code = _ks_run(np_sub, keyfile_me, reg, bonds=[bondf])
+        ks_e2e.append(('withdrawn declaration shown as 撤回済み', rep, code))
+
+        rot = {'protocol': 'nakama', 'version': 1, 'type': 'rotation',
+               'old_npub': np_sub, 'new_npub': np_sub2,
+               'created_at': ks_now - 50}
+        rot['old_sig'] = nakama.sign_schnorr(
+            s_sub, nakama.rotation_message(np_sub, np_sub2,
+                                           ks_now - 50)).hex()
+        rotf = os.path.join(tmpd, 'rotation.json')
+        with open(rotf, 'w') as f:
+            json.dump(rot, f)
+        rep, code = _ks_run(np_sub, keyfile_me, reg, bonds=[bondf],
+                            rotation=[rotf])
+        ks_e2e.append(('migration complete after latest declaration',
+                       rep, code))
+
+        keyfile_sub = _ks_keyfile(s_sub, tmpd, 'sub.json')
+        livef = os.path.join(tmpd, 'liveness.json')
+        with contextlib.redirect_stdout(io.StringIO()):
+            nakama.cmd_liveness(SimpleNamespace(bond=None, out=livef,
+                                                keyfile=keyfile_sub))
+        rep, code = _ks_run(np_sub, keyfile_me, reg, bonds=[bondf],
+                            liveness=livef)
+        ks_e2e.append(('counter-evidence 反証あり', rep, code))
+
+        rp = nakama.compromise_registry_path(
+            reg, nakama.npub_to_hex(np_sub))
+        with open(rp) as f:
+            decls = json.load(f)
+        decls.append({'protocol': 'nakama', 'version': 1,
+                      'type': 'key-compromise-declaration',
+                      'subject': np_sub, 'declarant': np_out,
+                      'created_at': ks_now - 70, 'sig': '00' * 128})
+        with open(rp, 'w') as f:
+            json.dump(decls, f)
+        rep, code = _ks_run(np_sub, keyfile_me, reg, bonds=[bondf])
+        ks_e2e.append(('invalid declaration ignored note', rep, code))
+
+    for name, rep, code in ks_e2e:
+        ok, errs, info = conform_key_status_report(rep, code)
+        print(f'key-status-e2e/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        ks_fails += 0 if ok else 1
+
+    # hand-crafted positives
+    _, np_k1 = _key()
+    _, np_k2 = _key()
+    hdr_k = _ks_hdr(np_k1, 1, 0)
+    row_ref = _ks_row(np_k2, '参考情報', '2026-09-30', reason='note')
+    ks_pos = [
+        ('below-threshold outsider verdict',
+         f'{hdr_k}\n{row_ref}\n'
+         f'判定: 宣言はあるが閾値未満（0 / 2）— 警告として扱ってください。\n',
+         0),
+        ('broken migration chain',
+         f'{_ks_hdr(np_k1, 0, 0)}\n'
+         f'migration: broken — チェーンが連鎖していない (link 1)\n'
+         f'判定: 侵害宣言はありません。\n',
+         0),
+    ]
+    for name, rep, code in ks_pos:
+        ok, errs, info = conform_key_status_report(rep, code)
+        print(f'key-status/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        ks_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    ks_neg = []
+    ks_neg.append(('header malformed', 'subject: nope\n', 0))
+    ks_neg.append(('unknown category',
+                   f'{hdr_k}\n{_ks_row(np_k2, "第三者", "2026-09-30")}\n'
+                   f'判定: 宣言はあるが閾値未満（0 / 2）— 警告として扱ってください。\n',
+                   0))
+    ks_neg.append(('row count mismatch',
+                   f'{hdr_k}\n{row_ref}\n{row_ref}\n'
+                   f'判定: 宣言はあるが閾値未満（0 / 2）— 警告として扱ってください。\n',
+                   0))
+    ks_neg.append(('withdrawn count mismatch',
+                   f'{hdr_k}\n{_ks_row(np_k2, "撤回済み", "2026-09-30", wd=True)}\n'
+                   f'判定: 宣言はあるが閾値未満（0 / 2）— 警告として扱ってください。\n',
+                   0))
+    ks_neg.append(('withdrawn row with wrong category',
+                   f'{_ks_hdr(np_k1, 1, 1)}\n'
+                   f'{_ks_row(np_k2, "直接の仲間", "2026-09-30", wd=True)}\n'
+                   f'判定: 侵害宣言はありません。\n',
+                   0))
+    ks_neg.append(('撤回済み category without marker',
+                   f'{hdr_k}\n{_ks_row(np_k2, "撤回済み", "2026-09-30")}\n'
+                   f'判定: 宣言はあるが閾値未満（0 / 2）— 警告として扱ってください。\n',
+                   0))
+    ks_neg.append(('invalid date',
+                   f'{hdr_k}\n{_ks_row(np_k2, "参考情報", "2026-13-40")}\n'
+                   f'判定: 宣言はあるが閾値未満（0 / 2）— 警告として扱ってください。\n',
+                   0))
+    ks_neg.append(('suspected verdict below threshold',
+                   f'{hdr_k}\n{_ks_row(np_k2, "直接の仲間", "2026-09-30")}\n'
+                   f'判定: 疑わしい（compromised suspected）— bond graph 内の宣言者 1 人 ≥ 閾値 2\n',
+                   1))
+    ks_neg.append(('warn verdict at threshold',
+                   f'{_ks_hdr(np_k1, 2, 0)}\n'
+                   f'{_ks_row(np_k1, "直接の仲間", "2026-09-30")}\n'
+                   f'{_ks_row(np_k2, "自分自身", "2026-09-30")}\n'
+                   f'判定: 宣言はあるが閾値未満（2 / 2）— 警告として扱ってください。\n',
+                   0))
+    ks_neg.append(('verdict count differs from rows',
+                   f'{_ks_hdr(np_k1, 2, 0)}\n'
+                   f'{_ks_row(np_k1, "直接の仲間", "2026-09-30")}\n'
+                   f'{_ks_row(np_k2, "自分自身", "2026-09-30")}\n'
+                   f'判定: 疑わしい（compromised suspected）— bond graph 内の宣言者 3 人 ≥ 閾値 2\n',
+                   1))
+    ks_neg.append(('exit code mismatch on suspected',
+                   f'{_ks_hdr(np_k1, 2, 0)}\n'
+                   f'{_ks_row(np_k1, "直接の仲間", "2026-09-30")}\n'
+                   f'{_ks_row(np_k2, "自分自身", "2026-09-30")}\n'
+                   f'判定: 疑わしい（compromised suspected）— bond graph 内の宣言者 2 人 ≥ 閾値 2\n',
+                   0))
+    ks_neg.append(('verdict not the final line',
+                   f'{_ks_hdr(np_k1, 0, 0)}\n判定: 侵害宣言はありません。\nextra line\n',
+                   0))
+    ks_neg.append(('missing verdict', f'{_ks_hdr(np_k1, 0, 0)}\n', 0))
+    ks_neg.append(('unknown middle line',
+                   f'{_ks_hdr(np_k1, 0, 0)}\nrandom garbage\n判定: 侵害宣言はありません。\n',
+                   0))
+    ks_neg.append(('complete migration with inverted dates',
+                   f'{_ks_hdr(np_k1, 1, 0)}\n{row_ref}\n'
+                   f'migration: complete ({np_k1[:12]}... -> {np_k2[:12]}...) '
+                   f'— rotated at 2026-09-01, after latest declaration at '
+                   f'2026-09-30 — 新鍵への有効な宣言はありません\n'
+                   f'判定: 宣言はあるが閾値未満（0 / 2）— 警告として扱ってください。\n',
+                   0))
+    ks_neg.append(('counter-evidence without declarations',
+                   f'{_ks_hdr(np_k1, 0, 0)}\n'
+                   f'反証あり: subject の新しい生存証明（5 秒前）が宣言より新しい — 判断はあなたに委ねます。\n'
+                   f'判定: 侵害宣言はありません。\n',
+                   0))
+
+    for name, rep, code in ks_neg:
+        ok, errs, info = conform_key_status_report(rep, code)
+        good = not ok
+        print(f'key-status-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            ks_fails += 1
+
+    ks_total = len(ks_e2e) + len(ks_pos) + len(ks_neg)
+    print(f'--- key-status {ks_total - ks_fails}/{ks_total} passed ---')
+    fails += ks_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
 
     grand = total + dm_total + board_total + dec_total + bond_total \
         + binding_total + live_total + cp_total + rt_total + rv_total \
-        + ub_total + pl_total + dr_total + ack_total + rec_total
+        + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -3436,6 +3905,23 @@ def main(argv: list[str]) -> int:
                   '<record1.json | notif_dir> [...]')
             return 2
         return check_notif_record_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_key_status':
+        rest = argv[2:]
+        exit_code = None
+        paths = []
+        i = 0
+        while i < len(rest):
+            if rest[i] == '--exit-code' and i + 1 < len(rest):
+                exit_code = int(rest[i + 1])
+                i += 2
+            else:
+                paths.append(rest[i])
+                i += 1
+        if not paths:
+            print('usage: conformance.py check_key_status [--exit-code N] '
+                  '<report1.txt> [...]')
+            return 2
+        return check_key_status_files(paths, exit_code)
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -3455,6 +3941,7 @@ def main(argv: list[str]) -> int:
           '<draft.json> [...] | '
           'check_notif_ack <ack1.txt> [...] | '
           'check_notif_record <record1.json | notif_dir> [...] | '
+          'check_key_status [--exit-code N] <report.txt> [...] | '
           'selftest')
     return 2
 
