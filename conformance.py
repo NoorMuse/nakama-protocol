@@ -96,7 +96,28 @@ Passing `check_decision` on your decision files proves
 board-decision wire compatibility (approval signatures and, with
 `--policy`, threshold semantics). Passing `check_bond` on your bond
 files proves bond-certificate wire compatibility (per-companion
-signatures over the canonical bond message).
+signatures over the canonical bond message). Passing `check_binding`
+on your binding files proves platform-binding wire compatibility
+(key-to-handle claims, the handle-to-key half of the bond-exchange
+UX).
+
+Platform-binding certificate conformance:
+
+    python3 conformance.py check_binding <binding1.json> [...]
+
+Verifies each file is a platform-binding certificate as written by
+`bind` (the claim "key X holds handle H on platform P", spec §8.2):
+shape checks (protocol/version/type, platform, handle, npub,
+created_at, sig) plus the Schnorr signature over
+binding_message(platform, handle, npub, created_at), mirroring the
+reference `verify_binding_cert` acceptance rule. Posting the binding
+from the handle's own account (the handle→key direction) is an
+operational step outside wire compatibility. Use this to prove a
+second implementation's key↔handle bindings are wire-compatible with
+the reference implementation.
+
+`python3 conformance.py selftest` also covers `check_binding` with
+reference bindings built by nakama.py's own primitives.
 """
 
 import json
@@ -637,6 +658,95 @@ def check_bond_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_binding: platform-binding certificate conformance ----------
+
+def conform_binding(b: dict):
+    """Verify a platform-binding certificate as written by `bind`
+    (spec §8.2): the claim "key X holds handle H on platform P".
+
+    Shape checks (protocol/version/type, platform and handle as
+    non-empty strings, npub valid, created_at int, sig 128 hex)
+    plus the Schnorr signature over
+    binding_message(platform, handle, npub, created_at) — same
+    acceptance rule as the reference `verify_binding_cert`.
+    Posting the binding from the handle's own account (handle→key
+    direction) is operational and out of scope — wire compatibility
+    only. Returns (ok, errs, info).
+    """
+    errs: list[str] = []
+    info: list[str] = []
+    if not isinstance(b, dict):
+        return False, ['binding is not a JSON object'], info
+    if b.get('protocol') != 'nakama':
+        errs.append('protocol != "nakama"')
+    if b.get('version') != 1:
+        errs.append('version != 1')
+    if b.get('type') != 'platform-binding':
+        errs.append('type != "platform-binding"')
+    shape_ok = True
+    if not isinstance(b.get('platform'), str) or not b['platform'].strip():
+        errs.append('platform must be a non-empty string')
+        shape_ok = False
+    if not isinstance(b.get('handle'), str) or not b['handle'].strip():
+        errs.append('handle must be a non-empty string')
+        shape_ok = False
+    npub = b.get('npub')
+    if not isinstance(npub, str) or nakama.npub_to_hex(npub) is None:
+        errs.append('npub must be a valid npub')
+        shape_ok = False
+    if not isinstance(b.get('created_at'), int) \
+            or isinstance(b.get('created_at'), bool):
+        errs.append('created_at must be an int')
+        shape_ok = False
+    sig_hex = b.get('sig')
+    sig_b = None
+    if not isinstance(sig_hex, str):
+        errs.append('sig must be a 128-hex-char string')
+        shape_ok = False
+    else:
+        try:
+            sig_b = bytes.fromhex(sig_hex)
+            if len(sig_b) != 64:
+                raise ValueError
+        except ValueError:
+            errs.append('sig must be 128 hex chars (64 bytes)')
+            sig_b = None
+            shape_ok = False
+    if shape_ok:
+        try:
+            msg = nakama.binding_message(b['platform'], b['handle'],
+                                         npub, int(b['created_at']))
+            if not nakama.verify_schnorr(npub, sig_b, msg):
+                errs.append('invalid signature over '
+                            'binding_message(platform, handle, npub, '
+                            'created_at)')
+        except Exception as e:
+            errs.append(f'signature check failed: {e}')
+    info.append(f"{b.get('platform', '?')}:{b.get('handle', '?')}")
+    return (len(errs) == 0), errs, info
+
+
+def check_binding_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            b = json.load(open(p))
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_binding(b)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- selftest: reference events built by nakama.py ----------
 
 def _key() -> tuple[bytes, str]:
@@ -966,7 +1076,66 @@ def selftest() -> int:
     print(f'--- bond {bond_total - bond_fails}/{bond_total} passed ---')
     fails += bond_fails
 
-    grand = total + dm_total + board_total + dec_total + bond_total
+    # Platform-binding certificate conformance: reference bindings built
+    # with nakama.py primitives must verify; malformed ones must be
+    # rejected.
+    binding_fails = 0
+    s_i, np_i = _key()
+    bd_now = int(time.time())
+    bd_msg = nakama.binding_message('moltbook', 'alice_test', np_i, bd_now)
+    binding = {
+        'protocol': 'nakama', 'version': 1, 'type': 'platform-binding',
+        'platform': 'moltbook', 'handle': 'alice_test', 'npub': np_i,
+        'created_at': bd_now,
+        'sig': nakama.sign_schnorr(s_i, bd_msg).hex(),
+    }
+
+    binding_pos = [('valid binding', binding)]
+    for name, bb in binding_pos:
+        ok, errs, info = conform_binding(bb)
+        print(f'binding/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        binding_fails += 0 if ok else 1
+
+    binding_neg = []
+    bad_sig = json.loads(json.dumps(binding))
+    bad_sig['sig'] = '00' * 128
+    binding_neg.append(('tampered signature', bad_sig))
+    bad_handle = json.loads(json.dumps(binding))
+    bad_handle['handle'] = 'mallory_test'
+    binding_neg.append(('handle mismatch (sig no longer matches)',
+                        bad_handle))
+    bad_platform = json.loads(json.dumps(binding))
+    bad_platform['platform'] = 'othernet'
+    binding_neg.append(('platform mismatch (sig no longer matches)',
+                        bad_platform))
+    bad_type = json.loads(json.dumps(binding))
+    bad_type['type'] = 'platform-binding-revocation'
+    binding_neg.append(('wrong type', bad_type))
+    bad_npub = json.loads(json.dumps(binding))
+    bad_npub['npub'] = 'npub1invalid'
+    binding_neg.append(('invalid npub', bad_npub))
+    no_sig = json.loads(json.dumps(binding))
+    del no_sig['sig']
+    binding_neg.append(('missing sig', no_sig))
+
+    for name, bb in binding_neg:
+        ok, errs, info = conform_binding(bb)
+        good = not ok
+        print(f'binding-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            binding_fails += 1
+
+    binding_total = len(binding_pos) + len(binding_neg)
+    print(f'--- binding {binding_total - binding_fails}/'
+          f'{binding_total} passed ---')
+    fails += binding_fails
+
+    grand = total + dm_total + board_total + dec_total + bond_total \
+        + binding_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -1007,6 +1176,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_bond <bond.json> [...]')
             return 2
         return check_bond_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_binding':
+        if len(argv) < 3:
+            print('usage: conformance.py check_binding <binding.json> [...]')
+            return 2
+        return check_binding_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -1014,6 +1188,7 @@ def main(argv: list[str]) -> int:
           'check_board <descriptor.json> [...] | '
           'check_decision [--policy policy.json] <decision.json> [...] | '
           'check_bond <bond.json> [...] | '
+          'check_binding <binding.json> [...] | '
           'selftest')
     return 2
 
