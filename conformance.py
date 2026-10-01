@@ -48,11 +48,33 @@ implementation accepts.
 `python3 conformance.py selftest` also covers `check_board` with
 reference descriptors built by nakama.py's own primitives.
 
+Board-decision file conformance:
+
+    python3 conformance.py check_decision [--policy policy.json] \
+        <decision1.json> [...]
+
+Verifies each file is a board-decision file as written by
+`board_decide`/`board_cosign`: shape checks (protocol/version/type,
+board_id, relay, decision type, per-type payload, created_at), one
+Schnorr signature check per approval over board_decision_message(...),
+deduplicated by npub, mirroring `verify_board_decision`. With
+`--policy policy.json`, the threshold is also evaluated against that
+policy cert (n-of-m semantics, outsiders ignored); without it, only
+signature validity is checked. Use this to prove a second
+implementation's decisions and cosignatures are wire-compatible with
+the reference implementation.
+
+`python3 conformance.py selftest` also covers `check_decision` with
+reference decisions built by nakama.py's own primitives.
+
 For the second implementer: passing `check` on your own events is the
 criterion-1 evidence the NIP-F5 draft PR needs, passing `check_dm`
 on wraps addressed to a nakama-built keypair proves NIP-17 wire
 compatibility, and passing `check_board` on your descriptors proves
 NIP-29 board wire compatibility with the reference implementation.
+Passing `check_decision` on your decision files proves
+board-decision wire compatibility (approval signatures and, with
+`--policy`, threshold semantics).
 """
 
 import json
@@ -333,6 +355,143 @@ def check_board_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_decision: board-decision file conformance ----------
+
+def conform_decision(d: dict, policy: dict | None = None):
+    """Verify a board-decision file as written by `board_decide`/`board_cosign`.
+
+    Shape checks (protocol/version/type, board_id, relay, decision type,
+    per-type payload via validate_decision_payload, created_at) plus one
+    Schnorr signature check per approval over board_decision_message(...),
+    with approvals deduplicated by npub. Same signature acceptance rule as
+    `verify_board_decision`. If `policy` is given, the threshold is also
+    evaluated (policy cert must verify, and policy's board_id/relay must
+    match the decision); without it, signature validity alone decides.
+    Returns (ok, errs, info_lines).
+    """
+    errs: list[str] = []
+    info: list[str] = []
+    if not isinstance(d, dict):
+        return False, ['decision is not a JSON object'], info
+    if d.get('protocol') != 'nakama':
+        errs.append('protocol != "nakama"')
+    if d.get('version') != 1:
+        errs.append('version != 1')
+    if d.get('type') not in ('board-decision', 'board-draft'):
+        errs.append('type must be "board-decision" or "board-draft"')
+    board_id = d.get('board_id')
+    if not isinstance(board_id, str):
+        errs.append(f'board_id {board_id!r} must be a string')
+    relay = d.get('relay')
+    if not (isinstance(relay, str)
+            and relay.startswith(('ws://', 'wss://'))):
+        errs.append(f'relay {relay!r} must be a ws(s):// URL')
+    decision = d.get('decision')
+    if decision not in nakama.BOARD_DECISION_TYPES:
+        errs.append(f'decision {decision!r} is not a known decision type')
+    else:
+        try:
+            if not nakama.validate_decision_payload(decision, d.get('payload')):
+                errs.append(f'payload shape invalid for decision {decision!r}')
+        except Exception as e:
+            errs.append(f'payload check failed: {e}')
+    if not isinstance(d.get('created_at'), int) \
+            or isinstance(d.get('created_at'), bool):
+        errs.append('created_at must be an int')
+
+    good: set[str] = set()
+    msg: bytes | None = None
+    approvals = d.get('approvals')
+    if not (isinstance(approvals, list) and approvals):
+        errs.append('approvals must be a non-empty list')
+    else:
+        try:
+            msg = nakama.board_decision_message(
+                board_id, relay, decision, d.get('payload'),
+                int(d.get('created_at')))
+        except Exception as e:
+            errs.append(f'decision message build failed: {e}')
+        if msg is not None:
+            seen: set[str] = set()
+            for i, a in enumerate(approvals):
+                if not isinstance(a, dict):
+                    errs.append(f'approval #{i} is not a dict')
+                    continue
+                npub = a.get('npub')
+                if npub in seen:
+                    continue  # dedup: one npub counts once (verify_board_decision rule)
+                seen.add(npub)
+                if nakama.npub_to_hex(npub) is None:
+                    errs.append(f'approval #{i} npub {npub!r} is not a valid npub')
+                    continue
+                sig_b = None
+                if isinstance(a.get('sig'), str):
+                    try:
+                        sig_b = bytes.fromhex(a['sig'])
+                    except ValueError:
+                        sig_b = None
+                if sig_b is None or len(sig_b) != 64:
+                    errs.append(f'approval #{i} ({npub[:16]}…): '
+                                'sig must be 128 hex chars')
+                    continue
+                try:
+                    if not nakama.verify_schnorr(npub, sig_b, msg):
+                        errs.append(f'approval #{i} ({npub[:16]}…): '
+                                    'invalid signature')
+                    else:
+                        good.add(npub)
+                except Exception as e:
+                    errs.append(f'approval #{i} ({npub[:16]}…): '
+                                f'signature check failed: {e}')
+    info.append(f'{len(good)} valid approval(s) from {len(approvals) if isinstance(approvals, list) else 0} entr(ies)')
+
+    if policy is not None:
+        if d.get('type') != 'board-decision':
+            errs.append('policy check is for board-decision files only')
+        elif not isinstance(policy, dict):
+            errs.append('policy is not a JSON object')
+        elif not nakama.verify_board_policy_cert(policy):
+            errs.append('policy cert invalid (signature rule: all eligible '
+                        'must sign, no outsiders)')
+        else:
+            ok_t, n, th = nakama.verify_board_decision(d, policy)
+            info.append(f'threshold: {n}/{th}')
+            if not ok_t:
+                errs.append(f'threshold not met: {n}/{th} (or board_id/relay '
+                            'mismatch with policy)')
+    return (len(errs) == 0), errs, info
+
+
+def check_decision_files(policy_path: str | None,
+                         paths: list[str]) -> int:
+    policy = None
+    if policy_path is not None:
+        try:
+            policy = json.load(open(policy_path))
+        except Exception as e:
+            print(f'FAIL (policy unreadable: {e})')
+            return 1
+    failures = 0
+    for p in paths:
+        try:
+            d = json.load(open(p))
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_decision(d, policy)
+        if ok:
+            print(f'{p}: PASS ({d.get("decision")!r} on {d.get("board_id")}; '
+                  f'{"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- selftest: reference events built by nakama.py ----------
 
 def _key() -> tuple[bytes, str]:
@@ -497,7 +656,104 @@ def selftest() -> int:
     print(f'--- board {board_total - board_fails}/{board_total} passed ---')
     fails += board_fails
 
-    grand = total + dm_total + board_total
+    # Board-decision file conformance: reference decisions built with
+    # nakama.py primitives must verify; malformed ones must be rejected.
+    dec_fails = 0
+    s_c, np_c = _key()
+    s_d, np_d = _key()
+    d_now = int(time.time())
+    d_id = 'nakama-' + secrets.token_hex(3)
+    d_relay = 'wss://relay.damus.io'
+    d_payload = {'candidate': np_d}
+    d_msg = nakama.board_decision_message(d_id, d_relay, 'admit',
+                                          d_payload, d_now)
+    dec = {
+        'protocol': 'nakama', 'version': 1, 'type': 'board-decision',
+        'board_id': d_id, 'relay': d_relay, 'decision': 'admit',
+        'payload': d_payload, 'created_at': d_now,
+        'approvals': [{'npub': np_c,
+                       'sig': nakama.sign_schnorr(s_c, d_msg).hex()}],
+    }
+    dec_cosigned = json.loads(json.dumps(dec))
+    dec_cosigned['approvals'].append(
+        {'npub': np_d, 'sig': nakama.sign_schnorr(s_d, d_msg).hex()})
+
+    # policy cert signed by both eligible members (n-of-n for first policy)
+    p_msg = nakama.board_policy_message(d_id, d_relay, 2, [np_c, np_d],
+                                        d_now)
+    pol = {
+        'protocol': 'nakama', 'version': 1, 'type': 'board-policy',
+        'board_id': d_id, 'relay': d_relay,
+        'threshold': 2, 'eligible': [np_c, np_d], 'created_at': d_now,
+        'signatures': [{'npub': np_c,
+                        'sig': nakama.sign_schnorr(s_c, p_msg).hex()},
+                       {'npub': np_d,
+                        'sig': nakama.sign_schnorr(s_d, p_msg).hex()}],
+    }
+    # same relay/board, stricter policy: exposes duplicate counting
+    s_e, np_e = _key()
+    pol3 = {
+        'protocol': 'nakama', 'version': 1, 'type': 'board-policy',
+        'board_id': d_id, 'relay': d_relay,
+        'threshold': 3, 'eligible': [np_c, np_d, np_e],
+        'created_at': d_now, 'signatures': [],
+    }
+    p3_msg = nakama.board_policy_message(d_id, d_relay, 3, [np_c, np_d, np_e],
+                                         d_now)
+    pol3['signatures'] = [
+        {'npub': np_, 'sig': nakama.sign_schnorr(s_, p3_msg).hex()}
+        for np_, s_ in ((np_c, s_c), (np_d, s_d), (np_e, s_e))]
+
+    dec_pos = []
+    dec_pos.append(('single approval, no policy', (dec, None)))
+    dec_pos.append(('two approvals, policy 2/2', (dec_cosigned, pol)))
+
+    for name, (dd, pp) in dec_pos:
+        ok, errs, info = conform_decision(dd, pp)
+        print(f'decision/{name}: {"PASS" if ok else "FAIL"}'
+              f' ({ "; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        dec_fails += 0 if ok else 1
+
+    dec_neg = []
+    bad_appr = json.loads(json.dumps(dec_cosigned))
+    bad_appr['approvals'][0]['sig'] = '00' * 128
+    dec_neg.append(('tampered approval signature', (bad_appr, None)))
+    bad_payload = json.loads(json.dumps(dec))
+    bad_payload['payload'] = {'threshold': 2}  # admit needs candidate
+    dec_neg.append(('payload/type mismatch', (bad_payload, None)))
+    dup = json.loads(json.dumps(dec_cosigned))
+    dup['approvals'].append(json.loads(json.dumps(dup['approvals'][0])))
+    dec_neg.append(('duplicate approval with policy 3/2 (counts once, '
+                    'not inflated)',
+                    (dup, pol3)))
+    outsider = json.loads(json.dumps(dec))
+    s_out, np_out = _key()
+    outsider['approvals'].append(
+        {'npub': np_out, 'sig': nakama.sign_schnorr(s_out, d_msg).hex()})
+    dec_neg.append(('outsider approval ignored, threshold not met',
+                    (outsider, pol)))
+    bad_type = json.loads(json.dumps(dec))
+    bad_type['decision'] = 'elect-pope'
+    dec_neg.append(('unknown decision type', (bad_type, None)))
+    no_approvals = json.loads(json.dumps(dec))
+    no_approvals['approvals'] = []
+    dec_neg.append(('empty approvals', (no_approvals, None)))
+
+    for name, (dd, pp) in dec_neg:
+        ok, errs, info = conform_decision(dd, pp)
+        good = not ok
+        print(f'decision-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            dec_fails += 1
+
+    dec_total = len(dec_pos) + len(dec_neg)
+    print(f'--- decision {dec_total - dec_fails}/{dec_total} passed ---')
+    fails += dec_fails
+
+    grand = total + dm_total + board_total + dec_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -519,11 +775,27 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_board <descriptor.json> [...]')
             return 2
         return check_board_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_decision':
+        policy_path = None
+        rest = argv[2:]
+        if rest[:1] == ['--policy']:
+            if len(rest) < 3:
+                print('usage: conformance.py check_decision [--policy policy.json] '
+                      '<decision.json> [...]')
+                return 2
+            policy_path, rest = rest[1], rest[2:]
+        if not rest:
+            print('usage: conformance.py check_decision [--policy policy.json] '
+                  '<decision.json> [...]')
+            return 2
+        return check_decision_files(policy_path, rest)
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
           'check_dm <recipient_secret_hex> <wrap.json> [...] | '
-          'check_board <descriptor.json> [...] | selftest')
+          'check_board <descriptor.json> [...] | '
+          'check_decision [--policy policy.json] <decision.json> [...] | '
+          'selftest')
     return 2
 
 
