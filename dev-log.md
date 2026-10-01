@@ -35,3 +35,9 @@
 - selftest 28/28（新規: 実 CLI の in-process E2E 5（nostr_request を monkeypatch、空→空行・1 草案・3 イベント中 1 スキップ・期限切れマーカー・policy＋out＋policy-update 提案句）＋正常 craft 7＋却下 16: 決定 fetch 行の [草案] 欠落・非 policy-update 草案の提案句 など）、selftest 総計 318/318 PASS、全 21 テストファイル回帰 PASS。
 - §21.5 に board_draft_fetch の表示文法を固定（ローカル時刻・`[草案]` プレフィクス・提案句の付与条件）。
 - 外部 push なし（remote HEAD=seen_refs=d737219）。
+
+## 2026-10-02 04:15 JST — v0.45 check_board_fetch_all
+- conformance.py: board_fetch_all レポート（§22）の一貫性チェッカー第 23 弾・ローカル出力チェッカー第 8 弾（`check_board_fetch_all`）。空レポートの単一行（`有効な決定（30110/30111）はありませんでした`）または免責行（2 行目の草案免責行は草案レコードがある場合のみ）→レコード行（`[成立済み <32hex>]` / `[草案（回覧中） <32hex>][ [期限切れ]]`）→フッター→保存行・スナップショット行の固定順。検証: 状態タグ 2 語彙（綴りのみ）・[期限切れ] は草案行のみ・コア 32 hex・種別語彙・日付有効・フッターのマージ件数==レコード行数・コア重複なし・threshold 句の全行均一（草案形/素形のタグ対応・提案句は policy-update 草案のみ pt≤pe）・保存行件数一致・草案免責行の出現条件。対象外を明示: 件数の真偽・コアハッシュの真偽（check_draft 管轄）・状態タグの真偽（kind 混成はレポートから不可視 — 綴りのみ）・充足/不足の意味（advisory）・期限切れの真偽（draft_is_expired 管轄）・時刻の値/順序・署名有効性（verify_board_decision_nostr_event 管轄）。§22.8 に board_fetch_all の表示文法を固定。
+- selftest 35/35（新規: 実 CLI の in-process E2E 5（nostr_request を monkeypatch、空→空行・1 成立済み・同一コアの草案＋成立済み→マージ済み 1 レコード・期限切れマーカー・policy＋out で 2 免責行＋threshold 行＋policy-update 提案句＋保存行＋スナップショット行）＋正常 craft 6＋却下 24: 成立済み行の [期限切れ]・草案免責行の出現条件 3 件・タグ/句形の不一致 4 件・提案句 3 件 など）、selftest 総計 353/353 PASS、全 21 テストファイル回帰 PASS。
+- ロードマップ §7 に v0.45 を追加。
+- 外部 push なし（remote HEAD=seen_refs=6552490）。

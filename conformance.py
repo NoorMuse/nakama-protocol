@@ -521,6 +521,50 @@ ordering/delivery (event signature validity is
 with reference reports produced in-process by nakama.py's own
 cmd_board_draft_fetch (offline: nostr_request monkeypatched, no relay
 contact).
+
+Board-fetch-all report conformance:
+
+    python3 conformance.py check_board_fetch_all <report1.txt> [...]
+
+Each file is the saved stdout of `nakama.py board_fetch_all`. Verifies
+the report is internally consistent: either the single no-decisions line
+(`<N> 件のイベントを取得: 有効な決定（30110/30111）はありませんでした（<M>
+件をスキップ）`), or — in order — the optional --policy disclaimer lines
+(the second draft disclaimer appears only when at least one
+草案（回覧中） record is listed), one line per merged record
+(`[成立済み <32 hex core>] <decision> (created_at YYYY-MM-DD, approvals
+<N> つ[, threshold <n>/<m> <充足|不足>])` or `[草案（回覧中） <32 hex
+core>][ [期限切れ]] <decision> (created_at YYYY-MM-DD, approvals <N> つ[,
+草案: threshold <n>/<m> <不足|充足（成立可能 — board_decide_pub で
+成立公開）>[（現行規約の判定） — 提案値: threshold <pt>/<pe>]])`, and the
+footer `<E> 件のイベントを取得: 有効 <V> 件、スキップ <S> 件、マージ後
+<M> 件`, optionally followed by the --out save line and the
+policy-snapshot line. The state tag must be one of the two vocabulary
+tags, the [期限切れ] marker only on 草案（回覧中） lines, the core 32 hex
+chars and distinct across lines, the decision type one of the
+BOARD_DECISION_TYPES vocabulary, the date a valid calendar date, the
+footer merged count equal to the number of record lines, core hashes
+distinct, and the threshold clause uniform (present on all record lines
+iff the first disclaimer is present; its approvals count must equal the
+`n` in `n/m` and satisfy `n <= m`; the `草案: threshold` form only on
+draft records, the plain form only on finalized records; the policy-update
+proposal clause only on policy-update drafts and must satisfy `pt <=
+pe`). Explicitly out of scope: the fetched/valid/skipped counts' truth
+(only the merged count is checkable), the core hash's truth
+(`check_draft`'s territory), the state tag's truth (which Nostr kinds were
+merged is not visible in the report — the checker validates the tag's
+spelling, never its truth), the meaning of the 充足/不足 verdict
+(advisory threshold display — `fetch_threshold_status` computes it, the
+checker only validates its spelling and internal arithmetic), expiry truth
+(the [期限切れ] marker is display-only — `draft_is_expired`'s territory),
+the date's value/timezone (the reference CLI prints local time), and
+record ordering/delivery (event signature validity is
+`verify_board_decision_nostr_event`'s territory).
+
+`python3 conformance.py selftest` also covers `check_board_fetch_all`
+with reference reports produced in-process by nakama.py's own
+cmd_board_fetch_all (offline: nostr_request monkeypatched, no relay
+contact).
 """
 
 import json
@@ -3040,6 +3084,232 @@ def check_board_draft_fetch_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_board_fetch_all: board_fetch_all report consistency ----------
+
+# board_fetch_all's stdout is a short human-readable cross-kind listing of
+# published board decisions (kind 30110) and circulating drafts (kind 30111)
+# fetched from a relay in a single REQ (#h=board_id), merged by decision
+# core hash, and its grammar is fixed (spec §22). check_board_fetch_all
+# verifies that a saved report is internally consistent: either the single
+# no-decisions line, or — in order — the optional --policy disclaimer lines
+# (the second draft disclaimer appears only when at least one 草案（回覧中）
+# record is listed), one line per merged record, the summary footer, and
+# (with --out) the save line plus the policy-snapshot line. A record line is
+# '[成立済み <32 hex core>] <decision> (created_at YYYY-MM-DD, approvals <N>
+# つ[, threshold <n>/<m> <充足|不足>])' for finalized records, or
+# '[草案（回覧中） <32 hex core>][ [期限切れ]] <decision> (created_at
+# YYYY-MM-DD, approvals <N> つ[, 草案: threshold <n>/<m> <不足|充足（成立可能
+# — board_decide_pub で成立公開）>[（現行規約の判定） — 提案値: threshold
+# <pt>/<pe>]])' for drafts. Verified: the state tag is one of the two
+# vocabulary tags, the [期限切れ] marker appears only on 草案（回覧中） lines
+# (the reference CLI never prints it on a 成立済み line — §24.2), the core is
+# 32 hex chars and distinct across lines, the decision type is in
+# BOARD_DECISION_TYPES, the created_at date is a valid calendar date, the
+# footer merged count equals the number of record lines, the --out save
+# line's count matches the footer, the threshold clause is uniform (present
+# on all record lines iff the first disclaimer is present; its approvals
+# count must equal the `n` in `n/m` and satisfy `n <= m`; the `草案:
+# threshold` form is only accepted on 草案（回覧中） lines, the plain
+# `threshold` form only on 成立済み lines; the policy-update proposal clause
+# is only accepted on policy-update drafts and must satisfy `pt <= pe`), the
+# second draft disclaimer is present exactly when the first disclaimer and at
+# least one draft record are, and the optional post-footer lines appear only
+# in their fixed order. Explicitly out of scope: the fetched/valid/skipped
+# counts' truth (only the merged count is checkable from the report), the
+# core hash's truth (check_draft's territory), the state tag's truth (which
+# Nostr kinds were merged is not visible in the report — the checker
+# validates the tag's spelling, never its truth), the 充足/不足 verdict's
+# meaning (advisory display — fetch_threshold_status computes it, the checker
+# only validates spelling and internal arithmetic), expiry truth (the
+# [期限切れ] marker is display-only — draft_is_expired's territory), the
+# date's value/timezone (the reference CLI prints local time — the checker
+# validates grammar, never the zone or the instant), record ordering, and
+# event signature validity (verify_board_decision_nostr_event's territory).
+
+_BFA_EMPTY = re.compile(
+    r'^(\d+) 件のイベントを取得: 有効な決定（30110/30111）はありませんでした'
+    r'（(\d+) 件をスキップ）$')
+_BFA_DISCLAIMER1 = ('threshold 表示は取得できた決定に基づく暫定です'
+                   '（権威ある判定は board_read --governance）')
+_BFA_DISCLAIMER2 = ('草案（回覧中）の threshold 表示は取得できた草案に基づく暫定です'
+                   '（草案は成立の証拠ではありません — 成立の公開宣言は kind 30110）')
+_BFA_LINE = re.compile(
+    r'^\[(成立済み|草案（回覧中）) ([0-9a-fA-F]{32})\]( \[期限切れ\])? '
+    r'(\S+) \(created_at (\d{4}-\d{2}-\d{2}), approvals (\d+) つ'
+    r'(, (?:(草案: ))?threshold (\d+)/(\d+) '
+    r'(充足（成立可能 — board_decide_pub で成立公開）|充足|不足)'
+    r'(（現行規約の判定） — 提案値: threshold (\d+)/(\d+))?)?'
+    r'\)$')
+_BFA_FOOTER = _BDF_FOOTER  # same summary footer text as the two sibling fetchers
+_BFA_SAVED = re.compile(
+    r'^(\d+) 件の決定を (.+)/ に保存しました'
+    r'（board_read --governance --decisions / board_cosign にそのまま渡せます。'
+    r'fetch 時点のスナップショット — 草案の approvals は増える可能性があります）$')
+_BFA_SNAPSHOT = _BRF_SNAPSHOT  # same policy-snapshot line text as the siblings
+
+
+def conform_board_fetch_all_report(text: str):
+    """Verify a saved `nakama.py board_fetch_all` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) == 1 and _BFA_EMPTY.match(lines[0]):
+        info.append('no published decisions/drafts')
+        return True, errs, info
+    if _BFA_EMPTY.match(lines[0]):
+        return False, ['empty-report line appears together with '
+                       'record lines'], info
+    pos = 0
+    with_policy = False
+    if lines[0] == _BFA_DISCLAIMER1:
+        with_policy = True
+        pos = 1
+        info.append('policy threshold display')
+    elif lines[0] == _BFA_DISCLAIMER2:
+        return False, ['draft disclaimer line without the policy '
+                       'disclaimer line'], info
+    with_draft_disclaimer = False
+    if pos < len(lines) and lines[pos] == _BFA_DISCLAIMER2:
+        with_draft_disclaimer = True
+        pos += 1
+        info.append('draft threshold disclaimer')
+    recs: list[tuple] = []
+    while pos < len(lines):
+        m = _BFA_LINE.match(lines[pos])
+        if not m:
+            break
+        recs.append((pos + 1, m))
+        pos += 1
+    if not recs:
+        return False, [f'line {pos + 1}: expected a record line'], info
+    has_draft = any(m.group(1) == '草案（回覧中）' for _, m in recs)
+    if with_policy and has_draft and not with_draft_disclaimer:
+        errs.append('draft records are listed but the draft disclaimer '
+                    'line is missing')
+    if with_draft_disclaimer and not has_draft:
+        errs.append('draft disclaimer line is present but no draft records '
+                    'are listed')
+    seen_cores: set[str] = set()
+    for lineno, m in recs:
+        tag, core, expired = m.group(1), m.group(2), m.group(3)
+        dtype, date, approvals = m.group(4), m.group(5), int(m.group(6))
+        thr, draft_prefix = m.group(7), m.group(8)
+        if tag == '成立済み' and expired:
+            errs.append(f'line {lineno}: [期限切れ] marker on a finalized '
+                        'record (the marker is draft-phase only)')
+        if with_policy and not thr:
+            errs.append(f'line {lineno}: threshold clause missing under the '
+                        'policy disclaimer')
+        if not with_policy and thr:
+            errs.append(f'line {lineno}: threshold clause without the policy '
+                        'disclaimer')
+        if dtype not in nakama.BOARD_DECISION_TYPES:
+            errs.append(f'line {lineno}: unknown decision type {dtype!r}')
+        if not _ns_valid_date(date):
+            errs.append(f'line {lineno}: invalid display date {date!r}')
+        if core.lower() in seen_cores:
+            errs.append(f'line {lineno}: duplicate record core {core}')
+        seen_cores.add(core.lower())
+        if thr:
+            tn, tm = int(m.group(9)), int(m.group(10))
+            status, prop = m.group(11), m.group(12)
+            if tag == '成立済み':
+                if draft_prefix:
+                    errs.append(f'line {lineno}: draft threshold form on a '
+                                'finalized record')
+                if prop:
+                    errs.append(f'line {lineno}: proposal clause on a '
+                                'finalized record')
+                if status not in ('充足', '不足'):
+                    errs.append(f'line {lineno}: unexpected status '
+                                f'{status!r} on a finalized record')
+            else:
+                if not draft_prefix:
+                    errs.append(f'line {lineno}: plain threshold form on a '
+                                'draft record')
+                if status not in ('不足',
+                                  '充足（成立可能 — board_decide_pub で成立公開）'):
+                    errs.append(f'line {lineno}: unexpected status '
+                                f'{status!r} on a draft record')
+                if prop:
+                    if dtype != 'policy-update':
+                        errs.append(f'line {lineno}: proposal clause on a '
+                                    f'non-policy-update draft ({dtype!r})')
+                    else:
+                        pt, pe = int(m.group(13)), int(m.group(14))
+                        if pt > pe:
+                            errs.append(f'line {lineno}: proposed threshold '
+                                        f'{pt}/{pe} has numerator larger '
+                                        'than denominator')
+            if approvals != tn:
+                errs.append(f'line {lineno}: approvals count {approvals} '
+                            f'does not match threshold numerator {tn}')
+            if tn > tm:
+                errs.append(f'line {lineno}: threshold {tn}/{tm} has '
+                            'numerator larger than denominator')
+    if pos >= len(lines):
+        return False, errs + [f'line {pos + 1}: missing summary footer'], info
+    fm = _BFA_FOOTER.match(lines[pos])
+    if not fm:
+        return False, [f'line {pos + 1}: expected the summary footer, '
+                       f'got {lines[pos]!r}'], info
+    merged = int(fm.group(4))
+    if merged != len(recs):
+        errs.append(f'line {pos + 1}: footer says merged {merged} '
+                    f'but {len(recs)} record lines were listed')
+    pos += 1
+    saved = None
+    if pos < len(lines):
+        sm = _BFA_SAVED.match(lines[pos])
+        if sm:
+            saved = sm
+            if int(sm.group(1)) != merged:
+                errs.append(f'line {pos + 1}: save line says {sm.group(1)} '
+                            f'records but footer merged count is {merged}')
+            pos += 1
+    if pos < len(lines):
+        if not saved:
+            return False, [f'line {pos + 1}: unexpected line after the '
+                           f'summary footer: {lines[pos]!r}'], info
+        if not _BFA_SNAPSHOT.match(lines[pos]):
+            return False, [f'line {pos + 1}: expected the policy-snapshot '
+                           f'line, got {lines[pos]!r}'], info
+        pos += 1
+    if pos != len(lines):
+        return False, [f'line {pos + 1}: unexpected trailing line '
+                       f'{lines[pos]!r}'], info
+    if not errs:
+        info.append(f'{len(recs)} record lines, merged {merged}')
+    return (not errs), errs, info
+
+
+def check_board_fetch_all_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_board_fetch_all_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # dm_fetch's stdout is a short human-readable listing of decrypted rumors,
 # but its grammar is fixed (spec §4.1). check_dm_fetch verifies that a
 # saved report is internally consistent: either the single no-new-DMs line
@@ -5537,6 +5807,290 @@ def selftest() -> int:
     print(f'--- draft-fetch {ddf_total - ddf_fails}/{ddf_total} passed ---')
     fails += ddf_fails
 
+    # ---------- check_board_fetch_all: board_fetch_all report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_board_fetch_all, with nostr_request monkeypatched to return
+    # crafted kind-30110/30111 events (no relay contact); hand-mutated
+    # reports that break the grammar must be rejected.
+    bfa_fails = 0
+
+    def _bfa_signer():
+        s = secrets.token_bytes(32)
+        return (s, nakama.npub_of(s), nakama.hexpub_of(s))
+
+    _bfa_relay = 'wss://example.invalid'
+    _bfa_board = 'bfa-board-001'
+
+    def _bfa_approve(d, signer):
+        msg = nakama.board_decision_message(d['board_id'], d['relay'],
+                                           d['decision'], d['payload'],
+                                           d['created_at'])
+        d['approvals'].append({'npub': signer[1],
+                               'sig': nakama.sign_schnorr(signer[0],
+                                                          msg).hex()})
+        return d
+
+    def _bfa_decision(dtype, approvers, ts, payload=None, expires_at=None):
+        d = {'protocol': 'nakama', 'version': 1, 'type': 'board-decision',
+             'board_id': _bfa_board, 'relay': _bfa_relay, 'decision': dtype,
+             'payload': payload if payload is not None
+             else {'candidate': approvers[0][1]},
+             'created_at': ts, 'approvals': []}
+        if expires_at is not None:
+            d['payload'] = dict(d['payload'])
+            d['payload']['expires_at'] = expires_at
+        for a in approvers:
+            _bfa_approve(d, a)
+        return d
+
+    def _bfa_event(d, publisher, kind):
+        content = json.dumps(d, sort_keys=True, separators=(',', ':'),
+                             ensure_ascii=False)
+        tags = [['d', nakama.decision_core_hash(d)], ['h', d['board_id']]]
+        return nakama.sign_event(publisher[0], d['created_at'] + 60,
+                                 kind, tags, content)
+
+    def _bfa_policy(members, threshold):
+        eligible = [m[1] for m in members]
+        ts = 1760000000
+        msg = nakama.board_policy_message(_bfa_board, _bfa_relay, threshold,
+                                          eligible, ts)
+        return {'protocol': 'nakama', 'version': 1, 'type': 'board-policy',
+                'board_id': _bfa_board, 'relay': _bfa_relay,
+                'threshold': threshold, 'eligible': eligible,
+                'created_at': ts,
+                'signatures': [{'npub': m[1],
+                                'sig': nakama.sign_schnorr(m[0], msg).hex()}
+                               for m in members]}
+
+    def _bfa_kf(tmpd):
+        s = secrets.token_bytes(32)
+        kf = os.path.join(tmpd, 'k.json')
+        with open(kf, 'w') as f:
+            json.dump({'secret_hex': s.hex()}, f)
+        os.chmod(kf, 0o600)
+        return kf
+
+    def _bfa_run(events, keyfile, policy=None, out=None):
+        orig = nakama.nostr_request
+        nakama.nostr_request = lambda *a, **k: events
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                nakama.cmd_board_fetch_all(SimpleNamespace(
+                    relay=_bfa_relay, board_id=_bfa_board, limit=20,
+                    auth=False, out=out, policy=policy, keyfile=keyfile))
+            return buf.getvalue()
+        finally:
+            nakama.nostr_request = orig
+
+    bfa_e2e = []
+    with tempfile.TemporaryDirectory() as tmpd:
+        _bfa_kf_path = _bfa_kf(tmpd)
+        bfa_e2e.append(('no events -> empty line',
+                        _bfa_run([], _bfa_kf_path)))
+        _m1, _m2, _m3 = _bfa_signer(), _bfa_signer(), _bfa_signer()
+        _pub = _bfa_signer()
+        _f1 = _bfa_decision('admit', [_m1, _m2], 1760000000)
+        bfa_e2e.append(('one finalized decision',
+                        _bfa_run([_bfa_event(_f1, _pub,
+                                            nakama.DECISION_NOSTR_KIND())],
+                                 _bfa_kf_path)))
+        # the same core published as a draft (30111) and as finalized
+        # (30110) merges into a single 成立済み record
+        _f2 = _bfa_decision('admit', [_m1], 1760010000)
+        bfa_e2e.append(('draft + finalized same core -> merged finalized',
+                        _bfa_run([_bfa_event(_f2, _pub,
+                                            nakama.DRAFT_NOSTR_KIND()),
+                                  _bfa_event(_f2, _pub,
+                                            nakama.DECISION_NOSTR_KIND())],
+                                 _bfa_kf_path)))
+        _exp = _bfa_decision('remove', [_m1], 1760020000,
+                             expires_at=int(time.time()) - 100)
+        bfa_e2e.append(('expired draft -> [期限切れ] marker',
+                        _bfa_run([_bfa_event(_exp, _pub,
+                                            nakama.DRAFT_NOSTR_KIND())],
+                                 _bfa_kf_path)))
+        _pol = _bfa_policy([_m1, _m2, _m3], 2)
+        _pf = os.path.join(tmpd, 'policy.json')
+        with open(_pf, 'w') as f:
+            json.dump(_pol, f)
+        _outd = os.path.join(tmpd, 'out')
+        _g1 = _bfa_decision('admit', [_m1, _m2], 1760030000)
+        _g2 = _bfa_decision('remove', [_m1], 1760040000)
+        _g3 = _bfa_decision('policy-update', [_m1, _m2], 1760050000,
+                            payload={'threshold': 2,
+                                     'eligible': [m[1] for m in
+                                                  (_m1, _m2, _m3)]})
+        bfa_e2e.append(('policy + out -> two disclaimers, thresholds, save '
+                        'and snapshot lines (incl. policy-update proposal)',
+                        _bfa_run([_bfa_event(_g1, _pub,
+                                            nakama.DECISION_NOSTR_KIND()),
+                                  _bfa_event(_g2, _pub,
+                                            nakama.DRAFT_NOSTR_KIND()),
+                                  _bfa_event(_g3, _pub,
+                                            nakama.DRAFT_NOSTR_KIND())],
+                                 _bfa_kf_path, policy=_pf, out=_outd)))
+
+    for name, rep in bfa_e2e:
+        ok, errs, info = conform_board_fetch_all_report(rep)
+        print(f'fetch-all-e2e/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        bfa_fails += 0 if ok else 1
+
+    # hand-crafted positives
+    _bf_h, _bf_h2, _bf_h3 = 'ab' * 16, 'cd' * 16, 'ef' * 16
+    _bf_dis1 = ('threshold 表示は取得できた決定に基づく暫定です'
+                '（権威ある判定は board_read --governance）')
+    _bf_dis2 = ('草案（回覧中）の threshold 表示は取得できた草案に基づく暫定です'
+                '（草案は成立の証拠ではありません — 成立の公開宣言は kind 30110）')
+    _bf_l1 = (f'[成立済み {_bf_h}] admit (created_at 2026-10-01, '
+              'approvals 2 つ)')
+    _bf_l2 = (f'[草案（回覧中） {_bf_h2}] remove (created_at 2026-10-02, '
+              'approvals 1 つ)')
+    _bf_f1 = ('5 件のイベントを取得: 有効 2 件、スキップ 1 件、マージ後 2 件')
+    _bf_f0 = ('5 件のイベントを取得: 有効 1 件、スキップ 0 件、マージ後 1 件')
+    _bf_e1 = ('0 件のイベントを取得: 有効な決定（30110/30111）はありませんでした'
+              '（0 件をスキップ）')
+    _bf_l1t = (f'[成立済み {_bf_h}] admit (created_at 2026-10-01, '
+               'approvals 2 つ, threshold 2/3 充足)')
+    _bf_l2t = (f'[草案（回覧中） {_bf_h2}] remove (created_at 2026-10-02, '
+               'approvals 1 つ, 草案: threshold 1/3 不足)')
+    _bf_l3t = (f'[草案（回覧中） {_bf_h3}] policy-update '
+               '(created_at 2026-10-03, approvals 2 つ, '
+               '草案: threshold 2/3 充足（成立可能 — board_decide_pub で成立公開）'
+               '（現行規約の判定） — 提案値: threshold 2/5)')
+    _bf_sv = (f'3 件の決定を /tmp/out/ に保存しました'
+              '（board_read --governance --decisions / board_cosign に'
+              'そのまま渡せます。fetch 時点のスナップショット — '
+              '草案の approvals は増える可能性があります）')
+    _bf_sn = ('fetch 時点の政策スナップショットを '
+              '/tmp/out/policy-snapshot-123.json に保存しました'
+              '（検証者はこのファイルを --policy に指定して threshold 判定を'
+              '再現できます）')
+    _bf_f2 = ('5 件のイベントを取得: 有効 3 件、スキップ 0 件、マージ後 3 件')
+
+    bfa_pos = [
+        ('empty report', _bf_e1 + '\n'),
+        ('plain finalized', _bf_l1 + '\n' + _bf_f0 + '\n'),
+        ('plain draft with expired marker',
+         _bf_l2.replace('remove (created_at',
+                        '[期限切れ] remove (created_at')
+         + '\n' + _bf_f0 + '\n'),
+        ('policy + all finalized',
+         _bf_dis1 + '\n' + _bf_l1t + '\n' + _bf_f0 + '\n'),
+        ('policy + mixed + save + snapshot',
+         _bf_dis1 + '\n' + _bf_dis2 + '\n' + _bf_l1t + '\n' + _bf_l2t + '\n'
+         + _bf_l3t + '\n' + _bf_f2 + '\n' + _bf_sv + '\n' + _bf_sn + '\n'),
+        ('uppercase hex core',
+         _bf_l1.replace(_bf_h, _bf_h.upper()) + '\n' + _bf_f0 + '\n'),
+    ]
+
+    for name, rep in bfa_pos:
+        ok, errs, info = conform_board_fetch_all_report(rep)
+        print(f'fetch-all/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        bfa_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    bfa_neg = []
+    bfa_neg.append(('empty report', ''))
+    bfa_neg.append(('empty line plus lines',
+                    _bf_e1 + '\n' + _bf_l1 + '\n' + _bf_f1 + '\n'))
+    bfa_neg.append(('[期限切れ] on finalized',
+                    _bf_l1.replace('admit (created_at',
+                                   '[期限切れ] admit (created_at')
+                    + '\n' + _bf_f0 + '\n'))
+    bfa_neg.append(('draft disclaimer without policy disclaimer',
+                    _bf_dis2 + '\n' + _bf_l2t + '\n' + _bf_f0 + '\n'))
+    bfa_neg.append(('draft records without draft disclaimer',
+                    _bf_dis1 + '\n' + _bf_l2t + '\n' + _bf_f0 + '\n'))
+    bfa_neg.append(('draft disclaimer but no draft records',
+                    _bf_dis1 + '\n' + _bf_dis2 + '\n' + _bf_l1t + '\n'
+                    + _bf_f0 + '\n'))
+    bfa_neg.append(('threshold clause without disclaimer',
+                    _bf_l1t + '\n' + _bf_f0 + '\n'))
+    bfa_neg.append(('plain line under disclaimer',
+                    _bf_dis1 + '\n' + _bf_l1 + '\n' + _bf_f0 + '\n'))
+    bfa_neg.append(('draft threshold form on finalized',
+                    _bf_dis1 + '\n'
+                    + _bf_l1t.replace('threshold 2/3 充足',
+                                      '草案: threshold 2/3 不足')
+                    + '\n' + _bf_f0 + '\n'))
+    bfa_neg.append(('plain threshold form on draft',
+                    _bf_dis1 + '\n' + _bf_dis2 + '\n'
+                    + _bf_l2t.replace('草案: threshold 1/3 不足',
+                                      'threshold 1/3 不足')
+                    + '\n' + _bf_f0 + '\n'))
+    bfa_neg.append(('proposal clause on finalized',
+                    _bf_dis1 + '\n'
+                    + _bf_l1t.replace('threshold 2/3 充足',
+                                      'threshold 2/3 充足'
+                                      '（現行規約の判定） — 提案値: '
+                                      'threshold 2/5')
+                    + '\n' + _bf_f0 + '\n'))
+    bfa_neg.append(('proposal clause on non-policy-update draft',
+                    _bf_dis1 + '\n' + _bf_dis2 + '\n'
+                    + _bf_l2t.replace('草案: threshold 1/3 不足',
+                                      '草案: threshold 1/3 不足'
+                                      '（現行規約の判定） — 提案値: '
+                                      'threshold 1/5')
+                    + '\n' + _bf_f0 + '\n'))
+    bfa_neg.append(('proposed threshold numerator > denominator',
+                    _bf_dis1 + '\n' + _bf_dis2 + '\n'
+                    + _bf_l3t.replace('提案値: threshold 2/5',
+                                      '提案値: threshold 6/5')
+                    + '\n' + _bf_f0 + '\n'))
+    bfa_neg.append(('duplicate core hash',
+                    _bf_l1 + '\n' + _bf_l1 + '\n'
+                    + '2 件のイベントを取得: 有効 2 件、スキップ 0 件、'
+                      'マージ後 2 件\n'))
+    bfa_neg.append(('unknown decision type',
+                    _bf_l1.replace('admit', 'banish') + '\n'
+                    + _bf_f0 + '\n'))
+    bfa_neg.append(('invalid date',
+                    _bf_l1.replace('2026-10-01', '2026-13-40') + '\n'
+                    + _bf_f0 + '\n'))
+    bfa_neg.append(('core not hex',
+                    _bf_l1.replace(_bf_h, 'zz' * 16) + '\n'
+                    + _bf_f0 + '\n'))
+    bfa_neg.append(('approvals/threshold mismatch',
+                    _bf_dis1 + '\n'
+                    + _bf_l1t.replace('approvals 2 つ', 'approvals 3 つ')
+                    + '\n' + _bf_f0 + '\n'))
+    bfa_neg.append(('threshold numerator > denominator',
+                    _bf_dis1 + '\n' + _bf_l1t.replace('2/3', '6/3') + '\n'
+                    + _bf_f0 + '\n'))
+    bfa_neg.append(('decide-fetch style line (no state tag)',
+                    _bf_l1.replace('[成立済み ', '[') + '\n'
+                    + _bf_f0 + '\n'))
+    bfa_neg.append(('footer merged count mismatch',
+                    _bf_l1 + '\n' + _bf_f0.replace('マージ後 1 件',
+                                                    'マージ後 2 件') + '\n'))
+    bfa_neg.append(('missing footer', _bf_l1 + '\n'))
+    bfa_neg.append(('trailing garbage', _bf_l1 + '\n' + _bf_f0 + '\n'
+                    + 'unexpected\n'))
+    bfa_neg.append(('snapshot without save line',
+                    _bf_dis1 + '\n' + _bf_dis2 + '\n' + _bf_l1t + '\n'
+                    + _bf_l2t + '\n' + _bf_f1 + '\n' + _bf_sn + '\n'))
+
+    for name, rep in bfa_neg:
+        ok, errs, info = conform_board_fetch_all_report(rep)
+        good = not ok
+        print(f'fetch-all-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            bfa_fails += 1
+
+    bfa_total = len(bfa_e2e) + len(bfa_pos) + len(bfa_neg)
+    print(f'--- fetch-all {bfa_total - bfa_fails}/{bfa_total} passed ---')
+    fails += bfa_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -5544,7 +6098,8 @@ def selftest() -> int:
     grand = total + dm_total + board_total + dec_total + bond_total \
         + binding_total + live_total + cp_total + rt_total + rv_total \
         + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total \
-        + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total
+        + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total \
+        + bfa_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -5727,6 +6282,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_board_draft_fetch_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_board_fetch_all':
+        if len(argv) < 3:
+            print('usage: conformance.py check_board_fetch_all '
+                  '<report.txt> [...]')
+            return 2
+        return check_board_fetch_all_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -5751,6 +6312,9 @@ def main(argv: list[str]) -> int:
           'check_notif_status <report.txt> [...] | '
           'check_dm_fetch <report.txt> [...] | '
           'check_board_read <report.txt> [...] | '
+          'check_board_decide_fetch <report.txt> [...] | '
+          'check_board_draft_fetch <report.txt> [...] | '
+          'check_board_fetch_all <report.txt> [...] | '
           'selftest')
     return 2
 
