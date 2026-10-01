@@ -72,6 +72,8 @@
       公開された草案を購読・検証・マージして表示（--out: <core_hash>.json で保存 — board_cosign にそのまま渡せる、--policy: 草案の threshold 充足・不足の表示）
   nakama.py board_fetch_all <relay> <board_id> [--limit N] [--auth] [--out DIR] [--policy POLICY]
       30103+30104 を 1 回の REQ で購読し同一コアの草案・完成を統合表示（--out: 内部マーカーを剥がした <core_hash>.json、--policy: 成立済みは時点解決・草案は現行政策のみで threshold 表示）
+  nakama.py board_draft_notify <relay> <board_id> [--limit N] [--auth] [--policy POLICY] [--within SECS] [--include-expired] [--dry-run] [--resend] [--from NPUB]
+      期限間近の草案を発行者に NIP-17 DM で通知（--within 既定 24h、送信記録で二重送信防止、宛先は草案イベントの publisher のみ — spec §25）
 """
 import argparse, base64, hashlib, json, os, re, secrets, sys, time
 
@@ -2790,6 +2792,184 @@ def cmd_board_fetch_all(args):
                   '（検証者はこのファイルを --policy に指定して threshold 判定を再現できます）')
 
 
+# --- v0.20: 草案への自動通知 (spec §25: board_draft_notify) ---
+
+DRAFT_NOTIFS_DEFAULT = os.path.expanduser('~/.config/nakama/draft_notifs')
+
+
+def draft_notify_targets(verified, now, within):
+    """通知対象の草案を選ぶ（純粋、spec §25.1）。
+
+    verified: [(決定 dict（verify_board_decision_nostr_event 済み）、
+                event の pubkey hex（草案の publisher）、event の created_at)]
+    同一コアは merge_decision_approvals で approvals マージした代表 1 件にまとめ、
+    宛先は最も古い event の publisher（原発行者）とする — 承認者は宛先外（spam 抑制）。
+    返り値: [(core_hash, d, publisher_hex, reason)]（created_at 昇順）。
+    reason は 'expiring_soon'（0 < expires_at - now <= within）または
+    'expired'（expires_at <= now）。期限なし・within 外は対象外。
+    """
+    merged = merge_decision_approvals([d for d, _, _ in verified])
+    first_pub = {}
+    for d, pub, ca in verified:
+        core = decision_core_hash(d)
+        if core not in first_pub or ca < first_pub[core][1]:
+            first_pub[core] = (pub, ca)
+    out = []
+    for md in merged:
+        core = decision_core_hash(md)
+        ea = md.get('payload', {}).get('expires_at')
+        if not isinstance(ea, int) or isinstance(ea, bool):
+            continue  # 期限なし・不正型は対象外
+        rem = ea - now
+        if rem > within:
+            continue
+        reason = 'expiring_soon' if rem > 0 else 'expired'
+        out.append((core, md, first_pub[core][0], reason))
+    return out
+
+
+def draft_notify_message(d, core, reason, relay, policy=None):
+    """DM 平文（kind 14 rumor の content）。形式は spec §25.1 に固定（純粋）。
+
+    policy 指定時のみ threshold 行（fetch_threshold_status で判定 —
+    §21.5 と同じく草案は現行政策のみ、policy-update 決定の草案は扱わない）。
+    """
+    header = '[nakama] draft expiring soon' if reason == 'expiring_soon' \
+        else '[nakama] draft expired'
+    ea = d['payload']['expires_at']
+    utc = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(ea))
+    lines = [header,
+             f'board: {d["board_id"]}',
+             f'decision: {d["decision"]} ({core[:12]})',
+             f'expires_at: {ea} ({utc})']
+    if policy is not None:
+        ok, n_, m = fetch_threshold_status(d, policy, [])
+        lines.append(f'threshold: {n_}/{m} {"充足" if ok else "不足"}')
+    lines += ['---',
+              'this is a courtesy notification. re-issue the draft to extend the deadline.',
+              f'verify the draft yourself with: board_draft_fetch {relay} {d["board_id"]}']
+    return '\n'.join(lines)
+
+
+def draft_notif_record_path(notif_dir, core, reason):
+    """送信記録のパス: <notif_dir>/<core_hash>:<reason>.json（spec §25.1）。"""
+    return os.path.join(notif_dir, f'{core}:{reason}.json')
+
+
+def draft_notif_already_sent(notif_dir, core, reason, now, within):
+    """同一草案・同一 reason の送信記録が --within 以内にあれば True（I/O のみ）。
+    記録なし・壊れた記録・記録が古ければ False（＝送ってよい）。"""
+    try:
+        with open(draft_notif_record_path(notif_dir, core, reason)) as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        return False
+    sent_at = rec.get('sent_at')
+    return isinstance(sent_at, int) and (now - sent_at) < within
+
+
+def draft_notif_record(notif_dir, core, reason, recipient_hex, sender_npub, now):
+    """送信記録を保存（送信時刻・宛先・送信者の npub）。通知は主張であり到達の
+    証明ではない — 受け手は board_draft_fetch で自分で確認する（§25.2）。"""
+    os.makedirs(notif_dir, exist_ok=True)
+    with open(draft_notif_record_path(notif_dir, core, reason), 'w') as f:
+        json.dump({'core_hash': core, 'reason': reason,
+                   'recipient_hex': recipient_hex,
+                   'sender_npub': sender_npub, 'sent_at': now},
+                  f, indent=2, ensure_ascii=False)
+
+
+def cmd_board_draft_notify(args):
+    """期限間近の草案を発行者（草案イベントの publisher）に NIP-17 DM で通知する（spec §25）。
+
+    board_draft_fetch と同一の REQ（kinds=[30104]・#h=[board_id]、三段階検証＋
+    同一コアの approvals マージ）を流用。対象は 0 < expires_at - now <= --within
+    （既定 86400 = 24h）の草案（reason=expiring_soon）。期限切れは既定で対象外 —
+    --include-expired 時のみ対象（reason=expired）。承認者は宛先外（spam 抑制）。
+    送信は nip17_build_seal/gift_wrap ＋ nostr_publish（dm_pub と同型、--auth 対応）。
+    同一 reason の再送は送信記録で --within 以内は抑制（--resend で強制再送）。
+    --dry-run は対象草案と宛先の一覧のみ表示（送信も記録もしない）。
+    exit: 送信成功・対象なし・スキップのみで 0、fetch 失敗・DM 構築失敗・
+    publish 拒否は 1（既存の publish 系と同型の clean fail）。
+    """
+    secret = load_key(args.keyfile)
+    now = int(time.time())
+    from_npub = getattr(args, 'from_npub', None)
+    if from_npub:
+        try:
+            NostrPublicKey.from_npub(from_npub)
+        except Exception:
+            print('--from の npub が不正です', file=sys.stderr)
+            sys.exit(1)
+        # rotate_pub と同じ思想: 送信者の取り違え防止
+        if npub_of(secret) != from_npub:
+            print('--from と keyfile の鍵が一致しません（鍵の取り違え防止のため送信しません）',
+                  file=sys.stderr)
+            sys.exit(1)
+    policy = None
+    if getattr(args, 'policy', None):
+        try:
+            with open(args.policy) as f:
+                policy = json.load(f)
+        except Exception as e:
+            print(f'policy ファイルの読み込みに失敗しました: {e}', file=sys.stderr)
+            sys.exit(1)
+        if not verify_board_policy_cert(policy):
+            print('policy の検証に失敗しました（n-of-n 署名が無効）', file=sys.stderr)
+            sys.exit(1)
+        if policy.get('board_id') != args.board_id:
+            print('policy の board_id が取得対象の board_id と一致しません',
+                  file=sys.stderr)
+            sys.exit(1)
+    filt = {'kinds': [DRAFT_NOSTR_KIND], '#h': [args.board_id], 'limit': args.limit}
+    sub_id = secrets.token_hex(8)
+    events = nostr_request(args.relay, ['REQ', sub_id, filt],
+                           auth_secret=secret if args.auth else None)
+    verified = []
+    for ev in events:
+        d = verify_board_decision_nostr_event(ev, args.board_id,
+                                              expect_kind=DRAFT_NOSTR_KIND)
+        if d is None:
+            continue
+        verified.append((d, ev.get('pubkey', ''), ev.get('created_at', 0)))
+    targets = draft_notify_targets(verified, now, args.within)
+    if not args.include_expired:
+        targets = [t for t in targets if t[3] == 'expiring_soon']
+    if not targets:
+        print('通知対象の草案はありませんでした')
+        return
+    notif_dir = getattr(args, 'notif_dir', None) or DRAFT_NOTIFS_DEFAULT
+    sender_npub = npub_of(secret)
+    failed = 0
+    for core, d, publisher_hex, reason in targets:
+        tag = f'{core[:12]} ({reason})'
+        if args.dry_run:
+            print(f'[dry-run] {tag} → {publisher_hex[:16]}... ({d["decision"]})')
+            continue
+        if not args.resend and draft_notif_already_sent(notif_dir, core, reason, now,
+                                                        args.within):
+            print(f'[skip] {tag} — {args.within}s 以内に送信済み')
+            continue
+        msg = draft_notify_message(d, core, reason, args.relay, policy)
+        try:
+            seal = nip17_build_seal(secret, publisher_hex, msg)
+            wrap = nip17_build_gift_wrap(seal, publisher_hex)
+        except Exception as e:
+            print(f'DM の構築に失敗しました ({tag}): {e}', file=sys.stderr)
+            failed += 1
+            continue
+        accepted, r = nostr_publish(args.relay, wrap,
+                                    auth_secret=secret if args.auth else None)
+        if not accepted:
+            print(f'publish 拒否 ({tag}): {r}', file=sys.stderr)
+            failed += 1
+            continue
+        draft_notif_record(notif_dir, core, reason, publisher_hex, sender_npub, now)
+        print(f'[sent] {tag} → {publisher_hex[:16]}... (id={wrap["id"]})')
+    if failed:
+        sys.exit(1)
+
+
 # --- v0.4: ガバナンス照合 (spec §9.4: board_read --governance) ---
 
 # 決定種別 → その決定が正当化できる NIP-29 管理イベントの kind。
@@ -3271,6 +3451,16 @@ def main():
     s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
     s.add_argument('--out', default=None, help='決定 JSON を <core_hash>.json で保存（内部マーカーを剥がしたプレーン決定 — board_read --governance --decisions / board_cosign に渡せる）')
     s.add_argument('--policy', default=None, help='運営規約 JSON（指定時のみ各決定の threshold 充足・不足を表示。成立済みは時点解決、草案は現行政策のみ）')
+    s = sub.add_parser('board_draft_notify'); s.add_argument('relay'); s.add_argument('board_id')
+    s.add_argument('--limit', type=int, default=20)
+    s.add_argument('--auth', action='store_true', help='NIP-42 認証を使う (keyfile の鍵で署名)')
+    s.add_argument('--policy', default=None, help='運営規約 JSON（指定時のみ DM に threshold 充足・不足を表示）')
+    s.add_argument('--within', type=int, default=86400, help='期限までの残り秒数の上限 (既定: 86400 = 24h)。この範囲内の草案が通知対象')
+    s.add_argument('--include-expired', action='store_true', help='期限切れの草案も通知対象にする (reason=expired)')
+    s.add_argument('--dry-run', action='store_true', help='対象草案と宛先の一覧のみ表示し、送信も記録もしない')
+    s.add_argument('--resend', action='store_true', help='送信記録があっても強制的に再送する')
+    s.add_argument('--from', dest='from_npub', default=None, help='送信者の npub（keyfile の鍵と一致しなければ拒否 — 取り違え防止）')
+    s.add_argument('--notif-dir', default=None, help='送信記録のディレクトリ (既定: ~/.config/nakama/draft_notifs)')
 
     args = ap.parse_args()
     {'init': cmd_init, 'whoami': cmd_whoami, 'propose': cmd_propose,
@@ -3300,7 +3490,8 @@ def main():
      'board_decide_fetch': cmd_board_decide_fetch,
      'board_draft_pub': cmd_board_draft_pub,
      'board_draft_fetch': cmd_board_draft_fetch,
-     'board_fetch_all': cmd_board_fetch_all}[args.cmd](args)
+     'board_fetch_all': cmd_board_fetch_all,
+     'board_draft_notify': cmd_board_draft_notify}[args.cmd](args)
 
 
 if __name__ == '__main__':
