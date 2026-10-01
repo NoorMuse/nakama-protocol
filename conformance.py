@@ -112,7 +112,11 @@ over the canonical rotation message; self-rotations rejected).
 Passing `check_unbinding` on your unbinding files proves
 unbinding-certificate wire compatibility (key-holder signature
 over the canonical unbinding message, including the signed
-binding_created_at scope semantics).
+binding_created_at scope semantics). Passing `check_policy` on
+your board-policy files proves board-policy-certificate wire
+compatibility (n-of-n signatures over the canonical
+board_policy_message: every eligible member signs, outsiders
+rejected).
 
 Platform-binding certificate conformance:
 
@@ -238,6 +242,30 @@ are wire-compatible with the reference implementation.
 
 `python3 conformance.py selftest` also covers `check_unbinding`
 with reference certificates built by nakama.py's own primitives.
+
+Board-policy certificate conformance:
+
+    python3 conformance.py check_policy <policy1.json> [...]
+
+Verifies each file is a board-policy certificate as written by
+`board_policy`/`board_policy_sign` (spec §9.4): shape checks
+(protocol/version/type, board_id, relay, threshold int,
+eligible list of unique valid npubs, created_at int,
+signatures list of {npub, sig}) plus one Schnorr signature
+check per listed signature over board_policy_message(board_id,
+relay, threshold, eligible, created_at), mirroring the reference
+`verify_board_policy_cert` acceptance rule. The initial policy is
+n-of-n: EVERY eligible member must have a valid signature and
+outsider signatures are rejected (duplicate signatures collapse
+to one, as in the reference). Threshold enforcement at decision
+time (§9.5) is out of scope — the cert carries threshold
+verbatim. Use this to prove a second implementation's
+board-policy certificates are wire-compatible with the
+reference implementation.
+
+`python3 conformance.py selftest` also covers `check_policy`
+with reference certificates built by nakama.py's own
+primitives.
 """
 
 import json
@@ -1392,6 +1420,146 @@ def check_revocation_files(paths: list[str]) -> int:
 
 # ---------- selftest: reference events built by nakama.py ----------
 
+def conform_policy(p: dict):
+    """Verify a board-policy certificate as written by `board_policy`
+    / `board_policy_sign` (spec §9.4).
+
+    Shape checks (protocol/version/type, board_id/relay non-empty
+    strings, threshold int, eligible non-empty list of unique valid
+    npubs, created_at int, signatures list of {npub, sig}) plus one
+    Schnorr signature check per listed signature over
+    board_policy_message(board_id, relay, threshold, eligible,
+    created_at) — the same acceptance rule as the reference
+    `verify_board_policy_cert`: the initial policy is n-of-n, so
+    EVERY eligible member must have a valid signature, outsiders'
+    signatures are rejected, and duplicate signatures collapse to
+    one (set semantics, as in the reference). Threshold
+    enforcement at decision time (§9.5) is out of scope — the cert
+    carries threshold verbatim, only range-checked.
+    Returns (ok, errs, info).
+    """
+    errs: list[str] = []
+    info: list[str] = []
+    if not isinstance(p, dict):
+        return False, ['policy cert is not a JSON object'], info
+    if p.get('protocol') != 'nakama':
+        errs.append('protocol != "nakama"')
+    if p.get('version') != 1:
+        errs.append('version != 1')
+    if p.get('type') != 'board-policy':
+        errs.append('type != "board-policy"')
+    shape_ok = True
+    if not (isinstance(p.get('board_id'), str) and p.get('board_id')):
+        errs.append('board_id must be a non-empty string')
+        shape_ok = False
+    if not (isinstance(p.get('relay'), str) and p.get('relay')):
+        errs.append('relay must be a non-empty string')
+        shape_ok = False
+    threshold = p.get('threshold')
+    if not isinstance(threshold, int) or isinstance(threshold, bool):
+        errs.append('threshold must be an int')
+        shape_ok = False
+    eligible = p.get('eligible')
+    if not isinstance(eligible, list) or not eligible:
+        errs.append('eligible must be a non-empty list')
+        shape_ok = False
+    else:
+        for npub in eligible:
+            if not isinstance(npub, str) or nakama.npub_to_hex(npub) is None:
+                errs.append('eligible must contain valid npubs only')
+                shape_ok = False
+                break
+        else:
+            if len(set(eligible)) != len(eligible):
+                errs.append('eligible must contain unique npubs')
+                shape_ok = False
+    if isinstance(threshold, int) and not isinstance(threshold, bool) \
+            and isinstance(eligible, list) and eligible:
+        if not (1 <= threshold <= len(eligible)):
+            errs.append('threshold must be within 1..len(eligible)')
+            shape_ok = False
+    if not isinstance(p.get('created_at'), int) \
+            or isinstance(p.get('created_at'), bool):
+        errs.append('created_at must be an int')
+        shape_ok = False
+    sigs = p.get('signatures')
+    if not isinstance(sigs, list):
+        errs.append('signatures must be a list of {npub, sig}')
+        shape_ok = False
+    else:
+        for s in sigs:
+            if not isinstance(s, dict):
+                errs.append('each signature must be a {npub, sig} object')
+                shape_ok = False
+                break
+            if not isinstance(s.get('npub'), str) \
+                    or nakama.npub_to_hex(s['npub']) is None:
+                errs.append('each signature must name a valid signer npub')
+                shape_ok = False
+                break
+            sh = s.get('sig')
+            try:
+                if not isinstance(sh, str):
+                    raise ValueError
+                sb = bytes.fromhex(sh)
+                if len(sb) != 64:
+                    raise ValueError
+            except ValueError:
+                errs.append('each signature sig must be 128 hex chars '
+                            '(64 bytes)')
+                shape_ok = False
+                break
+    if shape_ok:
+        try:
+            msg = nakama.board_policy_message(p['board_id'], p['relay'],
+                                              threshold, list(eligible),
+                                              int(p['created_at']))
+            for s in sigs:
+                sb = bytes.fromhex(s['sig'])
+                if not nakama.verify_schnorr(s['npub'], sb, msg):
+                    errs.append(f'invalid signature by {s["npub"][:12]}...: '
+                                'every listed signature must verify over '
+                                'board_policy_message(board_id, relay, '
+                                'threshold, eligible, created_at)')
+            signers = {s['npub'] for s in sigs}
+            if signers != set(eligible):
+                missing = set(eligible) - signers
+                extra = signers - set(eligible)
+                if missing:
+                    errs.append('n-of-n not met: missing signatures from '
+                                + ', '.join(n[:12] + '...' for n in missing))
+                if extra:
+                    errs.append('outsider signatures rejected: '
+                                + ', '.join(n[:12] + '...' for n in extra))
+        except Exception as e:
+            errs.append(f'signature check failed: {e}')
+    info.append(f'{p.get("board_id", "?")}/{threshold}of'
+                f'{len(eligible) if isinstance(eligible, list) else "?"}')
+    if isinstance(sigs, list):
+        info.append(f'{len(sigs)} signatures listed')
+    return (len(errs) == 0), errs, info
+
+
+def check_policy_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            d = json.load(open(p))
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_policy(d)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
 def _key() -> tuple[bytes, str]:
     s = secrets.token_bytes(32)
     return s, nakama.npub_of(s)
@@ -2194,9 +2362,116 @@ def selftest() -> int:
     print(f'--- unbinding {ub_total - ub_fails}/{ub_total} passed ---')
     fails += ub_fails
 
+    # Board-policy certificate conformance: reference policies
+    # built with nakama.py's board_policy_message/sign_schnorr must
+    # verify; malformed, re-scoped, and wrong-type ones must be
+    # rejected. The initial policy is n-of-n: every eligible member
+    # signs, outsiders are rejected, duplicate signatures collapse
+    # (set semantics, mirroring verify_board_policy_cert).
+    pl_fails = 0
+    s_c, np_c = _key()
+    pl_now = int(time.time())
+    pl_board, pl_relay = 'test-board', 'wss://relay.test'
+    pl_eligible = [np_a, np_b, np_c]
+    pl_thr = 2
+
+    def _policy(eligible, thr, created_at):
+        msg = nakama.board_policy_message(pl_board, pl_relay, thr,
+                                          eligible, created_at)
+        return {'protocol': 'nakama', 'version': 1,
+                'type': 'board-policy', 'board_id': pl_board,
+                'relay': pl_relay, 'threshold': thr,
+                'eligible': eligible, 'created_at': created_at,
+                'signatures': [{'npub': np, 'sig': ''} for np in eligible]}
+
+    def _sign(pl, keys):
+        msg = nakama.board_policy_message(pl['board_id'], pl['relay'],
+                                          pl['threshold'], pl['eligible'],
+                                          pl['created_at'])
+        pl['signatures'] = [{'npub': np, 'sig': nakama.sign_schnorr(
+            sec, msg).hex()} for sec, np in keys]
+        return pl
+
+    policy = _sign(_policy(pl_eligible, pl_thr, pl_now),
+                   [(s_a, np_a), (s_b, np_b), (s_c, np_c)])
+    solo = _sign(_policy([np_a], 1, pl_now), [(s_a, np_a)])
+    dup = _sign(_policy(pl_eligible, pl_thr, pl_now),
+                [(s_a, np_a), (s_b, np_b), (s_c, np_c), (s_a, np_a)])
+
+    pl_pos = [('valid 2-of-3 n-of-n policy', policy),
+              ('valid 1-of-1 single-member policy', solo),
+              ('valid n-of-n with duplicate signature (collapses)',
+               dup)]
+    for name, pp in pl_pos:
+        ok, errs, info = conform_policy(pp)
+        print(f'policy/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        pl_fails += 0 if ok else 1
+
+    pl_neg = []
+    bad_sig = json.loads(json.dumps(policy))
+    bad_sig['signatures'][0]['sig'] = '00' * 128
+    pl_neg.append(('tampered signature', bad_sig))
+    outsider = json.loads(json.dumps(policy))
+    s_x, np_x = _key()
+    outsider['signatures'][0] = {
+        'npub': np_x, 'sig': nakama.sign_schnorr(
+            s_x, nakama.board_policy_message(
+                pl_board, pl_relay, pl_thr, pl_eligible,
+                pl_now)).hex()}
+    pl_neg.append(('outsider signature (valid sig, not eligible)',
+                   outsider))
+    missing = json.loads(json.dumps(policy))
+    missing['signatures'] = missing['signatures'][1:]
+    pl_neg.append(('one eligible signer missing (n-of-n not met)',
+                   missing))
+    thr0 = json.loads(json.dumps(policy))
+    thr0['threshold'] = 0
+    pl_neg.append(('threshold 0 (invalid after resigning)',
+                   _sign(thr0, [(s_a, np_a), (s_b, np_b),
+                                (s_c, np_c)])))
+    thr_big = json.loads(json.dumps(policy))
+    thr_big['threshold'] = 4
+    pl_neg.append(('threshold > len(eligible)', thr_big))
+    dup_elig = _sign(_policy([np_a, np_a, np_c], pl_thr, pl_now),
+                     [(s_a, np_a), (s_a, np_a), (s_c, np_c)])
+    pl_neg.append(('duplicate npub in eligible', dup_elig))
+    bad_elig = json.loads(json.dumps(policy))
+    bad_elig['eligible'] = ['npub1invalid', np_b, np_c]
+    pl_neg.append(('invalid npub in eligible', bad_elig))
+    bad_bid = json.loads(json.dumps(policy))
+    bad_bid['board_id'] = 'other-board'
+    pl_neg.append(('board_id changed after signing', bad_bid))
+    bad_thr_type = json.loads(json.dumps(policy))
+    bad_thr_type['threshold'] = '2'
+    pl_neg.append(('threshold not an int', bad_thr_type))
+    bad_ca = json.loads(json.dumps(policy))
+    bad_ca['created_at'] = 'not-a-time'
+    pl_neg.append(('created_at not an int', bad_ca))
+    bad_type = json.loads(json.dumps(policy))
+    bad_type['type'] = 'board-decision'
+    pl_neg.append(('wrong type', bad_type))
+    no_sigs = json.loads(json.dumps(policy))
+    del no_sigs['signatures']
+    pl_neg.append(('missing signatures', no_sigs))
+
+    for name, pp in pl_neg:
+        ok, errs, info = conform_policy(pp)
+        good = not ok
+        print(f'policy-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            pl_fails += 1
+
+    pl_total = len(pl_pos) + len(pl_neg)
+    print(f'--- policy {pl_total - pl_fails}/{pl_total} passed ---')
+    fails += pl_fails
+
     grand = total + dm_total + board_total + dec_total + bond_total \
         + binding_total + live_total + cp_total + rt_total + rv_total \
-        + ub_total
+        + ub_total + pl_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -2292,6 +2567,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_revocation <rev1.json> [...]')
             return 2
         return check_revocation_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_policy':
+        if len(argv) < 3:
+            print('usage: conformance.py check_policy <policy1.json> [...]')
+            return 2
+        return check_policy_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -2306,6 +2586,7 @@ def main(argv: list[str]) -> int:
           'check_compromise <decl.json> [...] | '
           'check_rotation <rotation.json> [...] | '
           'check_revocation <rev.json> [...] | '
+          'check_policy <policy.json> [...] | '
           'selftest')
     return 2
 
