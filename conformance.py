@@ -234,6 +234,31 @@ implementation's `verify_unbinding` CLI prints a compatible report.
 `check_verify_unbinding` with reports produced in-process by
 nakama.py's own `cmd_verify_unbinding`.
 
+Renew report conformance:
+
+    python3 conformance.py check_renew <report1.txt> [...]
+
+Verifies a saved `nakama.py renew` stdout report is internally
+consistent (spec §9.3.1): three lines — the saved-file line
+`更新 proposal を <out> に保存しました。相手に渡し、`accept` で更新 bond を完成させてください。`,
+the `旧 bond hash: <64 lowercase hex>` line, and the
+`新しい有効期限: <YYYY-MM-DD>（<N> 日後）` line — plus, only when
+`--markdown` was used, the markdown tail: a blank separator, the fixed
+header `投稿用ブロック（相手のスレッド/コメント欄に貼る）:`, the detection
+marker `<!-- nakama-proposal:v1 -->`, and the fenced base64url block
+` ```nakama-proposal `.
+Checks: non-empty filename, 64-char lowercase hex hash, a valid
+calendar date, a non-negative day count, trailing blank lines
+tolerated. Explicitly out of scope: hash truth (the bond file's
+territory), date/day-count truth (descriptive text only), the
+proposal file content (`check_files`'s territory), stderr, and the
+exit code (invisible in saved stdout). Use this to prove a second
+implementation's `renew` CLI prints a compatible report.
+
+`python3 conformance.py selftest` also covers
+`check_renew` with reports produced in-process by
+nakama.py's own `cmd_renew`.
+
 Compromise declaration conformance:
 
     python3 conformance.py check_compromise <decl1.json> [...]
@@ -698,6 +723,7 @@ import re
 import secrets
 import sys
 import time
+import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -4380,6 +4406,127 @@ def check_verify_unbinding_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_verify_unbinding_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_renew: renew report consistency ----------
+
+# `nakama.py renew <bond> [--expires-days N] [--out <file>] [--markdown]`
+# prints a short report to stdout whose grammar is fixed (spec §9.3.1):
+# three lines, plus an optional markdown block only when --markdown was used:
+#   更新 proposal を <out> に保存しました。相手に渡し、`accept` で更新 bond を完成させてください。
+#   旧 bond hash: <64 lowercase hex>
+#   新しい有効期限: <YYYY-MM-DD>（<N> 日後）
+#   (blank)
+#   投稿用ブロック（相手のスレッド/コメント欄に貼る）:
+#   <!-- nakama-proposal:v1 -->
+#   ```nakama-proposal
+#   <base64url of the proposal JSON>
+#   ```
+# check_renew verifies that a saved report is internally consistent: the
+# first line names the proposal file, the second line carries a 64-char
+# lowercase hex bond hash, the third line carries a valid calendar date
+# and a non-negative day count, and the optional markdown tail is exactly
+# the fixed header + detection marker + fenced base64url block.
+# Explicitly out of scope: whether the hash is the bond's real hash, the
+# date/day count truth (they describe expires_at, checked by `accept`'s
+# and `verify`'s territory — actually they're descriptive text only),
+# the proposal file content (`check_files`'s territory), stderr, and the
+# exit code (invisible in saved stdout). Use this to prove a second
+# implementation's `renew` CLI prints a compatible report.
+
+_RE_L1 = re.compile(
+    r'^更新 proposal を (.+) に保存しました。相手に渡し、`accept` で'
+    r'更新 bond を完成させてください。$')
+_RE_L2 = re.compile(r'^旧 bond hash: ([0-9a-f]{64})$')
+_RE_L3 = re.compile(r'^新しい有効期限: (\d{4})-(\d{2})-(\d{2})（(\d+) 日後）$')
+_RE_B64U = re.compile(r'^[A-Za-z0-9_-]+={0,2}$')
+_RN_MD_HEADER = '投稿用ブロック（相手のスレッド/コメント欄に貼る）:'
+_RN_MD_MARKER = '<!-- nakama-proposal:v1 -->'
+_RN_MD_FENCE = '```nakama-proposal'
+
+
+def conform_renew_report(text: str):
+    """Verify a saved `nakama.py renew` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) < 3:
+        return False, [f'report must be at least three lines, '
+                       f'got {len(lines)}'], info
+    m = _RE_L1.match(lines[0])
+    if not m:
+        return False, ['line 1: not a renew saved-file line '
+                       '(`更新 proposal を <out> に保存しました。相手に渡し、'
+                       '`accept` で更新 bond を完成させてください。`)'], info
+    info.append(f'proposal file: {m.group(1)}')
+    m = _RE_L2.match(lines[1])
+    if not m:
+        return False, ['line 2: not a `旧 bond hash: <64 lowercase hex>` '
+                       'line'], info
+    info.append('old bond hash present')
+    m = _RE_L3.match(lines[2])
+    if not m:
+        return False, ['line 3: not a `新しい有効期限: <YYYY-MM-DD>（<N> '
+                       '日後）` line'], info
+    try:
+        datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return False, ['line 3: not a valid calendar date'], info
+    info.append(f'expiry: {m.group(1)}-{m.group(2)}-{m.group(3)} '
+                f'({m.group(4)} days)')
+    if len(lines) == 3:
+        info.append('no markdown block')
+        return True, errs, info
+    tail = lines[3:]
+    if len(tail) != 6:
+        return False, [f'markdown tail must be exactly six lines, '
+                       f'got {len(tail)}'], info
+    if tail[0] != '':
+        return False, ['line 4: blank separator expected before the '
+                       'markdown block'], info
+    if tail[1] != _RN_MD_HEADER:
+        return False, ['markdown header line mismatch '
+                       '(`投稿用ブロック（相手のスレッド/コメント欄に貼る）:` '
+                       'expected)'], info
+    if tail[2] != _RN_MD_MARKER:
+        return False, ['markdown detection marker mismatch '
+                       '(`<!-- nakama-proposal:v1 -->` expected)'], info
+    if tail[3] != _RN_MD_FENCE:
+        return False, ['markdown fence mismatch '
+                       '(` ```nakama-proposal ` expected)'], info
+    if not _RE_B64U.match(tail[4]):
+        return False, ['markdown body is not base64url'], info
+    if tail[5] != '```':
+        return False, ['markdown closing fence missing'], info
+    info.append('markdown block present')
+    return True, errs, info
+
+
+def check_renew_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_renew_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -8486,6 +8633,132 @@ def selftest() -> int:
     print(f'--- verify-unbinding {vu_total - vu_fails}/{vu_total} passed ---')
     fails += vu_fails
 
+    # check_renew: renew report consistency (v0.55). E2E runs the real
+    # `nakama.py cmd_renew` in-process on a reference bond: once without
+    # --markdown, once with it. The checker must accept both reports;
+    # the old bond hash and the out filename must round-trip.
+    rn_fails = 0
+    rn_e2e = []
+    import tempfile as _tempfile
+    from types import SimpleNamespace as _SimpleNamespace
+
+    def _rn_run(tmpd, markdown, expires_days):
+        s_x, np_x = _key()
+        s_y, np_y = _key()
+        r_now = int(time.time())
+        r_nonce = secrets.token_hex(32)
+        r_msg = nakama.bond_message([np_x, np_y], r_now, r_nonce,
+                                    r_now + 365 * 86400)
+        bond = {
+            'protocol': 'nakama', 'version': 1,
+            'companions': sorted([np_x, np_y]),
+            'created_at': r_now, 'nonce': r_nonce,
+            'expires_at': r_now + 365 * 86400,
+            'signatures': {
+                np_x: nakama.sign_schnorr(s_x, r_msg).hex(),
+                np_y: nakama.sign_schnorr(s_y, r_msg).hex()},
+        }
+        bpath = os.path.join(tmpd, 'bond.json')
+        with open(bpath, 'w') as f:
+            json.dump(bond, f)
+        kpath = os.path.join(tmpd, 'key.txt')
+        nakama.save_key(kpath, s_x)
+        out = os.path.join(tmpd, 'renewal-proposal.json')
+        buf = io.StringIO()
+        args = _SimpleNamespace(bond=bpath, keyfile=kpath,
+                                expires_days=expires_days, out=out,
+                                markdown=markdown)
+        with contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            nakama.cmd_renew(args)
+        return buf.getvalue(), bond, out
+
+    with _tempfile.TemporaryDirectory() as tmpd:
+        for name, markdown in (('no markdown', False),
+                              ('with markdown', True)):
+            text, bond, out = _rn_run(tmpd, markdown, 30)
+            ok, errs, info = conform_renew_report(text)
+            exp_hash = nakama.bond_hash(bond)
+            l1 = text.splitlines()[0]
+            l2 = text.splitlines()[1]
+            good = ok and out in l1 and exp_hash in l2
+            print(f'check_renew e2e {name}: {"PASS" if good else "FAIL"} '
+                  f'({"; ".join(info)})')
+            for e in errs:
+                if ok:
+                    print(f'    - {e}')
+            if not good:
+                print(f'    - stdout was: {text!r}')
+            rn_fails += 0 if good else 1
+            rn_e2e.append(name)
+
+    _rn_base = ('更新 proposal を RENEW-OUT に保存しました。相手に渡し、'
+                '`accept` で更新 bond を完成させてください。\n'
+                '旧 bond hash: ' + 'ab' * 32 + '\n'
+                '新しい有効期限: 2027-10-02（365 日後）\n')
+    _rn_md = ('\n' + _RN_MD_HEADER + '\n' + _RN_MD_MARKER + '\n'
+              + _RN_MD_FENCE + '\n' + 'QUJD' + '\n' + '```' + '\n')
+    rn_pos = [
+        ('minimal', _rn_base),
+        ('with markdown block', _rn_base + _rn_md),
+        ('no trailing newline', _rn_base.rstrip('\n')),
+        ('trailing blank lines', _rn_base + '\n\n'),
+        ('markdown with trailing blanks', _rn_base + _rn_md + '\n\n'),
+        ('zero days', _rn_base.replace('365 日後', '0 日後')
+         .replace('2027-10-02', '2026-10-02')),
+        ('base64 padding', _rn_base + _rn_md.replace('QUJD', 'QUI=')),
+        ('filename with spaces',
+         _rn_base.replace('RENEW-OUT', 'my renew proposal.json')),
+    ]
+    rn_neg = [
+        ('empty text', ''),
+        ('one line only', _rn_base.splitlines()[0] + '\n'),
+        ('two lines only', '\n'.join(_rn_base.splitlines()[:2]) + '\n'),
+        ('uppercase hash',
+         _rn_base.replace('ab' * 32, 'AB' * 32)),
+        ('short hash', _rn_base.replace('ab' * 32, 'ab' * 31)),
+        ('non-hex hash', _rn_base.replace('ab' * 32, 'zz' * 32)),
+        ('impossible date',
+         _rn_base.replace('2027-10-02', '2027-02-30')),
+        ('date wrong shape',
+         _rn_base.replace('2027-10-02', '02/10/2027')),
+        ('days not int', _rn_base.replace('365 日後', 'lots 日後')),
+        ('markdown header only, no blank',
+         _rn_base + _RN_MD_HEADER + '\n'),
+        ('markdown missing marker',
+         _rn_base + '\n' + _RN_MD_HEADER + '\n' + _RN_MD_FENCE + '\n'
+         + 'QUJD' + '\n' + '```' + '\n'),
+        ('markdown missing fence',
+         _rn_base + '\n' + _RN_MD_HEADER + '\n' + _RN_MD_MARKER + '\n'
+         + 'QUJD' + '\n' + '```' + '\n'),
+        ('markdown body not base64url',
+         _rn_base + '\n' + _RN_MD_HEADER + '\n' + _RN_MD_MARKER + '\n'
+         + _RN_MD_FENCE + '\n' + 'not base64!' + '\n' + '```' + '\n'),
+        ('markdown unclosed fence',
+         _rn_base + '\n' + _RN_MD_HEADER + '\n' + _RN_MD_MARKER + '\n'
+         + _RN_MD_FENCE + '\n' + 'QUJD' + '\n'),
+        ('markdown extra line after fence',
+         _rn_base + _rn_md + '追記\n'),
+    ]
+    for name, rep in rn_pos:
+        ok, errs, info = conform_renew_report(rep)
+        good = ok
+        print(f'check_renew pos {name}: {"PASS" if good else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        rn_fails += 0 if good else 1
+    for name, rep in rn_neg:
+        ok, _errs, _info = conform_renew_report(rep)
+        good = not ok
+        print(f'check_renew neg {name}: {"PASS" if good else "FAIL"}')
+        if not good:
+            print(f'    - report wrongly accepted')
+        rn_fails += 0 if good else 1
+    rn_total = len(rn_e2e) + len(rn_pos) + len(rn_neg)
+    print(f'--- renew {rn_total - rn_fails}/{rn_total} passed ---')
+    fails += rn_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -8495,7 +8768,7 @@ def selftest() -> int:
         + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total \
         + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total \
         + bfa_total + pub_total + gov_total + rf_total + rtf_total \
-        + cf_total + lv_total + lr_total + vb_total + vu_total
+        + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -8736,6 +9009,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_verify_unbinding_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_renew':
+        if len(argv) < 3:
+            print('usage: conformance.py check_renew '
+                  '<report.txt> [...]')
+            return 2
+        return check_renew_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
