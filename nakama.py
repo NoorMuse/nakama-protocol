@@ -56,7 +56,7 @@
   nakama.py board_policy_sign <policy.json> [--out policy.json]
       回覧中の規約案に自分の署名を追加
   nakama.py verify_board_policy <policy.json>  規約の検証（初回は全員署名 n-of-n）
-  nakama.py board_decide --board-id <id> --relay <url> --decision admit|handover|policy-update|close --payload '<json>' [--out decision.json]
+  nakama.py board_decide --board-id <id> --relay <url> --decision admit|handover|policy-update|close --payload '<json>' [--expires-in SECS] [--expires-at TS] [--out decision.json]
       board-decision 決定案を作成＋自分の承認署名
   nakama.py board_cosign <decision.json> [--out decision.json]
       回覧中の決定案に自分の承認署名を追加
@@ -2018,27 +2018,46 @@ def board_decision_message(board_id: str, relay: str, decision: str, payload: di
     return hashlib.sha256(canon.encode('utf-8')).digest()
 
 
+def _expires_at_ok(payload: dict) -> bool:
+    """payload の任意フィールド expires_at の型チェック（spec §24.1）。
+
+    キーなし → True（後方互換・無期限）。int（bool 除外）のみ受理。
+    """
+    if 'expires_at' not in payload:
+        return True
+    exp = payload['expires_at']
+    return isinstance(exp, int) and not isinstance(exp, bool)
+
+
 def validate_decision_payload(decision: str, payload: dict) -> bool:
-    """決定種別ごとの payload 形式チェック。"""
+    """決定種別ごとの payload 形式チェック。
+
+    v0.19 (spec §24.1): 全決定種別で任意フィールド expires_at（unix 時刻 int、
+    署名対象）を許可。キー集合のチェックは expires_at を除いたベースで行い、
+    型チェックは _expires_at_ok に委譲。"""
     if not isinstance(payload, dict):
         return False
     if decision == 'admit':
-        return set(payload.keys()) == {'candidate'}
+        if set(payload.keys()) - {'expires_at'} != {'candidate'}:
+            return False
+        return _expires_at_ok(payload)
     if decision == 'handover':
-        keys = set(payload.keys())
+        keys = set(payload.keys()) - {'expires_at'}
         if keys not in ({'new_moderators'}, {'new_moderators', 'old_moderators'}):
             return False
         if not (isinstance(payload['new_moderators'], list)
                 and all(isinstance(n, str) for n in payload['new_moderators'])):
             return False
         if 'old_moderators' in payload:
-            return (isinstance(payload['old_moderators'], list)
-                    and all(isinstance(n, str) for n in payload['old_moderators']))
-        return True
+            if not (isinstance(payload['old_moderators'], list)
+                    and all(isinstance(n, str) for n in payload['old_moderators'])):
+                return False
+            return _expires_at_ok(payload)
+        return _expires_at_ok(payload)
     if decision == 'policy-update':
         # v0.6 (spec §11.2): 範囲検証。threshold は 1..len(eligible) の int、
         # eligible は空・重複なしの npub リスト。
-        if set(payload.keys()) != {'threshold', 'eligible'}:
+        if set(payload.keys()) - {'expires_at'} != {'threshold', 'eligible'}:
             return False
         elig = payload['eligible']
         if not (isinstance(elig, list) and elig
@@ -2046,24 +2065,47 @@ def validate_decision_payload(decision: str, payload: dict) -> bool:
                 and len(set(elig)) == len(elig)):
             return False
         th = payload['threshold']
-        return (isinstance(th, int) and not isinstance(th, bool)
+        return ((isinstance(th, int) and not isinstance(th, bool)
                 and 1 <= th <= len(elig))
+                and _expires_at_ok(payload))
     if decision == 'close':
-        return set(payload.keys()) == {'reason'}
+        if set(payload.keys()) - {'expires_at'} != {'reason'}:
+            return False
+        return _expires_at_ok(payload)
     if decision == 'remove':
         # v0.13 (spec §18.3): キー集合 {'candidate'} または {'candidate','reason'}。
         # candidate は文字列。npub 形式の厳密検証はしない — 照合時の
         # npub_to_hex が None を返して自然に不整合になる (admit と同型)。
         # reason は署名対象に含める（改ざん検出 — §18.2）。
-        keys = set(payload.keys())
+        keys = set(payload.keys()) - {'expires_at'}
         if keys not in ({'candidate'}, {'candidate', 'reason'}):
             return False
         if not isinstance(payload['candidate'], str):
             return False
         if 'reason' in payload and not isinstance(payload['reason'], str):
             return False
-        return True
+        return _expires_at_ok(payload)
     return False
+
+
+def draft_is_expired(d: dict, now: int) -> bool:
+    """草案の期限切れ判定（純粋、spec §24.2）。
+
+    payload の任意フィールド expires_at（unix 時刻 int）が now 以下なら
+    True。期限なし（キーなし）→ False（無期限・後方互換）。
+    不正な型（非 int）は validate 側の管轄 — ここでは期限なし扱い（False）。
+    時計ずれへの注記: now は呼び出し側のホスト時刻（NTP 前提）。テストでは
+    time.time() をモック可能にするためこの分離が必要。
+    """
+    try:
+        exp = d.get('payload', {}).get('expires_at')
+    except AttributeError:
+        return False
+    if exp is None:
+        return False
+    if not (isinstance(exp, int) and not isinstance(exp, bool)):
+        return False
+    return exp <= now
 
 
 def _verify_decision_core(d: dict, threshold: int, eligible: list,
@@ -2209,6 +2251,25 @@ def cmd_board_decide(args):
         print(f"payload の形式が decision '{args.decision}' に適合しません", file=sys.stderr)
         sys.exit(1)
     created_at = int(time.time())
+    # v0.19 (spec §24.1): 草案の期限。--expires-at が --expires-in に優先。
+    # --expires-in は created_at + 秒で換算。expires_at <= created_at は
+    # clean fail（生まれてすぐ死ぬ草案は作らせない）。
+    expires_at = None
+    if getattr(args, 'expires_at', None) is not None:
+        expires_at = args.expires_at
+    elif getattr(args, 'expires_in', None) is not None:
+        expires_at = created_at + args.expires_in
+    if expires_at is not None:
+        if expires_at <= created_at:
+            print(f'expires_at ({expires_at}) は created_at ({created_at})'
+                  ' より未来の時刻である必要があります', file=sys.stderr)
+            sys.exit(1)
+        payload = dict(payload)
+        payload['expires_at'] = expires_at
+        if not validate_decision_payload(args.decision, payload):
+            print(f"payload の形式が decision '{args.decision}' に適合しません",
+                  file=sys.stderr)
+            sys.exit(1)
     msg = board_decision_message(args.board_id, args.relay, args.decision, payload, created_at)
     d = {
         'protocol': 'nakama', 'version': 1, 'type': 'board-decision',
@@ -2232,6 +2293,11 @@ def cmd_board_cosign(args):
         d = json.load(f)
     if d.get('type') != 'board-decision':
         print('board-decision 形式ではありません', file=sys.stderr)
+        sys.exit(1)
+    # v0.19 (spec §24.2): 期限切れの草案には署名しない — ゾンビ草案対策の主軸。
+    if draft_is_expired(d, int(time.time())):
+        print(f'草案は期限切れです（expires_at {d["payload"]["expires_at"]}）'
+              ' — 署名しません', file=sys.stderr)
         sys.exit(1)
     try:
         msg = board_decision_message(d['board_id'], d['relay'], d['decision'],
@@ -2530,6 +2596,11 @@ def cmd_board_draft_pub(args):
     if not decision_structure_ok(d):
         print('草案は無効です（構造違反 — publish しません）', file=sys.stderr)
         sys.exit(1)
+    # v0.19 (spec §24.2): 期限切れの草案はリレーに置かない。
+    if draft_is_expired(d, int(time.time())):
+        print(f'草案は期限切れです（expires_at {d["payload"]["expires_at"]}）'
+              ' — publish しません', file=sys.stderr)
+        sys.exit(1)
     ev = decision_nostr_event(d, secret, kind=DRAFT_NOSTR_KIND)
     accepted, reason = nostr_publish(args.relay, ev, auth_secret=secret if args.auth else None)
     print(f'publish: {"受理" if accepted else "拒否"} ({reason}) id={ev["id"]}')
@@ -2583,13 +2654,16 @@ def cmd_board_draft_fetch(args):
               '（草案は成立の証拠ではありません — 成立の公開宣言は kind 30103）')
     for d in merged:
         ca = time.strftime('%Y-%m-%d', time.localtime(d['created_at']))
+        # v0.19 (spec §24.2): 期限切れ草案に [期限切れ] マーカー（表示のみ、
+        # exit 不変。threshold 表示は維持）。
+        expired = ' [期限切れ]' if draft_is_expired(d, int(time.time())) else ''
         if policy is None:
-            print(f'[草案 {decision_core_hash(d)}] {d["decision"]}'
+            print(f'[草案 {decision_core_hash(d)}]{expired} {d["decision"]}'
                   f' (created_at {ca}, approvals {len(d.get("approvals", []))} つ)')
         else:
             ok, n, m = fetch_threshold_status(d, policy, [])
             status = '充足（成立可能 — board_decide_pub で成立公開）' if ok else '不足'
-            print(f'[草案 {decision_core_hash(d)}] {d["decision"]}'
+            print(f'[草案 {decision_core_hash(d)}]{expired} {d["decision"]}'
                   f' (created_at {ca}, approvals {n} つ, 草案: threshold {n}/{m} {status})')
     print(f'{len(events)} 件のイベントを取得: 有効 {len(valid)} 件、スキップ {skipped} 件、'
           f'マージ後 {len(merged)} 件')
@@ -2678,8 +2752,14 @@ def cmd_board_fetch_all(args):
         ca = time.strftime('%Y-%m-%d', time.localtime(rec['created_at']))
         core = decision_core_hash(rec)
         tag = '成立済み' if rec['finalized'] else '草案（回覧中）'
+        # v0.19 (spec §24.2): 草案フェーズのみに [期限切れ]。同一コアに期限切れ
+        # 30104 と 30103 が混在した場合は「成立済み」表示が優先（期限は草案
+        # フェーズを殺しただけ — 成立は §20 の不変性ルールで恒久的）。
+        expired = (' [期限切れ]'
+                   if (not rec['finalized']
+                       and draft_is_expired(rec, int(time.time()))) else '')
         if policy is None:
-            print(f'[{tag} {core}] {rec["decision"]}'
+            print(f'[{tag} {core}]{expired} {rec["decision"]}'
                   f' (created_at {ca}, approvals {len(rec.get("approvals", []))} つ)')
         elif rec['finalized']:
             ok, n, m = fetch_threshold_status(rec, policy, finalized_only)
@@ -2689,7 +2769,7 @@ def cmd_board_fetch_all(args):
         else:
             ok, n, m = fetch_threshold_status(rec, policy, [])
             status = '充足（成立可能 — board_decide_pub で成立公開）' if ok else '不足'
-            print(f'[{tag} {core}] {rec["decision"]}'
+            print(f'[{tag} {core}]{expired} {rec["decision"]}'
                   f' (created_at {ca}, approvals {n} つ, 草案: threshold {n}/{m} {status})')
     print(f'{len(events)} 件のイベントを取得: 有効 {len(valid)} 件、スキップ {skipped} 件、'
           f'マージ後 {len(merged)} 件')
@@ -3163,6 +3243,10 @@ def main():
     s.add_argument('--relay', required=True)
     s.add_argument('--decision', required=True, choices=list(BOARD_DECISION_TYPES))
     s.add_argument('--payload', required=True, help="決定内容の JSON（例: '{\"candidate\": \"<npub>\"}'）")
+    s.add_argument('--expires-in', type=int, default=None,
+                   help='草案の期限（秒）。created_at + 秒で expires_at を設定（spec §24）')
+    s.add_argument('--expires-at', type=int, default=None,
+                   help='草案の期限（unix 時刻）。--expires-in より優先（spec §24）')
     s.add_argument('--old-moderators', nargs='*', default=None,
                    help="handover 専用: 旧運営の npub 一覧（省略時は policy.eligible をフォールバック、spec §10.2）")
     s.add_argument('--out')
