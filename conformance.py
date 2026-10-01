@@ -369,6 +369,24 @@ that is the registry's claim, not the report's.
 
 `python3 conformance.py selftest` also covers `check_key_status` with
 reference reports produced in-process by nakama.py's own cmd_key_status.
+
+Revoke-list report conformance:
+
+    python3 conformance.py check_revoke_list <report1.txt> [...]
+
+Each file is the saved stdout of `nakama.py revoke_list`. Verifies the
+report is internally consistent: either the single empty-registry line
+(`revocation registry は空です`), or the header `解消済み bond: N 件`
+with exactly N rows, each row's bond prefix 16 hex chars, the revoker
+npub prefix 16 chars, and a valid date; the trailing `理由: ...` suffix
+is display-only free text and is not validated. Explicitly out of
+scope: whether the listed revocations really exist in the registry —
+that is the registry's claim — and their signature validity
+(`check_revocation`'s territory).
+
+`python3 conformance.py selftest` also covers `check_revoke_list` with
+reference reports produced in-process by nakama.py's own cmd_revoke /
+cmd_revoke_list.
 """
 
 import json
@@ -2266,6 +2284,96 @@ def check_key_status_files(paths: list[str], exit_code: int | None) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_revoke_list: revoke_list report consistency ----------
+
+# revoke_list's stdout is a short human-readable listing, but its grammar is
+# fixed (spec §12.4d). check_revoke_list verifies that a saved report is
+# internally consistent: either the single empty-registry line, or the
+# header '解消済み bond: N 件' (N >= 1) with exactly N rows; each row's bond
+# prefix must be 16 hex chars, the revoker npub prefix 16 chars, and the date
+# valid. The trailing '  理由: ...' suffix is display-only free text
+# (unvalidated). Explicitly out of scope: whether the listed revocations
+# really exist in the registry (the registry's claim), and their signature
+# validity — check_revocation's territory.
+
+_RE_RL_HDR = re.compile(r'^解消済み bond: (\d+) 件$')
+_RE_RL_EMPTY = 'revocation registry は空です'
+_RE_RL_ROW = re.compile(
+    r'^  (\S+)\.\.\.  解消: (\S+)\.\.\.  '
+    r'\((\d{4})-(\d{2})-(\d{2})\)(  理由: (.*))?$')
+_RE_RL_HEX = frozenset('0123456789abcdefABCDEF')
+
+
+def conform_revoke_list_report(text: str):
+    """Verify a saved `nakama.py revoke_list` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) == 1 and lines[0] == _RE_RL_EMPTY:
+        info.append('empty registry')
+        return True, errs, info
+    m = _RE_RL_HDR.match(lines[0])
+    if not m:
+        return False, ['header line does not match revoke_list grammar '
+                       '(want "解消済み bond: N 件" or the empty-registry '
+                       'line)'], info
+    n = int(m.group(1))
+    if n == 0:
+        errs.append('header says 0 but the reference CLI prints the '
+                    'empty-registry line instead of a 0-row listing')
+    rows = lines[1:]
+    for j, ln in enumerate(rows):
+        rm = _RE_RL_ROW.match(ln)
+        if not rm:
+            errs.append(f'line {j + 2}: does not match revoke_list row '
+                        'grammar')
+            continue
+        bh, rv, yy, mm, dd, _rs, _reason = rm.groups()
+        if len(bh) != 16 or any(c not in _RE_RL_HEX for c in bh):
+            errs.append(f'line {j + 2}: bond prefix {bh!r} is not '
+                        '16 hex chars')
+        if len(rv) != 16:
+            errs.append(f'line {j + 2}: revoker prefix is {len(rv)} chars, '
+                        'want 16')
+        try:
+            time.strptime(f'{yy}-{mm}-{dd}', '%Y-%m-%d')
+        except ValueError:
+            errs.append(f'line {j + 2}: invalid date {yy}-{mm}-{dd}')
+    if len(rows) != n:
+        errs.append(f'header says {n} revocations but {len(rows)} rows '
+                    'listed')
+    if not errs:
+        info.append(f'{n} revocations listed')
+    return (not errs), errs, info
+
+
+def check_revoke_list_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_revoke_list_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 def _key() -> tuple[bytes, str]:
     s = secrets.token_bytes(32)
     return s, nakama.npub_of(s)
@@ -3765,13 +3873,141 @@ def selftest() -> int:
     print(f'--- key-status {ks_total - ks_fails}/{ks_total} passed ---')
     fails += ks_fails
 
+    # ---------- check_revoke_list: revoke_list report consistency ----------
+    # Real revoke_list reports are produced in-process with nakama.py's own
+    # cmd_revoke / cmd_revoke_list (throwaway keyfiles + registry) and must
+    # pass; hand-mutated reports that break the grammar or the header/row
+    # count consistency must be rejected.
+    rl_fails = 0
+
+    def _rl_keyfile(secret, tmpd, name):
+        kf = os.path.join(tmpd, name)
+        with open(kf, 'w') as f:
+            json.dump({'secret_hex': secret.hex()}, f)
+        os.chmod(kf, 0o600)
+        return kf
+
+    def _rl_bondf(tmpd, name, companions, nonce):
+        bf = os.path.join(tmpd, name)
+        with open(bf, 'w') as f:
+            json.dump({'protocol': 'nakama', 'version': 1, 'type': 'bond',
+                       'companions': companions,
+                       'created_at': int(time.time()) - 1000,
+                       'nonce': nonce}, f)
+        return bf
+
+    def _rl_revoke(bondf, keyfile, reg, out, reason=''):
+        with contextlib.redirect_stdout(io.StringIO()):
+            nakama.cmd_revoke(SimpleNamespace(bond=bondf, keyfile=keyfile,
+                                              reason=reason, registry=reg,
+                                              no_registry=False, out=out))
+
+    def _rl_list(reg):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            nakama.cmd_revoke_list(SimpleNamespace(registry=reg))
+        return buf.getvalue()
+
+    rl_e2e = []
+    with tempfile.TemporaryDirectory() as tmpd:
+        s_a, np_a = _key()
+        s_b, np_b = _key()
+        s_c, np_c = _key()
+        reg = os.path.join(tmpd, 'revocations')
+        rl_e2e.append(('missing registry -> empty line', _rl_list(reg)))
+
+        bond1 = _rl_bondf(tmpd, 'bond1.json', [np_a, np_b], 'cc' * 32)
+        _rl_revoke(bond1, _rl_keyfile(s_a, tmpd, 'a.json'), reg,
+                   os.path.join(tmpd, 'rev1.json'))
+        rl_e2e.append(('one revocation, no reason', _rl_list(reg)))
+
+        bond2 = _rl_bondf(tmpd, 'bond2.json', [np_b, np_c], 'dd' * 32)
+        _rl_revoke(bond2, _rl_keyfile(s_b, tmpd, 'b.json'), reg,
+                   os.path.join(tmpd, 'rev2.json'),
+                   reason='引っ越しのため')
+        rl_e2e.append(('two revocations, one with reason', _rl_list(reg)))
+
+        # registry dir exists but holds no valid revocation -> empty line
+        reg2 = os.path.join(tmpd, 'empty-reg')
+        os.makedirs(reg2)
+        with open(os.path.join(reg2, 'junk.txt'), 'w') as f:
+            f.write('not json\n')
+        rl_e2e.append(('registry with no valid revocations -> empty line',
+                       _rl_list(reg2)))
+
+    for name, rep in rl_e2e:
+        ok, errs, info = conform_revoke_list_report(rep)
+        print(f'revoke-list-e2e/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        rl_fails += 0 if ok else 1
+
+    # hand-crafted positives
+    _, np_r1 = _key()
+    _, np_r2 = _key()
+    bh1, bh2 = 'ab' * 8, 'cd' * 8
+    rl_pos = [
+        ('empty report', 'revocation registry は空です\n'),
+        ('two rows with reason',
+         f'解消済み bond: 2 件\n'
+         f'  {bh1}...  解消: {np_r1[:16]}...  (2026-09-30)  理由: test note\n'
+         f'  {bh2}...  解消: {np_r2[:16]}...  (2026-10-01)\n'),
+    ]
+    for name, rep in rl_pos:
+        ok, errs, info = conform_revoke_list_report(rep)
+        print(f'revoke-list/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        rl_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    rl_hdr2 = ('解消済み bond: 2 件\n'
+               f'  {bh1}...  解消: {np_r1[:16]}...  (2026-09-30)\n'
+               f'  {bh2}...  解消: {np_r2[:16]}...  (2026-10-01)\n')
+    rl_neg = []
+    rl_neg.append(('header malformed', 'garbage line\n'))
+    rl_neg.append(('empty report', ''))
+    rl_neg.append(('empty line plus row',
+                   'revocation registry は空です\n'
+                   f'  {bh1}...  解消: {np_r1[:16]}...  (2026-09-30)\n'))
+    rl_neg.append(('row count mismatch',
+                   '解消済み bond: 2 件\n'
+                   f'  {bh1}...  解消: {np_r1[:16]}...  (2026-09-30)\n'))
+    rl_neg.append(('zero-row header', '解消済み bond: 0 件\n'))
+    rl_neg.append(('bond prefix not hex',
+                   rl_hdr2.replace(bh1, 'zz' * 8, 1)))
+    rl_neg.append(('bond prefix short',
+                   rl_hdr2.replace(bh1, 'ab' * 7 + 'a', 1)))
+    rl_neg.append(('revoker prefix short',
+                   rl_hdr2.replace(np_r1[:16], np_r1[:15], 1)))
+    rl_neg.append(('invalid date',
+                   rl_hdr2.replace('2026-09-30', '2026-13-40', 1)))
+    rl_neg.append(('trailing garbage', rl_hdr2 + 'extra line\n'))
+    rl_neg.append(('row missing ellipsis',
+                   rl_hdr2.replace(f'{bh1}...', bh1, 1)))
+
+    for name, rep in rl_neg:
+        ok, errs, info = conform_revoke_list_report(rep)
+        good = not ok
+        print(f'revoke-list-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            rl_fails += 1
+
+    rl_total = len(rl_e2e) + len(rl_pos) + len(rl_neg)
+    print(f'--- revoke-list {rl_total - rl_fails}/{rl_total} passed ---')
+    fails += rl_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
 
     grand = total + dm_total + board_total + dec_total + bond_total \
         + binding_total + live_total + cp_total + rt_total + rv_total \
-        + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total
+        + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total \
+        + rl_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -3922,6 +4158,11 @@ def main(argv: list[str]) -> int:
                   '<report1.txt> [...]')
             return 2
         return check_key_status_files(paths, exit_code)
+    if len(argv) >= 2 and argv[1] == 'check_revoke_list':
+        if len(argv) < 3:
+            print('usage: conformance.py check_revoke_list <report1.txt> [...]')
+            return 2
+        return check_revoke_list_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -3942,6 +4183,7 @@ def main(argv: list[str]) -> int:
           'check_notif_ack <ack1.txt> [...] | '
           'check_notif_record <record1.json | notif_dir> [...] | '
           'check_key_status [--exit-code N] <report.txt> [...] | '
+          'check_revoke_list <report.txt> [...] | '
           'selftest')
     return 2
 
