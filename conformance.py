@@ -194,6 +194,24 @@ reference implementation.
 
 `python3 conformance.py selftest` also covers `check_rotation`
 with reference certificates built by nakama.py's own primitives.
+
+Revocation file conformance:
+
+    python3 conformance.py check_revocation <rev1.json> [...]
+
+Verifies each file is a revocation event as written by `revoke`
+(spec §4.3): shape checks (protocol/version/type, 64-hex bond_hash,
+valid revoker npub, created_at int, 128-hex sig, optional string
+reason) plus the REVOKER's Schnorr signature over
+revocation_message(bond_hash, revoker, created_at, reason or ''),
+mirroring the reference `verify_revocation_event` acceptance rule
+(without a bond: revoker-companion membership and bond_hash matching
+are local/registry-level steps outside wire compatibility). Use this
+to prove a second implementation's revocation events are
+wire-compatible with the reference implementation.
+
+`python3 conformance.py selftest` also covers `check_revocation`
+with reference events built by nakama.py's own primitives.
 """
 
 import json
@@ -1144,6 +1162,103 @@ def check_rotation_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+def conform_revocation(d: dict):
+    """Verify a revocation event as written by `revoke` (spec §4.3).
+
+    Shape checks (protocol/version/type, 64-hex bond_hash, valid
+    revoker npub, created_at int, 128-hex sig, optional string
+    reason) plus the REVOKER's Schnorr signature over
+    revocation_message(bond_hash, revoker, created_at, reason or
+    '') — the same signature rule as the reference
+    `verify_revocation_event` with no bond argument. bond linkage
+    (revoker is a companion of the referenced bond, bond_hash matches
+    bond_hash(bond)) is a local/registry-level step, like the
+    registry dedup excluded from `conform_compromise`: a standalone
+    file check cannot resolve the referenced bond, and the wire
+    event itself is self-contained either way.
+    Returns (ok, errs, info).
+    """
+    errs: list[str] = []
+    info: list[str] = []
+    if not isinstance(d, dict):
+        return False, ['revocation event is not a JSON object'], info
+    if d.get('protocol') != 'nakama':
+        errs.append('protocol != "nakama"')
+    if d.get('version') != 1:
+        errs.append('version != 1')
+    if d.get('type') != 'revocation':
+        errs.append('type != "revocation"')
+    shape_ok = True
+    bh = d.get('bond_hash')
+    if not (isinstance(bh, str) and re.fullmatch(r'[0-9a-f]{64}', bh)):
+        errs.append('bond_hash must be 64 hex chars')
+        shape_ok = False
+    revoker = d.get('revoker')
+    if not isinstance(revoker, str) or nakama.npub_to_hex(revoker) is None:
+        errs.append('revoker must be a valid npub')
+        shape_ok = False
+    if not isinstance(d.get('created_at'), int) \
+            or isinstance(d.get('created_at'), bool):
+        errs.append('created_at must be an int')
+        shape_ok = False
+    sig_hex = d.get('sig')
+    sig_b = None
+    if not isinstance(sig_hex, str):
+        errs.append('sig must be a 128-hex-char string')
+        shape_ok = False
+    else:
+        try:
+            sig_b = bytes.fromhex(sig_hex)
+            if len(sig_b) != 64:
+                raise ValueError
+        except ValueError:
+            errs.append('sig must be 128 hex chars (64 bytes)')
+            sig_b = None
+            shape_ok = False
+    reason = d.get('reason', '')
+    if not isinstance(reason, str):
+        errs.append('reason must be a string when present')
+        shape_ok = False
+    if shape_ok:
+        try:
+            msg = nakama.revocation_message(bh, revoker,
+                                            int(d['created_at']), reason)
+            if not nakama.verify_schnorr(revoker, sig_b, msg):
+                errs.append('invalid signature: the REVOKER must sign '
+                            'revocation_message(bond_hash, revoker, '
+                            'created_at, reason or \'\')')
+        except Exception as e:
+            errs.append(f'signature check failed: {e}')
+    info.append(bh[:16] + '...' if isinstance(bh, str) else '?')
+    if isinstance(revoker, str):
+        info.append(f'revoker {revoker[:12]}...')
+    if reason:
+        info.append(f'reason: {reason[:40]}' if isinstance(reason, str)
+                    else 'reason: <non-string>')
+    return (len(errs) == 0), errs, info
+
+
+def check_revocation_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            d = json.load(open(p))
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_revocation(d)
+        if ok:
+            print(f"{p}: PASS ({'; '.join(info)})")
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- selftest: reference events built by nakama.py ----------
 
 def _key() -> tuple[bytes, str]:
@@ -1773,8 +1888,88 @@ def selftest() -> int:
     print(f'--- rotation {rt_total - rt_fails}/{rt_total} passed ---')
     fails += rt_fails
 
+    # Revocation file conformance: reference events built with
+    # nakama.py's own primitives (revocation_message + sign_schnorr,
+    # the same fields `revoke` writes) must verify; tampered,
+    # wrong-signer, wrong-type, and malformed ones must be rejected.
+    # The signature must come from the revoker named in the event —
+    # a signature by any other key proves nothing about the revoker's
+    # intent and is rejected.
+    rv_fails = 0
+    rv_now = int(time.time())
+    rv_bh = 'ab' * 32
+    rv = {
+        'protocol': 'nakama', 'version': 1, 'type': 'revocation',
+        'bond_hash': rv_bh, 'revoker': np_a, 'created_at': rv_now,
+    }
+    rv['sig'] = nakama.sign_schnorr(
+        s_a, nakama.revocation_message(rv_bh, np_a, rv_now)).hex()
+    rv_reason = json.loads(json.dumps(rv))
+    rv_reason['reason'] = 'conformance selftest'
+    rv_reason['sig'] = nakama.sign_schnorr(
+        s_a, nakama.revocation_message(
+            rv_bh, np_a, rv_now, 'conformance selftest')).hex()
+    rv_extra = json.loads(json.dumps(rv))
+    rv_extra['note'] = 'extra unknown field tolerated'
+
+    rv_pos = [('valid revocation', rv),
+              ('valid revocation with reason', rv_reason),
+              ('valid revocation with extra field', rv_extra)]
+    for name, dd in rv_pos:
+        ok, errs, info = conform_revocation(dd)
+        print(f'revocation/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        rv_fails += 0 if ok else 1
+
+    rv_neg = []
+    bad_sig = json.loads(json.dumps(rv))
+    bad_sig['sig'] = '00' * 128
+    rv_neg.append(('tampered signature', bad_sig))
+    wrong_signer = json.loads(json.dumps(rv))
+    wrong_signer['sig'] = nakama.sign_schnorr(
+        s_b, nakama.revocation_message(rv_bh, np_a, rv_now)).hex()
+    rv_neg.append(('sig from a non-revoker key', wrong_signer))
+    revoker_changed = json.loads(json.dumps(rv))
+    revoker_changed['revoker'] = np_b
+    rv_neg.append(('revoker changed after signing', revoker_changed))
+    bh_changed = json.loads(json.dumps(rv))
+    bh_changed['bond_hash'] = 'cd' * 32
+    rv_neg.append(('bond_hash changed after signing', bh_changed))
+    bad_type = json.loads(json.dumps(rv))
+    bad_type['type'] = 'dissolution'
+    rv_neg.append(('wrong type', bad_type))
+    bad_revoker = json.loads(json.dumps(rv))
+    bad_revoker['revoker'] = 'npub1invalid'
+    rv_neg.append(('invalid revoker npub', bad_revoker))
+    bad_bh = json.loads(json.dumps(rv))
+    bad_bh['bond_hash'] = 'zz' * 32
+    rv_neg.append(('bond_hash not hex', bad_bh))
+    bad_ca = json.loads(json.dumps(rv))
+    bad_ca['created_at'] = 'not-a-time'
+    rv_neg.append(('created_at not an int', bad_ca))
+    bad_reason = json.loads(json.dumps(rv_reason))
+    bad_reason['reason'] = 123
+    rv_neg.append(('reason not a string', bad_reason))
+    no_sig = json.loads(json.dumps(rv))
+    del no_sig['sig']
+    rv_neg.append(('missing sig', no_sig))
+
+    for name, dd in rv_neg:
+        ok, errs, info = conform_revocation(dd)
+        good = not ok
+        print(f'revocation-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            rv_fails += 1
+
+    rv_total = len(rv_pos) + len(rv_neg)
+    print(f'--- revocation {rv_total - rv_fails}/{rv_total} passed ---')
+    fails += rv_fails
+
     grand = total + dm_total + board_total + dec_total + bond_total \
-        + binding_total + live_total + cp_total + rt_total
+        + binding_total + live_total + cp_total + rt_total + rv_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -1860,6 +2055,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_rotation <rotation1.json> [...]')
             return 2
         return check_rotation_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_revocation':
+        if len(argv) < 3:
+            print('usage: conformance.py check_revocation <rev1.json> [...]')
+            return 2
+        return check_revocation_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -1872,6 +2072,7 @@ def main(argv: list[str]) -> int:
           '<liveness.json> [...] | '
           'check_compromise <decl.json> [...] | '
           'check_rotation <rotation.json> [...] | '
+          'check_revocation <rev.json> [...] | '
           'selftest')
     return 2
 
