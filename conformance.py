@@ -810,6 +810,39 @@ nakama.py's own `cmd_board_policy` + `cmd_board_policy_sign`
 3/3 effective report, and a duplicate-sign report with exact
 stdout+exit matches).
 
+Verify-board-policy report conformance:
+
+    python3 conformance.py check_verify_board_policy <report1.txt> [...]
+
+Verifies a saved `nakama.py verify_board_policy` stdout report is
+internally consistent (spec §9.4.3): exactly one line —
+`board-policy は有効です: eligible <n> 名全員の署名を確認（threshold <t>）`
+or the fixed invalid line
+`board-policy は無効です: 全員の有効署名が揃っていないか、形式が不正です`.
+The valid line's internal arithmetic rules: n >= 1 (the valid cert
+requires a non-empty eligible list) and 1 <= t <= n
+(`verify_board_policy_cert` returns False unless
+1 <= threshold <= len(eligible); t == n is NOT asserted, since the
+initial policy accepts threshold < n — the n-of-n rule concerns the
+signatures, not the threshold field). The invalid line is a fixed
+literal with no numbers. Trailing blank lines tolerated; a leading
+blank line is rejected. Explicitly out of scope: the verdict's truth
+(`verify_board_policy_cert`'s territory — the policy file itself),
+the eligible/threshold values' truth, stderr, and the exit code
+(invisible in saved stdout text). The `board_policy` creation report
+(§9.4.1) and the `board_policy_sign` report (§9.4.2) are different
+grammars — the three checkers reject each other's reports. Use this to
+prove a second implementation's `verify_board_policy` CLI prints a
+compatible report.
+
+`python3 conformance.py selftest` also covers
+`check_verify_board_policy` with reports produced in-process by
+nakama.py's own `cmd_board_policy` + `cmd_board_policy_sign` +
+`cmd_verify_board_policy` (offline: 3 real key pairs, temp keyfiles —
+a partial 1/3 policy (invalid, exit 1), the fully signed 3/3 policy
+(valid, exit 0), and a tampered policy (invalid, exit 1), each with
+exact stdout+exit matches).
+
 Board-read report conformance:
 
     python3 conformance.py check_board_read <report1.txt> [...]
@@ -4184,6 +4217,98 @@ def check_board_policy_sign_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_board_policy_sign_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_verify_board_policy: verify_board_policy report consistency ----------
+
+# A saved `nakama.py verify_board_policy` stdout report. Its grammar is fixed
+# (spec §9.4.3). check_verify_board_policy verifies that the report is
+# internally consistent. Exactly one line:
+#   board-policy は有効です: eligible <n> 名全員の署名を確認（threshold <t>）
+# or
+#   board-policy は無効です: 全員の有効署名が揃っていないか、形式が不正です
+# The valid line's internal arithmetic rules: n >= 1 (the valid cert
+# requires a non-empty eligible list) and 1 <= t <= n
+# (verify_board_policy_cert returns False unless 1 <= threshold <=
+# len(eligible); the reference CLI prints the valid line only when the
+# cert is True). t == n is NOT asserted: the initial policy accepts
+# threshold < n (the n-of-n rule concerns the signatures, not the
+# threshold field — the reference CLI prints the policy's threshold
+# verbatim). The invalid line is a fixed literal with no numbers, so no
+# arithmetic applies there. Trailing blank lines tolerated; a leading
+# blank line is rejected.
+# Explicitly out of scope: the verdict's truth (verify_board_policy_cert's
+# territory — the policy file itself), the eligible/threshold values'
+# truth, stderr, and the exit code (invisible in saved stdout text). The
+# `board_policy` creation report (§9.4.1) and the `board_policy_sign`
+# report (§9.4.2) are different grammars — the three checkers reject each
+# other's reports. Use this to prove a second implementation's
+# `verify_board_policy` CLI prints a compatible report.
+
+_RE_VBP_VALID = re.compile(
+    r'^board-policy は有効です: eligible (\d+) 名全員の署名を確認'
+    r'（threshold (\d+)）$')
+_RE_VBP_INVALID = ('board-policy は無効です: '
+                   '全員の有効署名が揃っていないか、形式が不正です')
+
+
+def conform_verify_board_policy_report(text: str):
+    """Verify a saved `nakama.py verify_board_policy` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    if len(lines) != 1:
+        return False, [f'report must be exactly one verdict line, '
+                       f'found {len(lines)} lines'], info
+    line = lines[0]
+    if line == _RE_VBP_INVALID:
+        info.append('verdict: invalid')
+        return (not errs), errs, info
+    m = _RE_VBP_VALID.match(line)
+    if not m:
+        return False, ['line 1: not a verify_board_policy verdict line '
+                       '(`board-policy は有効です: eligible <n> '
+                       '名全員の署名を確認（threshold <t>）` or '
+                       '`board-policy は無効です: 全員の有効署名が揃っていない'
+                       'か、形式が不正です`)'], info
+    n, t = int(m.group(1)), int(m.group(2))
+    if n < 1:
+        return False, [f'line 1: inconsistent counts '
+                       f'(eligible {n} — n >= 1 required)'], info
+    if not (1 <= t <= n):
+        return False, [f'line 1: inconsistent counts '
+                       f'(threshold {t} — 1 <= t <= n (n={n}) required)'], info
+    info.append(f'verdict: valid, eligible={n}, threshold={t}')
+    return (not errs), errs, info
+
+
+def check_verify_board_policy_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_verify_board_policy_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -8194,6 +8319,183 @@ def selftest() -> int:
           f'passed ---')
     fails += bps_fails
 
+    # ---------- check_verify_board_policy: verify_board_policy report consistency
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_board_policy + cmd_board_policy_sign + cmd_verify_board_policy
+    # (offline: 3 real key pairs, temp keyfiles — a partially signed 1/3
+    # policy (invalid, exit 1), the fully signed 3/3 policy (valid, exit
+    # 0), and a signature-stripped tampered policy (invalid, exit 1) —
+    # exact stdout+exit matches); hand-mutated reports that break the
+    # one-line grammar (or the n >= 1 / 1 <= t <= n arithmetic rules)
+    # must be rejected, as must the sibling board-policy reports
+    # (creation, board_policy_sign).
+    vbp_fails = 0
+    _vbp_secs = [_key()[0] for _ in range(3)]
+    _vbp_npbs = [nakama.npub_of(s) for s in _vbp_secs]
+    _vbp_valid = 'board-policy は有効です: eligible 3 名全員の署名を確認（threshold 2）\n'
+    _vbp_invalid = ('board-policy は無効です: 全員の有効署名が揃っていないか、'
+                    '形式が不正です\n')
+
+    def _vbp_setup(tmpd):
+        kfs = []
+        for i, s in enumerate(_vbp_secs):
+            kf = os.path.join(tmpd, f'key{i}.json')
+            with open(kf, 'w') as f:
+                json.dump({'secret_hex': s.hex()}, f)
+            kfs.append(kf)
+        pol = os.path.join(tmpd, 'vbp-policy.json')
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            nakama.cmd_board_policy(SimpleNamespace(
+                board_id='nakama-vbp', relay='wss://example.invalid',
+                threshold=2, eligible=_vbp_npbs, out=pol,
+                keyfile=kfs[0], markdown=False))
+        return pol, kfs
+
+    def _vbp_verify(pol):
+        buf = io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                nakama.cmd_verify_board_policy(SimpleNamespace(policy=pol))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        return buf.getvalue(), code
+
+    _vbp_e2e = []
+    with tempfile.TemporaryDirectory() as _vbp_td:
+        _vbp_pol, _vbp_kfs = _vbp_setup(_vbp_td)
+        _rep, _code = _vbp_verify(_vbp_pol)
+        _vbp_e2e.append(('partial 1/3 -> invalid', _rep, _code, 1,
+                         _vbp_invalid))
+        for _kf in (_vbp_kfs[1], _vbp_kfs[2]):
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    nakama.cmd_board_policy_sign(SimpleNamespace(
+                        policy=_vbp_pol, out=None, keyfile=_kf))
+                except SystemExit:
+                    pass
+        _rep, _code = _vbp_verify(_vbp_pol)
+        _vbp_e2e.append(('complete 3/3 -> valid', _rep, _code, 0,
+                         _vbp_valid))
+        with open(_vbp_pol) as _f:
+            _tampered = json.load(_f)
+        _tampered['signatures'] = _tampered['signatures'][:-1]  # strip one
+        _tpol = os.path.join(_vbp_td, 'vbp-policy-tampered.json')
+        with open(_tpol, 'w') as _f:
+            json.dump(_tampered, _f)
+        _rep, _code = _vbp_verify(_tpol)
+        _vbp_e2e.append(('signature stripped -> invalid', _rep, _code, 1,
+                         _vbp_invalid))
+    for name, rep, code, want_code, want_rep in _vbp_e2e:
+        exact = (rep == want_rep) and (code == want_code)
+        ok, errs, info = conform_verify_board_policy_report(rep)
+        good = exact and ok
+        print(f'verify-board-policy-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        if not good:
+            if not exact:
+                print(f'    - stdout/exit mismatch: {rep!r} code={code}')
+            for e in errs:
+                print(f'    - {e}')
+            vbp_fails += 1
+
+    # hand-crafted positives
+    vbp_pos = [
+        ('valid 3/2',
+         'board-policy は有効です: eligible 3 名全員の署名を確認'
+         '（threshold 2）\n'),
+        ('valid 1/1 (t == n allowed)',
+         'board-policy は有効です: eligible 1 名全員の署名を確認'
+         '（threshold 1）\n'),
+        ('valid 2/1 (t < n allowed)',
+         'board-policy は有効です: eligible 2 名全員の署名を確認'
+         '（threshold 1）\n'),
+        ('invalid fixed line',
+         'board-policy は無効です: 全員の有効署名が揃っていないか、'
+         '形式が不正です\n'),
+        ('no trailing newline (valid)',
+         'board-policy は有効です: eligible 3 名全員の署名を確認'
+         '（threshold 2）'),
+        ('trailing blanks (invalid)',
+         'board-policy は無効です: 全員の有効署名が揃っていないか、'
+         '形式が不正です\n\n\n'),
+    ]
+    for name, rep in vbp_pos:
+        ok, errs, info = conform_verify_board_policy_report(rep)
+        print(f'verify-board-policy/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        vbp_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    _vbp_creation = ('board-policy 案: x.json — あなたの署名 1/3'
+                     '（初回は全員 3/3 の署名が必要）\n'
+                     '運用: このファイルを eligible 全員に回覧し、'
+                     '`board_policy_sign` で署名を集めてください。\n')
+    _vbp_sign = ('board-policy: x.json — 署名 2/3'
+                 '（まだ全員分が揃っていません）\n')
+    vbp_neg = []
+    vbp_neg.append(('empty report', ''))
+    vbp_neg.append(('garbage line', 'hello\n'))
+    vbp_neg.append(('two reports concatenated',
+                    'board-policy は無効です: 全員の有効署名が揃っていないか、'
+                    '形式が不正です\n'
+                    'board-policy は有効です: eligible 3 名全員の署名を確認'
+                    '（threshold 2）\n'))
+    vbp_neg.append(('valid, eligible 0 (self-contradiction)',
+                    'board-policy は有効です: eligible 0 名全員の署名を確認'
+                    '（threshold 0）\n'))
+    vbp_neg.append(('valid, threshold 0',
+                    'board-policy は有効です: eligible 3 名全員の署名を確認'
+                    '（threshold 0）\n'))
+    vbp_neg.append(('valid, threshold > n (self-contradiction)',
+                    'board-policy は有効です: eligible 3 名全員の署名を確認'
+                    '（threshold 4）\n'))
+    vbp_neg.append(('counts non-numeric',
+                    'board-policy は有効です: eligible a 名全員の署名を確認'
+                    '（threshold 2）\n'))
+    vbp_neg.append(('valid suffix typo',
+                    'board-policy は有効です: eligible 3 名全員の署名を確認'
+                    '（threshold 2）\n'.replace('確認', '確認済み')))
+    vbp_neg.append(('invalid suffix typo',
+                    'board-policy は無効です: 全員の有効署名が揃っていないか、'
+                    '形式が不正である\n'))
+    vbp_neg.append(('english valid',
+                    'board-policy is valid: eligible 3 all signed '
+                    '(threshold 2)\n'))
+    vbp_neg.append(('invalid prefixed differently',
+                    'board-policy は有効ではありません: 全員の有効署名が'
+                    '揃っていないか、形式が不正です\n'))
+    vbp_neg.append(('board_policy creation report (different grammar)',
+                    _vbp_creation))
+    vbp_neg.append(('board_policy_sign report (different grammar)',
+                    _vbp_sign))
+    vbp_neg.append(('valid line + extra line',
+                    'board-policy は有効です: eligible 3 名全員の署名を確認'
+                    '（threshold 2）\nextra\n'))
+    vbp_neg.append(('missing closing paren',
+                    'board-policy は有効です: eligible 3 名全員の署名を確認'
+                    '（threshold 2\n'))
+    vbp_neg.append(('leading blank line',
+                    '\nboard-policy は有効です: eligible 3 名全員の署名を確認'
+                    '（threshold 2）\n'))
+    for name, rep in vbp_neg:
+        ok, _errs, _info = conform_verify_board_policy_report(rep)
+        good = not ok
+        print(f'verify-board-policy-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            vbp_fails += 1
+
+    vbp_total = len(_vbp_e2e) + len(vbp_pos) + len(vbp_neg)
+    print(f'--- verify-board-policy {vbp_total - vbp_fails}/{vbp_total} '
+          f'passed ---')
+    fails += vbp_fails
+
     # ---------- check_board_read: board_read report consistency ----------
     # Reference reports are produced in-process with nakama.py's own
     # cmd_board_read, with nostr_request monkeypatched to return crafted
@@ -11501,7 +11803,7 @@ def selftest() -> int:
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
         + bj_total + bs_total + bc_total + vbd_total + bvr_total \
         + bdc_total + bcs_total + dmr_total + vrt_total + bpl_total \
-        + bps_total
+        + bps_total + vbp_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -11813,6 +12115,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_board_policy_sign_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_verify_board_policy':
+        if len(argv) < 3:
+            print('usage: conformance.py check_verify_board_policy '
+                  '<report.txt> [...]')
+            return 2
+        return check_verify_board_policy_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -11861,6 +12169,7 @@ def main(argv: list[str]) -> int:
           'check_verify_rotation <report.txt> [...] | '
           'check_board_policy <report.txt> [...] | '
           'check_board_policy_sign <report.txt> [...] | '
+          'check_verify_board_policy <report.txt> [...] | '
           'selftest')
     return 2
 
