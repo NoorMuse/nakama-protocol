@@ -75,3 +75,7 @@
 - selftest 20/20（新規: 実 CLI の in-process E2E 5（in-process 署名の binding — 有効（stdout＋exit 0 完全一致）・platform/handle 一致指定の有効・handle 改ざんの無効（exit 1）・platform 不一致（stderr 警告＋無効、exit 1）・handle 不一致（stderr 警告＋無効、exit 1）、各 stdout＋exit コード完全一致確認）＋正常 craft 4（有効・無効・末尾空行・改行なし）＋却下 11: 空テキスト・2 レポート連結・3 行・無効時の運用手順行・運用手順行の切詰め・余計な接尾辞・未知の判定行・判定行の接尾辞・英語判定・先頭空行・運用手順行の先行）、selftest 総計 541/541 PASS、全 21 テストファイル回帰 PASS。
 - ロードマップ §7 に v0.53 を追加。spec §8.8 に verify_binding レポートの表示文法を固定。
 - 外部 push なし（run 開始時 remote HEAD=seen_refs=8832a32）。
+- 2026-10-02: v0.54 完了 — conformance チェッカー第 32 弾 `check_verify_unbinding`（ローカル出力チェッカー第 17 弾）。`nakama.py verify_unbinding` の stdout（§9.1.1 に表示文法を固定: 第 1 行は判定行 `unbinding は有効です` / `unbinding は無効です` のいずれかに完全一致、第 2 行は有効時のみ `（運用手順）: 取り消し対象の binding がこの unbinding の binding_created_at 以前であることを確認してください` に完全一致（無効時の 2 行目は却下）、末尾の空行は許容）の内部整合性チェッカー。検証: 判定二語彙の完全一致・運用手順行は有効時のみ・1〜2 行。対象外を明示 — 判定の真偽（`verify_unbinding_cert` の管轄）、platform / handle 一致の真偽（不一致警告は stderr のため保存レポートに現れない）、stderr、exit コード。
+- selftest 20/20（新規: 実 CLI の in-process E2E 5（in-process 署名の unbinding — 有効（stdout＋exit 0 完全一致）・platform/handle 一致指定の有効・handle 改ざんの無効（exit 1）・platform 不一致（stderr 警告＋無効、exit 1）・handle 不一致（stderr 警告＋無効、exit 1）、各 stdout＋exit コード完全一致確認）＋正常 craft 4（有効・無効・末尾空行・改行なし）＋却下 11: 空テキスト・2 レポート連結・3 行・無効時の運用手順行・運用手順行の切詰め・余計な接尾辞・未知の判定行・判定行の接尾辞・英語判定・先頭空行・運用手順行の先行）、selftest 総計 561/561 PASS、全 21 テストファイル回帰 PASS。
+- ロードマップ §7 に v0.54 を追加。spec §9.1.1 に verify_unbinding レポートの表示文法を固定。
+- 外部 push なし（run 開始時 remote HEAD=seen_refs=a3f14b1）。

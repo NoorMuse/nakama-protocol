@@ -214,6 +214,26 @@ report.
 `check_verify_binding` with reports produced in-process by
 nakama.py's own `cmd_verify_binding`.
 
+Verify-unbinding report conformance:
+
+    python3 conformance.py check_verify_unbinding <report1.txt> [...]
+
+Verifies a saved `nakama.py verify_unbinding` stdout report is
+internally consistent (spec §9.1.1): one or two lines — the verdict
+line `unbinding は有効です` / `unbinding は無効です`, plus, only
+with the valid verdict, the operational note
+`（運用手順）: 取り消し対象の binding がこの unbinding の
+binding_created_at 以前であることを確認してください`.
+Explicitly out of scope: verdict truth (`verify_unbinding_cert`'s
+territory), platform/handle match truth (mismatch warnings go to
+stderr, so saved stdout reports never show them), stderr, and the
+exit code (invisible in saved stdout). Use this to prove a second
+implementation's `verify_unbinding` CLI prints a compatible report.
+
+`python3 conformance.py selftest` also covers
+`check_verify_unbinding` with reports produced in-process by
+nakama.py's own `cmd_verify_unbinding`.
+
 Compromise declaration conformance:
 
     python3 conformance.py check_compromise <decl1.json> [...]
@@ -4290,6 +4310,87 @@ def check_verify_binding_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_verify_unbinding: verify_unbinding report consistency ----------
+
+# `nakama.py verify_unbinding <unbinding.json> [--platform <name> --handle <name>]`
+# prints a short report to stdout whose grammar is fixed (spec §9.1.1):
+# one line when the unbinding is invalid, two lines when it is valid:
+#   unbinding は有効です
+#   （運用手順）: 取り消し対象の binding がこの unbinding の binding_created_at 以前であることを確認してください
+# or
+#   unbinding は無効です
+# check_verify_unbinding verifies that a saved report is internally
+# consistent. The first line is one of the two fixed verdict words; the
+# second (operational) line is only ever present with the valid verdict.
+# Explicitly out of scope: whether the verdict is right (that's
+# verify_unbinding_cert's territory — signature/platform/handle content),
+# platform/handle match truth (the mismatch warnings go to stderr, so a
+# saved stdout report never shows them), stderr in general, and the
+# exit code (invisible in saved stdout). Use this to prove a second
+# implementation's `verify_unbinding` CLI prints a compatible report.
+
+_VU_VALID = 'unbinding は有効です'
+_VU_INVALID = 'unbinding は無効です'
+_VU_NOTE = ('（運用手順）: 取り消し対象の binding がこの unbinding の '
+            'binding_created_at 以前であることを確認してください')
+
+
+def conform_verify_unbinding_report(text: str):
+    """Verify a saved `nakama.py verify_unbinding` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) not in (1, 2):
+        return False, [f'report must be one or two lines, '
+                       f'got {len(lines)}'], info
+    verdict = lines[0]
+    if verdict == _VU_VALID:
+        info.append('verdict: valid')
+    elif verdict == _VU_INVALID:
+        info.append('verdict: invalid')
+    else:
+        return False, ['line 1: not a verify_unbinding verdict line '
+                       '(`unbinding は有効です` / `unbinding は無効です`)'], info
+    if len(lines) == 2:
+        if verdict != _VU_VALID:
+            return False, ['line 2: operational note only allowed '
+                           'with a valid verdict'], info
+        if lines[1] != _VU_NOTE:
+            return False, ['line 2: not the fixed operational note '
+                           '(`（運用手順）: 取り消し対象の binding がこの '
+                           'unbinding の binding_created_at 以前であること'
+                           'を確認してください`)'], info
+        info.append('operational note present')
+    return True, errs, info
+
+
+def check_verify_unbinding_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_verify_unbinding_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 def _key() -> tuple[bytes, str]:
     s = secrets.token_bytes(32)
     return s, nakama.npub_of(s)
@@ -8278,6 +8379,113 @@ def selftest() -> int:
     print(f'--- verify-binding {vb_total - vb_fails}/{vb_total} passed ---')
     fails += vb_fails
 
+    vu_fails = 0
+
+    def _vu_run(tmpd, unbinding_dict, platform=None, handle=None):
+        ufp = os.path.join(tmpd, 'unbinding.json')
+        with open(ufp, 'w') as f:
+            json.dump(unbinding_dict, f, ensure_ascii=False)
+        buf = io.StringIO()
+        code = 0
+        args = SimpleNamespace(unbinding=ufp, platform=platform,
+                               handle=handle)
+        with contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                nakama.cmd_verify_unbinding(args)
+            except SystemExit as e:
+                code = e.code
+        return buf.getvalue(), code
+
+    vu_e2e = []
+    with tempfile.TemporaryDirectory() as tmpd:
+        _vus, _vunp = _key()
+        _vu_time = 1759280000
+        _vu_msg = nakama.unbinding_message('moltbook', 'alex', _vunp,
+                                           _vu_time - 100, 'handle change',
+                                           _vu_time)
+        _unbinding = {'protocol': 'nakama', 'version': 1,
+                      'type': 'platform-binding-revocation',
+                      'platform': 'moltbook', 'handle': 'alex',
+                      'npub': _vunp,
+                      'binding_created_at': _vu_time - 100,
+                      'reason': 'handle change', 'created_at': _vu_time,
+                      'sig': nakama.sign_schnorr(_vus, _vu_msg).hex()}
+        _vu_valid = (_VU_VALID + '\n' + _VU_NOTE + '\n')
+        _vu_invalid = (_VU_INVALID + '\n')
+        _vu_tampered = dict(_unbinding, handle='someone_else')
+        for name, kw, exp_text, exp_code, exp_ok in (
+                ('valid minimal', {'unbinding_dict': _unbinding},
+                 _vu_valid, 0, True),
+                ('valid with platform/handle match',
+                 {'unbinding_dict': _unbinding, 'platform': 'moltbook',
+                  'handle': 'alex'}, _vu_valid, 0, True),
+                ('tampered handle (invalid)',
+                 {'unbinding_dict': _vu_tampered}, _vu_invalid, 1, True),
+                ('platform mismatch (stderr warn, invalid)',
+                 {'unbinding_dict': _unbinding, 'platform': 'the-colony'},
+                 _vu_invalid, 1, True),
+                ('handle mismatch (stderr warn, invalid)',
+                 {'unbinding_dict': _unbinding, 'handle': 'not_alex'},
+                 _vu_invalid, 1, True)):
+            text, code = _vu_run(tmpd, **kw)
+            ok, errs, info = conform_verify_unbinding_report(text)
+            good = (ok == exp_ok) and text == exp_text and code == exp_code
+            print(f'check_verify_unbinding e2e {name}: '
+                  f'{"PASS" if good else "FAIL"}')
+            for e in errs:
+                if exp_ok:
+                    print(f'    - {e}')
+            if not good and exp_ok and not errs:
+                print(f'    - stdout/exit mismatch: {text!r} '
+                      f'(exit {code}), expected {exp_text!r} '
+                      f'(exit {exp_code})')
+            vu_fails += 0 if good else 1
+            vu_e2e.append(name)
+
+    vu_pos = [
+        ('valid minimal', _VU_VALID + '\n' + _VU_NOTE + '\n'),
+        ('invalid minimal', _VU_INVALID + '\n'),
+        ('trailing blank lines', _VU_VALID + '\n' + _VU_NOTE + '\n\n'),
+        ('no trailing newline', _VU_INVALID),
+    ]
+    vu_neg = [
+        ('empty text', ''),
+        ('two reports concatenated',
+         _VU_VALID + '\n' + _VU_NOTE + '\n' + _VU_INVALID + '\n'),
+        ('three lines', _VU_VALID + '\n' + _VU_NOTE + '\nゴミ行\n'),
+        ('operational note on invalid verdict',
+         _VU_INVALID + '\n' + _VU_NOTE + '\n'),
+        ('note truncated',
+         _VU_VALID + '\n（運用手順）: 取り消し対象の binding を確認してください\n'),
+        ('note with extra suffix',
+         _VU_VALID + '\n' + _VU_NOTE + '（追記）\n'),
+        ('unknown verdict', 'unbinding は確認中です\n'),
+        ('verdict with extra suffix', _VU_VALID + '（要確認）\n'),
+        ('verdict lowercase latin', 'unbinding is valid\n'),
+        ('leading blank line', '\n' + _VU_INVALID + '\n'),
+        ('note before verdict', _VU_NOTE + '\n' + _VU_VALID + '\n'),
+    ]
+    for name, rep in vu_pos:
+        ok, errs, info = conform_verify_unbinding_report(rep)
+        good = ok
+        print(f'check_verify_unbinding pos {name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        vu_fails += 0 if good else 1
+    for name, rep in vu_neg:
+        ok, _errs, _info = conform_verify_unbinding_report(rep)
+        good = not ok
+        print(f'check_verify_unbinding neg {name}: '
+              f'{"PASS" if good else "FAIL"}')
+        if not good:
+            print(f'    - report wrongly accepted')
+        vu_fails += 0 if good else 1
+    vu_total = len(vu_e2e) + len(vu_pos) + len(vu_neg)
+    print(f'--- verify-unbinding {vu_total - vu_fails}/{vu_total} passed ---')
+    fails += vu_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -8287,7 +8495,7 @@ def selftest() -> int:
         + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total \
         + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total \
         + bfa_total + pub_total + gov_total + rf_total + rtf_total \
-        + cf_total + lv_total + lr_total + vb_total
+        + cf_total + lv_total + lr_total + vb_total + vu_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -8522,6 +8730,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_verify_binding_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_verify_unbinding':
+        if len(argv) < 3:
+            print('usage: conformance.py check_verify_unbinding '
+                  '<report.txt> [...]')
+            return 2
+        return check_verify_unbinding_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -8557,6 +8771,7 @@ def main(argv: list[str]) -> int:
           'check_liveness_verify <report.txt> [...] | '
           'check_liveness_report <report.txt> [...] | '
           'check_verify_binding <report.txt> [...] | '
+          'check_verify_unbinding <report.txt> [...] | '
           'selftest')
     return 2
 
