@@ -843,6 +843,39 @@ a partial 1/3 policy (invalid, exit 1), the fully signed 3/3 policy
 (valid, exit 0), and a tampered policy (invalid, exit 1), each with
 exact stdout+exit matches).
 
+Verify report conformance:
+
+    python3 conformance.py check_verify <report1.txt> [...]
+
+Verifies a saved `nakama.py verify` stdout report is internally
+consistent (spec §2.3.1): one line per companion (>= 1) —
+`<npub[:24]>... : 有効 | 無効/欠落` with an optional rotation note
+`  (鍵は <npub[:24]>... へローテーション済み — 署名自体は旧鍵のまま有効)` —
+then exactly one of: `bond は有効です 🤝` (all valid), `bond は無効です`
+(some invalid), the 2-line expiry block
+(`bond の有効期限が切れています（期限: YYYY-MM-DD）` +
+`bond は無効です — `renew` で更新してください`, no final verdict line),
+or the 2-line warn block followed by the valid verdict. After the valid
+verdict, the registry-revocation pair may follow
+(`⚠ ただしこの bond は解消されています: <npub[:24]>... が YYYY-MM-DD
+に解消を宣言` + `bond は無効です`). Consistency rules: any 無効/欠落
+companion forces the plain invalid verdict and forbids the expiry/warn/
+revocation lines; the expiry block requires all companions 有効 and ends
+the report; dates are YYYY-MM-DD shape-checked only. Trailing blank
+lines tolerated; a leading blank line is rejected. Explicitly out of
+scope: the verdict's truth (`verify_schnorr` / the bond cert —
+`check_bond`'s territory), npub truth, rotation-note truth, expiry date
+truth (local time), stderr, and the exit code (invisible in saved stdout
+text). The `verify_binding` report (§8.8) is a different grammar — the
+two checkers reject each other's reports. Use this to prove a second
+implementation's `verify` CLI prints a compatible report.
+
+`python3 conformance.py selftest` also covers `check_verify` with
+reports produced in-process by nakama.py's own `cmd_verify` (offline:
+real key pairs — a valid 2-companion bond, a signature-stripped bond, an
+expired bond, an expiry-approaching bond, a rotated companion, and a
+registry-revoked bond, each with exact stdout+exit matches).
+
 Board-read report conformance:
 
     python3 conformance.py check_board_read <report1.txt> [...]
@@ -4309,6 +4342,205 @@ def check_verify_board_policy_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_verify_board_policy_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_verify: verify (bond verification) report consistency ----------
+
+# A saved `nakama.py verify` stdout report. Its grammar is fixed (spec
+# §2.3.1). check_verify verifies that the report is internally consistent.
+# One line per companion (>= 1):
+#   <npub[:24]>... : 有効 | 無効/欠落
+#     [  (鍵は <npub[:24]>... へローテーション済み — 署名自体は旧鍵のまま有効)]
+# then exactly one of:
+#   (a) bond は有効です 🤝                                  (all valid — exit 0)
+#   (b) bond は無効です                                    (some invalid — exit 1)
+#   (c) bond の有効期限が切れています（期限: YYYY-MM-DD）
+#       bond は無効です — `renew` で更新してください            (expired — exit 1,
+#       no final verdict line)
+# The warn variant: (a) may be preceded by the two warning lines:
+#   ⚠ bond の有効期限が近づいています（期限: YYYY-MM-DD）
+#     `renew` で更新し、更新後 `liveness --bond` で生存証明を取り直すと良いでしょう
+# and (a) may be followed by the registry-revocation pair:
+#   ⚠ ただしこの bond は解消されています: <npub[:24]>... が YYYY-MM-DD に解消を宣言
+#   bond は無効です
+# Internal consistency rules: the npub prefix is 24 non-space chars (bech32 —
+# the same convention as the other checkers); the rotation note may only
+# appear on a companion line, verbatim; any 無効/欠落 companion forces the
+# final line (b) and forbids the expiry/warn/revocation lines; the expiry
+# 2-line block requires all companions 有効 (the reference CLI checks expiry
+# only while ok is still True) and is NOT followed by a final verdict line;
+# the warn 2-line block is always followed by (a); the revocation 2-line
+# block may only follow (a), and its last line is the plain `bond は無効です`
+# (distinct from the expiry block's `bond は無効です — `renew` で更新してください`).
+# Dates are YYYY-MM-DD shape-checked only (the value is the checker's local
+# time — its truth is out of scope). Trailing blank lines tolerated; a
+# leading blank line is rejected.
+# Explicitly out of scope: the verdict's truth (verify_schnorr / the bond
+# cert — check_bond's territory), npub truth, rotation-note truth, expiry
+# date truth (local time), stderr (§14.2 compromise warnings, the registry
+# failure note), and the exit code (invisible in saved stdout text). The
+# `verify_binding` report (§8.8, `binding は有効です` ...) is a different
+# grammar — the two checkers reject each other's reports. Use this to prove a
+# second implementation's `verify` CLI prints a compatible report.
+
+_RE_VERIFY_COMPANION = re.compile(
+    r'^(\S{24})\.\.\. : (有効|無効/欠落)'
+    r'(  \(鍵は (\S{24})\.\.\. へローテーション済み — 署名自体は旧鍵のまま有効\))?$')
+_RE_VERIFY_REVOKED = re.compile(
+    r'^⚠ ただしこの bond は解消されています: (\S{24})\.\.\. が '
+    r'(\d{4})-(\d{2})-(\d{2}) に解消を宣言$')
+_VRF_VALID = 'bond は有効です 🤝'
+_VRF_INVALID = 'bond は無効です'
+_VRF_EXPIRY_1 = 'bond の有効期限が切れています（期限: '
+_VRF_EXPIRY_2 = 'bond は無効です — `renew` で更新してください'
+_VRF_WARN_1 = '⚠ bond の有効期限が近づいています（期限: '
+_VRF_WARN_2 = ('  `renew` で更新し、更新後 `liveness --bond` '
+               'で生存証明を取り直すと良いでしょう')
+
+
+def _vrf_date_ok(y: str, mo: str, d: str) -> bool:
+    return 1 <= int(mo) <= 12 and 1 <= int(d) <= 31
+
+
+def conform_verify_report(text: str):
+    """Verify a saved `nakama.py verify` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    i = 0
+    invalid = 0
+    while i < len(lines) and _RE_VERIFY_COMPANION.match(lines[i]):
+        m = _RE_VERIFY_COMPANION.match(lines[i])
+        if m.group(2) == '無効/欠落':
+            invalid += 1
+        i += 1
+    n_comp = i
+    if n_comp == 0:
+        return False, ['line 1: not a verify companion line '
+                       '(`<npub24>... : 有効|無効/欠落` ...)'], info
+    rest = lines[i:]
+    if not rest:
+        return False, [f'line {i + 1}: report ends after the companion '
+                       'lines — no verdict'], info
+    first = rest[0]
+
+    def _paren_date(prefix: str, line: str):
+        # '…（期限: YYYY-MM-DD）' -> date string or None
+        if not (line.startswith(prefix) and line.endswith('）')):
+            return None
+        d = line[len(prefix):-1]
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', d):
+            return None
+        return d
+
+    if first.startswith(_VRF_EXPIRY_1):
+        # expired: all companions must be 有効, exactly 2 lines, no verdict
+        if invalid:
+            errs.append(f'line {i + 1}: expiry block with {invalid} '
+                        '無効/欠落 companion(s) — the reference CLI checks '
+                        'expiry only while all signatures are valid')
+        d = _paren_date(_VRF_EXPIRY_1, first)
+        if d is None:
+            errs.append(f'line {i + 1}: malformed expiry date '
+                        '(expected `…（期限: YYYY-MM-DD）`)')
+        elif not _vrf_date_ok(*d.split('-')):
+            errs.append(f'line {i + 1}: impossible expiry date {d}')
+        if len(rest) != 2 or rest[1] != _VRF_EXPIRY_2:
+            errs.append(f'line {i + 2}: the expiry block is exactly 2 lines '
+                        '(`bond の有効期限が切れています（期限: …）` + '
+                        '`bond は無効です — `renew` で更新してください`), '
+                        'with no final verdict line')
+        info.append(f'companions={n_comp}, verdict: expired')
+        return (not errs), errs, info
+
+    j = 0
+    if first.startswith(_VRF_WARN_1):
+        # warn block: always followed by the valid verdict
+        d = _paren_date(_VRF_WARN_1, first)
+        if d is None:
+            errs.append(f'line {i + 1}: malformed warn date '
+                        '(expected `…（期限: YYYY-MM-DD）`)')
+        elif not _vrf_date_ok(*d.split('-')):
+            errs.append(f'line {i + 1}: impossible warn date {d}')
+        if invalid:
+            errs.append(f'line {i + 1}: warn block with {invalid} '
+                        '無効/欠落 companion(s) — the reference CLI warns '
+                        'only while all signatures are valid')
+        if len(rest) < 2 or rest[1] != _VRF_WARN_2:
+            errs.append(f'line {i + 2}: the warn block is exactly 2 lines '
+                        'followed by the valid verdict line')
+            return False, errs, info
+        j = 2
+        info.append('warn: expiry approaching')
+    if j >= len(rest):
+        return False, [f'line {i + j + 1}: missing verdict line'], info
+    verdict = rest[j]
+    if verdict == _VRF_VALID:
+        if invalid:
+            errs.append(f'line {i + j + 1}: verdict `{_VRF_VALID}` with '
+                        f'{invalid} 無効/欠落 companion(s) — inconsistent')
+        info.append(f'companions={n_comp}, verdict: valid')
+    elif verdict == _VRF_INVALID:
+        if not invalid:
+            errs.append(f'line {i + j + 1}: verdict `{_VRF_INVALID}` with all '
+                        'companions 有効 — inconsistent (no expiry or '
+                        'revocation block present)')
+        info.append(f'companions={n_comp}, invalid={invalid}, verdict: invalid')
+    else:
+        return False, [f'line {i + j + 1}: not a verify verdict line '
+                       f'(`{_VRF_VALID}` / `{_VRF_INVALID}`)'], info
+    tail = rest[j + 1:]
+    if not tail:
+        return (not errs), errs, info
+    # optional registry-revocation pair, only after the valid verdict
+    if verdict != _VRF_VALID:
+        errs.append(f'line {i + j + 2}: lines after the invalid verdict — '
+                    'the revocation pair may only follow the valid verdict')
+        return False, errs, info
+    if len(tail) != 2 or tail[1] != _VRF_INVALID:
+        errs.append(f'line {i + j + 2}: after the valid verdict only the '
+                    'registry-revocation pair is allowed '
+                    '(`⚠ ただしこの bond は解消されています: …` + '
+                    f'`{_VRF_INVALID}`)')
+        return False, errs, info
+    m = _RE_VERIFY_REVOKED.match(tail[0])
+    if not m:
+        return False, [f'line {i + j + 2}: malformed revocation line '
+                       '(expected `⚠ ただしこの bond は解消されています: '
+                       '<npub24>... が YYYY-MM-DD に解消を宣言`)'], info
+    if not _vrf_date_ok(m.group(2), m.group(3), m.group(4)):
+        errs.append(f'line {i + j + 2}: impossible revocation date')
+    info.append('verdict: revoked-in-registry')
+    return (not errs), errs, info
+
+
+def check_verify_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_verify_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -8496,6 +8728,266 @@ def selftest() -> int:
           f'passed ---')
     fails += vbp_fails
 
+    # ---------- check_verify: verify report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_verify (offline: real key pairs — a valid 2-companion bond (exit
+    # 0), a signature-stripped bond (invalid, exit 1), an expired bond
+    # (expiry 2-line block, exit 1, no final verdict), an expiry-approaching
+    # bond (warn 2-line block + valid verdict, exit 0), a rotated companion
+    # (rotation note on one companion line, exit 0), and a registry-revoked
+    # bond (revocation pair after the valid verdict, exit 1) — exact
+    # stdout+exit matches); hand-mutated reports that break the grammar or
+    # the consistency rules (verdict mismatch, expiry block with an invalid
+    # companion, warn/revocation blocks in the wrong position) must be
+    # rejected, as must the sibling `verify_binding` report.
+    vrf_fails = 0
+    _vrf_sa, _vrf_npa = _key()
+    _vrf_sb, _vrf_npb = _key()
+    _vrf_sn, _vrf_npn = _key()  # rotation target for _vrf_npa
+
+    def _vrf_setup(tmpd, expires_at=None, strip_sig=False, rotation=False):
+        comps = sorted([_vrf_npa, _vrf_npb])
+        nonce = secrets.token_hex(32)
+        msg = nakama.bond_message(comps, 1700000000, nonce, expires_at)
+        bond = {'protocol': 'nakama', 'version': 1, 'companions': comps,
+                'created_at': 1700000000,
+                'nonce': nonce,
+                'signatures': {
+                    _vrf_npa: nakama.sign_schnorr(_vrf_sa, msg).hex(),
+                    _vrf_npb: nakama.sign_schnorr(_vrf_sb, msg).hex()}}
+        if expires_at is not None:
+            bond['expires_at'] = expires_at
+        if strip_sig:
+            del bond['signatures'][comps[1]]
+        bp = os.path.join(tmpd, 'bond.json')
+        with open(bp, 'w') as f:
+            json.dump(bond, f)
+        rot = None
+        if rotation:
+            rmsg = nakama.rotation_message(_vrf_npa, _vrf_npn, 1700000000)
+            rot = {'protocol': 'nakama', 'version': 1, 'type': 'rotation',
+                   'old_npub': _vrf_npa, 'new_npub': _vrf_npn,
+                   'created_at': 1700000000,
+                   'old_sig': nakama.sign_schnorr(_vrf_sa, rmsg).hex()}
+            rp = os.path.join(tmpd, 'rotation.json')
+            with open(rp, 'w') as f:
+                json.dump(rot, f)
+            rot = [rp]
+        return bond, bp, comps, rot
+
+    def _vrf_run(bp, registry=None, skip_registry=True, skip_expiry=True,
+                 rotation=None, creg=None):
+        buf = io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                nakama.cmd_verify(SimpleNamespace(
+                    bond=bp, rotation=rotation or [], registry=registry,
+                    skip_registry=skip_registry, skip_expiry=skip_expiry,
+                    compromise_registry=creg or os.devnull))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        return buf.getvalue(), code
+
+    _vrf_e2e = []
+    with tempfile.TemporaryDirectory() as _vrf_td:
+        _vrf_creg = os.path.join(_vrf_td, 'creg')
+        os.makedirs(_vrf_creg)
+        # 1. valid bond, no expiry
+        _vb, _vbp, _vc, _ = _vrf_setup(_vrf_td)
+        _rep, _code = _vrf_run(_vbp, creg=_vrf_creg)
+        _want = (f'{_vc[0][:24]}... : 有効\n'
+                 f'{_vc[1][:24]}... : 有効\n'
+                 'bond は有効です 🤝\n')
+        _vrf_e2e.append(('valid 2/2', _rep, _code, 0, _want))
+        # 2. signature stripped -> invalid
+        _vb2, _vbp2, _vc2, _ = _vrf_setup(_vrf_td, strip_sig=True)
+        _rep, _code = _vrf_run(_vbp2, creg=_vrf_creg)
+        _want = (f'{_vc2[0][:24]}... : 有効\n'
+                 f'{_vc2[1][:24]}... : 無効/欠落\n'
+                 'bond は無効です\n')
+        _vrf_e2e.append(('stripped sig -> invalid', _rep, _code, 1, _want))
+        # 3. expired bond
+        _vexp = 1000000000
+        _vb3, _vbp3, _vc3, _ = _vrf_setup(_vrf_td, expires_at=_vexp)
+        _rep, _code = _vrf_run(_vbp3, creg=_vrf_creg, skip_expiry=False)
+        _vdate = time.strftime('%Y-%m-%d', time.localtime(_vexp))
+        _want = (f'{_vc3[0][:24]}... : 有効\n'
+                 f'{_vc3[1][:24]}... : 有効\n'
+                 f'bond の有効期限が切れています（期限: {_vdate}）\n'
+                 'bond は無効です — `renew` で更新してください\n')
+        _vrf_e2e.append(('expired', _rep, _code, 1, _want))
+        # 4. expiry approaching -> warn block + valid verdict
+        _vwarn = int(time.time()) + 86400
+        _vb4, _vbp4, _vc4, _ = _vrf_setup(_vrf_td, expires_at=_vwarn)
+        _rep, _code = _vrf_run(_vbp4, creg=_vrf_creg, skip_expiry=False)
+        _wdate = time.strftime('%Y-%m-%d', time.localtime(_vwarn))
+        _want = (f'{_vc4[0][:24]}... : 有効\n'
+                 f'{_vc4[1][:24]}... : 有効\n'
+                 f'⚠ bond の有効期限が近づいています（期限: {_wdate}）\n'
+                 '  `renew` で更新し、更新後 `liveness --bond` '
+                 'で生存証明を取り直すと良いでしょう\n'
+                 'bond は有効です 🤝\n')
+        _vrf_e2e.append(('warn', _rep, _code, 0, _want))
+        # 5. rotated companion -> rotation note on one line
+        _vb5, _vbp5, _vc5, _vrot = _vrf_setup(_vrf_td, rotation=True)
+        _rep, _code = _vrf_run(_vbp5, creg=_vrf_creg, rotation=_vrot)
+        _rlines = []
+        for _c in _vc5:
+            _note = ''
+            if _c == _vrf_npa:
+                _note = (f'  (鍵は {_vrf_npn[:24]}... へローテーション済み — '
+                         '署名自体は旧鍵のまま有効)')
+            _rlines.append(f'{_c[:24]}... : 有効{_note}\n')
+        _want = ''.join(_rlines) + 'bond は有効です 🤝\n'
+        _vrf_e2e.append(('rotation note', _rep, _code, 0, _want))
+        # 6. registry-revoked bond
+        _vb6, _vbp6, _vc6, _ = _vrf_setup(_vrf_td)
+        _bh = nakama.bond_hash(_vb6)
+        _rc = 1700000001
+        _rmsg = nakama.revocation_message(_bh, _vrf_npa, _rc)
+        _rev = {'protocol': 'nakama', 'version': 1, 'type': 'revocation',
+                'bond_hash': _bh, 'revoker': _vrf_npa, 'created_at': _rc,
+                'sig': nakama.sign_schnorr(_vrf_sa, _rmsg).hex()}
+        _regd = os.path.join(_vrf_td, 'reg')
+        os.makedirs(_regd)
+        with open(nakama.revocation_registry_path(_regd, _bh), 'w') as _f:
+            json.dump(_rev, _f)
+        _rep, _code = _vrf_run(_vbp6, creg=_vrf_creg, registry=_regd,
+                              skip_registry=False)
+        _rdate = time.strftime('%Y-%m-%d', time.localtime(_rc))
+        _want = (f'{_vc6[0][:24]}... : 有効\n'
+                 f'{_vc6[1][:24]}... : 有効\n'
+                 'bond は有効です 🤝\n'
+                 f'⚠ ただしこの bond は解消されています: '
+                 f'{_vrf_npa[:24]}... が {_rdate} に解消を宣言\n'
+                 'bond は無効です\n')
+        _vrf_e2e.append(('revoked-in-registry', _rep, _code, 1, _want))
+    for _name, _rep, _code, _want_code, _want_rep in _vrf_e2e:
+        _exact = (_rep == _want_rep) and (_code == _want_code)
+        _ok, _errs, _info = conform_verify_report(_rep)
+        _good = _exact and _ok
+        print(f'verify-e2e/{_name}: '
+              f'{"PASS" if _good else "FAIL"} ("{"; ".join(_info)}")')
+        if not _good:
+            if not _exact:
+                print(f'    - stdout/exit mismatch: {_rep!r} code={_code}')
+                print(f'    - expected: {_want_rep!r} code={_want_code}')
+            for _e in _errs:
+                print(f'    - {_e}')
+            vrf_fails += 1
+
+    # hand-crafted positives
+    _np1 = 'npub1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    _np2 = 'npub1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+    _np3 = 'npub1cccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+    vrf_pos = [
+        ('valid 2/2', f'{_np1[:24]}... : 有効\n{_np2[:24]}... : 有効\n'
+         'bond は有効です 🤝\n'),
+        ('valid 2/2, trailing blanks', f'{_np1[:24]}... : 有効\n'
+         f'{_np2[:24]}... : 有効\nbond は有効です 🤝\n\n\n'),
+        ('valid 2/2, no trailing newline', f'{_np1[:24]}... : 有効\n'
+         f'{_np2[:24]}... : 有効\nbond は有効です 🤝'),
+        ('invalid 1/1', f'{_np1[:24]}... : 無効/欠落\nbond は無効です\n'),
+        ('mixed 2/3 invalid', f'{_np1[:24]}... : 有効\n'
+         f'{_np2[:24]}... : 無効/欠落\n{_np3[:24]}... : 有効\nbond は無効です\n'),
+        ('rotation note', f'{_np1[:24]}... : 有効  (鍵は {_np2[:24]}... '
+         'へローテーション済み — 署名自体は旧鍵のまま有効)\n'
+         f'{_np2[:24]}... : 有効\nbond は有効です 🤝\n'),
+        ('warn block', f'{_np1[:24]}... : 有効\n'
+         '⚠ bond の有効期限が近づいています（期限: 2026-11-01）\n'
+         '  `renew` で更新し、更新後 `liveness --bond` '
+         'で生存証明を取り直すと良いでしょう\nbond は有効です 🤝\n'),
+        ('expiry block', f'{_np1[:24]}... : 有効\n'
+         'bond の有効期限が切れています（期限: 2026-09-01）\n'
+         'bond は無効です — `renew` で更新してください\n'),
+        ('revocation pair', f'{_np1[:24]}... : 有効\nbond は有効です 🤝\n'
+         f'⚠ ただしこの bond は解消されています: {_np2[:24]}... '
+         'が 2026-10-01 に解消を宣言\nbond は無効です\n'),
+    ]
+    for _name, _rep in vrf_pos:
+        _ok, _errs, _info = conform_verify_report(_rep)
+        print(f'verify-pos/{_name}: '
+              f'{"PASS" if _ok else "FAIL"} ("{"; ".join(_info)}")')
+        if not _ok:
+            for _e in _errs:
+                print(f'    - {_e}')
+            vrf_fails += 1
+
+    # hand-crafted negatives (must be rejected)
+    vrf_neg = [
+        ('empty', ''),
+        ('garbage', 'hello\n'),
+        ('two reports concatenated',
+         f'{_np1[:24]}... : 有効\nbond は有効です 🤝\n'
+         f'{_np1[:24]}... : 有効\nbond は有効です 🤝\n'),
+        ('companion prefix short',
+         f'{_np1[:23]}... : 有効\nbond は有効です 🤝\n'),
+        ('companion prefix with space',
+         f'{_np1[:23]} ... : 有効\nbond は有効です 🤝\n'),
+        ('english verdict word',
+         f'{_np1[:24]}... : valid\nbond は有効です 🤝\n'),
+        ('valid verdict without emoji',
+         f'{_np1[:24]}... : 有効\nbond は有効です\n'),
+        ('all-valid but invalid verdict',
+         f'{_np1[:24]}... : 有効\nbond は無効です\n'),
+        ('invalid companion but valid verdict',
+         f'{_np1[:24]}... : 無効/欠落\nbond は有効です 🤝\n'),
+        ('expiry block with invalid companion',
+         f'{_np1[:24]}... : 無効/欠落\n'
+         'bond の有効期限が切れています（期限: 2026-09-01）\n'
+         'bond は無効です — `renew` で更新してください\n'),
+        ('expiry block followed by verdict',
+         f'{_np1[:24]}... : 有効\n'
+         'bond の有効期限が切れています（期限: 2026-09-01）\n'
+         'bond は無効です — `renew` で更新してください\nbond は有効です 🤝\n'),
+        ('expiry date malformed',
+         f'{_np1[:24]}... : 有効\n'
+         'bond の有効期限が切れています（期限: 2026-13-99）\n'
+         'bond は無効です — `renew` で更新してください\n'),
+        ('expiry 2nd line truncated',
+         f'{_np1[:24]}... : 有効\n'
+         'bond の有効期限が切れています（期限: 2026-09-01）\n'
+         'bond は無効です\n'),
+        ('warn block followed by invalid verdict',
+         f'{_np1[:24]}... : 有効\n'
+         '⚠ bond の有効期限が近づいています（期限: 2026-11-01）\n'
+         '  `renew` で更新し、更新後 `liveness --bond` '
+         'で生存証明を取り直すと良いでしょう\nbond は無効です\n'),
+        ('warn 2nd line altered',
+         f'{_np1[:24]}... : 有効\n'
+         '⚠ bond の有効期限が近づいています（期限: 2026-11-01）\n'
+         '  renew してください\nbond は有効です 🤝\n'),
+        ('revocation pair after invalid verdict',
+         f'{_np1[:24]}... : 無効/欠落\nbond は無効です\n'
+         f'⚠ ただしこの bond は解消されています: {_np2[:24]}... '
+         'が 2026-10-01 に解消を宣言\nbond は無効です\n'),
+        ('revocation line malformed',
+         f'{_np1[:24]}... : 有効\nbond は有効です 🤝\n'
+         '⚠ ただしこの bond は解消されています\nbond は無効です\n'),
+        ('verify_binding report (mutual rejection)',
+         'binding は有効です\n'
+         '（運用手順）: この binding が実際に該当ハンドルのアカウントから'
+         '投稿されていることを確認してください\n'),
+        ('leading blank line',
+         f'\n{_np1[:24]}... : 有効\nbond は有効です 🤝\n'),
+        ('rotation note with short new prefix',
+         f'{_np1[:24]}... : 有効  (鍵は {_np2[:23]}... へローテーション済み — '
+         '署名自体は旧鍵のまま有効)\nbond は有効です 🤝\n'),
+    ]
+    for _name, _rep in vrf_neg:
+        _ok, _errs, _info = conform_verify_report(_rep)
+        _good = not _ok
+        print(f'verify-neg/{_name}: '
+              f'{"PASS (rejected)" if _good else "FAIL (accepted!)"}')
+        if not _good:
+            vrf_fails += 1
+
+    vrf_total = len(_vrf_e2e) + len(vrf_pos) + len(vrf_neg)
+    print(f'--- verify {vrf_total - vrf_fails}/{vrf_total} passed ---')
+    fails += vrf_fails
+
     # ---------- check_board_read: board_read report consistency ----------
     # Reference reports are produced in-process with nakama.py's own
     # cmd_board_read, with nostr_request monkeypatched to return crafted
@@ -11803,7 +12295,7 @@ def selftest() -> int:
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
         + bj_total + bs_total + bc_total + vbd_total + bvr_total \
         + bdc_total + bcs_total + dmr_total + vrt_total + bpl_total \
-        + bps_total + vbp_total
+        + bps_total + vbp_total + vrf_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -12121,6 +12613,11 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_verify_board_policy_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_verify':
+        if len(argv) < 3:
+            print('usage: conformance.py check_verify <report.txt> [...]')
+            return 2
+        return check_verify_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -12170,6 +12667,7 @@ def main(argv: list[str]) -> int:
           'check_board_policy <report.txt> [...] | '
           'check_board_policy_sign <report.txt> [...] | '
           'check_verify_board_policy <report.txt> [...] | '
+          'check_verify <report.txt> [...] | '
           'selftest')
     return 2
 
