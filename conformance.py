@@ -603,6 +603,29 @@ reference reports produced in-process by nakama.py's own
 cmd_revoke_fetch (offline: nostr_request monkeypatched, no relay
 contact; revocation events signed in-process with
 nakama.revocation_nostr_event).
+
+Rotate-fetch report conformance:
+
+    python3 conformance.py check_rotate_fetch <report.txt> [...]
+
+Each file is the saved stdout of `nakama.py rotate_fetch`. Verifies the
+report is internally consistent: either the single no-publications line
+`<E> 件のイベントを取得: 有効な rotation 公開はありませんでした（<K>
+件をスキップ）`, or — in order — the link line `rotation 公開: <old16>...
+→ <new16>... (created_at YYYY-MM-DD)`, the footer `<E> 件のイベントを
+取得: 有効 1 件、スキップ <K> 件`, and (with --out) the save line
+`rotation を <file> に保存しました（mode 600）`. With --chain: one `[i]`
+line per chain link (indices sequential from 0), optionally followed by
+the save line `最新の rotation を <file> に保存しました（mode 600）`;
+the empty-chain report is the single line `rotation 公開イベントは
+見つかりませんでした`. The npub prefixes must be 16 non-space chars
+(the reference CLI prints an npub truncation, which is bech32, not hex),
+the date a valid calendar date, and a report that shows a valid rotation
+must have fetched at least 1 event. Explicitly out of scope: the counts'
+truth (the relay's event set is the relay's claim), npub truth
+(`check_rotation`'s territory), the date's value/timezone, chain-link
+continuity (only 16-char prefixes are printed), event signature validity
+(`verify_rotation_nostr_event`'s territory), ordering, and stderr.
 """
 
 import json
@@ -3715,6 +3738,154 @@ def check_revoke_fetch_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_revoke_fetch_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_rotate_fetch: rotate_fetch report consistency ----------
+
+# `nakama.py rotate_fetch <relay> <old_npub>` (kind 30109, #d=old_hex)
+# prints either the single no-publications line, or — in order — one
+# `rotation 公開:` link line, the summary footer, and (with --out) the
+# save line. With --chain it prints one `[i]` line per chain link (oldest
+# first) and optionally the latest-save line; the empty-chain report is
+# the single `rotation 公開イベントは見つかりませんでした` line. The
+# grammar is fixed (spec §17.9). check_rotate_fetch verifies that a saved
+# report is internally consistent:
+#   rotation 公開: <old16>... → <new16>... (created_at YYYY-MM-DD)
+#   <E> 件のイベントを取得: 有効 1 件、スキップ <K> 件
+#   rotation を <file> に保存しました（mode 600）        (only with --out)
+#   [<i>] <old16>... → <new16>... (created_at YYYY-MM-DD)  (--chain)
+# The npub prefixes are 16 non-space chars (the reference CLI prints an
+# npub truncation, which is bech32, not hex — so hex is deliberately not
+# required, unlike board-decision core hashes). The date must be a valid
+# calendar date. Chain indices must be sequential starting at 0. A report
+# that shows a valid rotation must have fetched at least 1 event.
+# Explicitly out of scope: the counts' truth (the relay's event set is
+# the relay's claim — display consistency only), npub truth
+# (check_rotation's territory), the date's value/timezone (the reference
+# CLI prints local time — the checker validates grammar, never the zone
+# or the instant), chain-link continuity (only 16-char prefixes are
+# printed, so full-key equality cannot be verified), ordering beyond the
+# index sequence, event signature validity
+# (verify_rotation_nostr_event's territory), and stderr notes.
+
+_RTF_LINK = re.compile(
+    r'^rotation 公開: (\S{16})\.\.\. → (\S{16})\.\.\. '
+    r'\(created_at (\d{4}-\d{2}-\d{2})\)$')
+_RTF_CHAIN_LINK = re.compile(
+    r'^\[(\d+)\] (\S{16})\.\.\. → (\S{16})\.\.\. '
+    r'\(created_at (\d{4}-\d{2}-\d{2})\)$')
+_RTF_EMPTY = re.compile(
+    r'^(\d+) 件のイベントを取得: 有効な rotation 公開はありませんでした'
+    r'（(\d+) 件をスキップ）$')
+_RTF_CHAIN_EMPTY = 'rotation 公開イベントは見つかりませんでした'
+_RTF_FOOT = re.compile(
+    r'^(\d+) 件のイベントを取得: 有効 1 件、スキップ (\d+) 件$')
+_RTF_SAVED = re.compile(
+    r'^rotation を (.+) に保存しました（mode 600）$')
+_RTF_SAVED_LATEST = re.compile(
+    r'^最新の rotation を (.+) に保存しました（mode 600）$')
+
+
+def conform_rotate_fetch_report(text: str):
+    """Verify a saved `nakama.py rotate_fetch` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) == 1 and lines[0] == _RTF_CHAIN_EMPTY:
+        info.append('no published rotations (chain)')
+        return True, errs, info
+    if _RTF_EMPTY.match(lines[0]):
+        if len(lines) != 1:
+            return False, ['empty-report line appears together with '
+                           'link lines'], info
+        m = _RTF_EMPTY.match(lines[0])
+        info.append(f'no published rotations ({m.group(1)} fetched, '
+                    f'{m.group(2)} skipped)')
+        return True, errs, info
+    if _RTF_CHAIN_LINK.match(lines[0]):
+        links = []
+        pos = 0
+        while pos < len(lines):
+            m = _RTF_CHAIN_LINK.match(lines[pos])
+            if not m:
+                break
+            links.append((pos + 1, int(m.group(1)), m.group(2),
+                          m.group(3), m.group(4)))
+            pos += 1
+        for j, (lineno, idx, _old, _new, date) in enumerate(links):
+            if idx != j:
+                errs.append(f'line {lineno}: chain index {idx} is not '
+                            f'sequential (expected {j})')
+            if not _ns_valid_date(date):
+                errs.append(f'line {lineno}: invalid display date '
+                            f'{date!r}')
+        if pos < len(lines):
+            if not _RTF_SAVED_LATEST.match(lines[pos]):
+                return False, [f'line {pos + 1}: expected the chain save '
+                               f'line, got {lines[pos]!r}'], info
+            pos += 1
+        if pos != len(lines):
+            return False, [f'line {pos + 1}: unexpected trailing line '
+                           f'{lines[pos]!r}'], info
+        if not errs:
+            info.append(f'{len(links)} chain links')
+        return (not errs), errs, info
+    m = _RTF_LINK.match(lines[0])
+    if not m:
+        return False, [f'line 1: not a rotate_fetch report line '
+                       f'({lines[0]!r})'], info
+    _old, _new, date = m.group(1), m.group(2), m.group(3)
+    if not _ns_valid_date(date):
+        errs.append(f'line 1: invalid display date {date!r}')
+    if len(lines) < 2:
+        return False, errs + ['line 2: missing summary footer'], info
+    fm = _RTF_FOOT.match(lines[1])
+    if not fm:
+        return False, [f'line 2: expected the summary footer, '
+                       f'got {lines[1]!r}'], info
+    e, k = int(fm.group(1)), int(fm.group(2))
+    if e < 1:
+        errs.append(f'line 2: footer fetched {e} but a valid rotation '
+                    'was shown')
+    pos = 2
+    if pos < len(lines):
+        if not _RTF_SAVED.match(lines[pos]):
+            return False, [f'line {pos + 1}: unexpected line after the '
+                           f'summary footer: {lines[pos]!r}'], info
+        pos += 1
+    if pos != len(lines):
+        return False, [f'line {pos + 1}: unexpected trailing line '
+                       f'{lines[pos]!r}'], info
+    if not errs:
+        info.append(f'1 rotation shown, {e} fetched, {k} skipped')
+    return (not errs), errs, info
+
+
+def check_rotate_fetch_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_rotate_fetch_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -6950,6 +7121,211 @@ def selftest() -> int:
     print(f'--- revoke-fetch {rf_total - rf_fails}/{rf_total} passed ---')
     fails += rf_fails
 
+    # ---------- check_rotate_fetch: rotate_fetch report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_rotate_fetch, with nostr_request monkeypatched to return
+    # in-process-signed rotation events (no relay contact); hand-mutated
+    # reports that break the fixed display grammar (spec §17.9) or the
+    # link/footer/index consistency must be rejected.
+    rtf_fails = 0
+    _rtf_now = int(time.time())
+
+    def _rtf_keyfile(secret, tmpd, name):
+        kf = os.path.join(tmpd, name)
+        with open(kf, 'w') as f:
+            json.dump({'secret_hex': secret.hex()}, f)
+        os.chmod(kf, 0o600)
+        return kf
+
+    def _rtf_rot(old_secret, new_npub, created_at):
+        old_npub = nakama.npub_of(old_secret)
+        rot = {'protocol': 'nakama', 'version': 1, 'type': 'rotation',
+               'old_npub': old_npub, 'new_npub': new_npub,
+               'created_at': created_at,
+               'old_sig': nakama.sign_schnorr(
+                   old_secret,
+                   nakama.rotation_message(old_npub, new_npub,
+                                           created_at)).hex()}
+        return nakama.rotation_nostr_event(rot, old_secret)
+
+    def _rtf_run(tmpd, old_npub, keyfile, by_d, chain=False, out=None):
+        orig = nakama.nostr_request
+
+        def fake(*a, **k):
+            target = a[1][2]['#d'][0]
+            return by_d.get(target, [])
+
+        nakama.nostr_request = fake
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                nakama.cmd_rotate_fetch(SimpleNamespace(
+                    relay='wss://example.invalid', old_npub=old_npub,
+                    limit=20, auth=False, out=out, chain=chain,
+                    keyfile=keyfile))
+            return buf.getvalue()
+        finally:
+            nakama.nostr_request = orig
+
+    def _rtf_date(ts):
+        return time.strftime('%Y-%m-%d', time.localtime(ts))
+
+    rtf_e2e = []
+    with tempfile.TemporaryDirectory() as tmpd:
+        _rsA, _npA = _key()
+        _rsB, _npB = _key()
+        _rsC, _npC = _key()
+        _kf = _rtf_keyfile(_rsA, tmpd, 'a.json')
+        _ev_ok = _rtf_rot(_rsA, _npB, _rtf_now)
+        _ev_badsig = json.loads(json.dumps(_ev_ok))
+        _ev_badsig['sig'] = '00' * 64
+        _ev_wrongd = _rtf_rot(_rsA, _npB, _rtf_now)
+        _ev_wrongd['tags'] = [['d', 'ff' * 32]]
+        _rtf_hexA = nakama.npub_to_hex(_npA)
+        _rtf_hexB = nakama.npub_to_hex(_npB)
+        _ev_b2c = _rtf_rot(_rsB, _npC, _rtf_now + 60)
+        _rtf_by_d = {_rtf_hexA: [_ev_ok, _ev_badsig, _ev_wrongd],
+                     _rtf_hexB: [_ev_b2c]}
+        _rtf_link = (f'rotation 公開: {_npA[:16]}... → {_npB[:16]}... '
+                     f'(created_at {_rtf_date(_rtf_now)})\n')
+        _rtf_chain = (f'[0] {_npA[:16]}... → {_npB[:16]}... '
+                      f'(created_at {_rtf_date(_rtf_now)})\n'
+                      f'[1] {_npB[:16]}... → {_npC[:16]}... '
+                      f'(created_at {_rtf_date(_rtf_now + 60)})\n')
+        for name, old_npub, by_d, chain, out, exp in (
+                ('1 valid + 2 skipped (bad Nostr sig, wrong d)',
+                 _npA, _rtf_by_d, False, None,
+                 _rtf_link
+                 + '3 件のイベントを取得: 有効 1 件、スキップ 2 件\n'),
+                ('empty events', _npA, {}, False, None,
+                 '0 件のイベントを取得: 有効な rotation 公開はありませんでした'
+                 '（0 件をスキップ）\n'),
+                ('all skipped', _npA,
+                 {_rtf_hexA: [_ev_badsig, _ev_wrongd]}, False, None,
+                 '2 件のイベントを取得: 有効な rotation 公開はありませんでした'
+                 '（2 件をスキップ）\n'),
+                ('--chain two links', _npA, _rtf_by_d, True, None,
+                 _rtf_chain),
+                ('--chain empty', _npC, {}, True, None,
+                 'rotation 公開イベントは見つかりませんでした\n'),
+                ('--out saves rotation', _npA,
+                 {_rtf_hexA: [_ev_ok]}, False,
+                 os.path.join(tmpd, 'rotation.json'),
+                 _rtf_link
+                 + '1 件のイベントを取得: 有効 1 件、スキップ 0 件\n'
+                 + f'rotation を {os.path.join(tmpd, "rotation.json")}'
+                   f' に保存しました（mode 600）\n'),
+                ('--chain --out saves latest', _npA, _rtf_by_d, True,
+                 os.path.join(tmpd, 'chain.json'),
+                 _rtf_chain
+                 + f'最新の rotation を {os.path.join(tmpd, "chain.json")}'
+                   f' に保存しました（mode 600）\n')):
+            text = _rtf_run(tmpd, old_npub, _kf, by_d, chain=chain, out=out)
+            ok, errs, info = conform_rotate_fetch_report(text)
+            good = ok and text == exp
+            if out and good:
+                try:
+                    good = (os.stat(out).st_mode & 0o777) == 0o600
+                    if not good:
+                        print(f'    - save file mode is not 600')
+                except OSError as e:
+                    good = False
+                    print(f'    - save file missing: {e}')
+            print(f'check_rotate_fetch e2e {name}: '
+                  f'{"PASS" if good else "FAIL"}')
+            for e in errs:
+                print(f'    - {e}')
+            if not good and not errs:
+                print(f'    - stdout mismatch: {text!r} '
+                      f'(expected {exp!r})')
+            rtf_fails += 0 if good else 1
+            rtf_e2e.append(name)
+
+    _rtf_np1 = 'npub1' + 'a' * 58
+    _rtf_np2 = 'npub1' + 'b' * 58
+    _rtf_d = '2026-10-02'
+    _rtf_link1 = (f'rotation 公開: {_rtf_np1[:16]}... → {_rtf_np2[:16]}... '
+                  f'(created_at {_rtf_d})')
+    _rtf_foot1 = '3 件のイベントを取得: 有効 1 件、スキップ 2 件'
+    _rtf_chain1 = (f'[0] {_rtf_np1[:16]}... → {_rtf_np2[:16]}... '
+                   f'(created_at {_rtf_d})')
+    rtf_pos = [
+        ('one valid + footer',
+         f'{_rtf_link1}\n{_rtf_foot1}\n'),
+        ('with save line',
+         f'{_rtf_link1}\n{_rtf_foot1}\n'
+         f'rotation を /tmp/rotation.json に保存しました（mode 600）\n'),
+        ('empty single line',
+         '0 件のイベントを取得: 有効な rotation 公開はありませんでした'
+         '（0 件をスキップ）\n'),
+        ('chain two links',
+         f'[0] {_rtf_np1[:16]}... → {_rtf_np2[:16]}... '
+         f'(created_at {_rtf_d})\n'
+         f'[1] {_rtf_np2[:16]}... → {_rtf_np1[:16]}... '
+         f'(created_at {_rtf_d})\n'),
+        ('chain one link + latest save',
+         f'{_rtf_chain1}\n'
+         f'最新の rotation を /tmp/chain.json に保存しました（mode 600）\n'),
+        ('chain empty',
+         'rotation 公開イベントは見つかりませんでした\n'),
+    ]
+    rtf_neg = [
+        ('missing ellipsis',
+         _rtf_link1.replace('...', '..') + f'\n{_rtf_foot1}\n'),
+        ('有効 2 件 (only 1 valid is shown)',
+         f'{_rtf_link1}\n'
+         f'3 件のイベントを取得: 有効 2 件、スキップ 2 件\n'),
+        ('footer fetched 0 but rotation shown',
+         f'{_rtf_link1}\n'
+         f'0 件のイベントを取得: 有効 1 件、スキップ 0 件\n'),
+        ('missing footer',
+         f'{_rtf_link1}\n'),
+        ('invalid date',
+         f'rotation 公開: {_rtf_np1[:16]}... → {_rtf_np2[:16]}... '
+         f'(created_at 2026-13-99)\n{_rtf_foot1}\n'),
+        ('chain index skips (0, 2)',
+         f'[0] {_rtf_np1[:16]}... → {_rtf_np2[:16]}... '
+         f'(created_at {_rtf_d})\n'
+         f'[2] {_rtf_np2[:16]}... → {_rtf_np1[:16]}... '
+         f'(created_at {_rtf_d})\n'),
+        ('chain index starts at 1',
+         f'[1] {_rtf_np1[:16]}... → {_rtf_np2[:16]}... '
+         f'(created_at {_rtf_d})\n'),
+        ('empty line with link lines',
+         '0 件のイベントを取得: 有効な rotation 公開はありませんでした'
+         '（0 件をスキップ）\n'
+         f'{_rtf_link1}\n'),
+        ('trailing line after footer',
+         f'{_rtf_link1}\n{_rtf_foot1}\n'
+         f'rotation を /tmp/r.json に保存しました（mode 600）\n'
+         f'余計な行\n'),
+        ('chain save line without latest',
+         f'{_rtf_chain1}\n'
+         f'rotation を /tmp/r.json に保存しました（mode 600）\n'),
+        ('garbage first line',
+         'なんか違う出力\n'),
+    ]
+    for name, rep in rtf_pos:
+        ok, errs, info = conform_rotate_fetch_report(rep)
+        good = ok
+        print(f'check_rotate_fetch pos {name}: {"PASS" if good else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        rtf_fails += 0 if good else 1
+    for name, rep in rtf_neg:
+        ok, _errs, _info = conform_rotate_fetch_report(rep)
+        good = not ok
+        print(f'check_rotate_fetch neg {name}: '
+              f'{"PASS" if good else "FAIL"}')
+        if not good:
+            print(f'    - report wrongly accepted')
+        rtf_fails += 0 if good else 1
+    rtf_total = len(rtf_e2e) + len(rtf_pos) + len(rtf_neg)
+    print(f'--- rotate-fetch {rtf_total - rtf_fails}/{rtf_total} passed ---')
+    fails += rtf_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -6958,7 +7334,7 @@ def selftest() -> int:
         + binding_total + live_total + cp_total + rt_total + rv_total \
         + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total \
         + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total \
-        + bfa_total + pub_total + gov_total + rf_total
+        + bfa_total + pub_total + gov_total + rf_total + rtf_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -7163,6 +7539,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_revoke_fetch_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_rotate_fetch':
+        if len(argv) < 3:
+            print('usage: conformance.py check_rotate_fetch '
+                  '<report.txt> [...]')
+            return 2
+        return check_rotate_fetch_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -7193,6 +7575,7 @@ def main(argv: list[str]) -> int:
           'check_pub <report.txt> [...] | '
           'check_governance <report.txt> [...] | '
           'check_revoke_fetch <report.txt> [...] | '
+          'check_rotate_fetch <report.txt> [...] | '
           'selftest')
     return 2
 
