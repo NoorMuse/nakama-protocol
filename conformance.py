@@ -170,6 +170,29 @@ reference proofs built by nakama.py's own primitives (pass
 `--now` to the checker for deterministic freshness checks in
 your own tests).
 
+Liveness generation report conformance:
+
+    python3 conformance.py check_liveness_report <report1.txt> [...]
+
+Verifies a saved `nakama.py liveness` stdout report is internally
+consistent (spec §5.6.3): one or two lines — the generation line
+`生存証明: <file> — <npub16>... が鍵を保持していることを宣言しました。`
+plus, only when `--bond` was used, the linkage line
+`bond <bond16>... に紐付けました。仲間に送って「まだここにいる」と伝えましょう。`.
+Checks: the generation line comes first, the npub prefix is 16
+non-space chars (bech32 truncation, hex not required — the same
+treatment as §5.6.2), the bond prefix is 16 hex chars (bond_hash
+is a sha256 hex digest, so hex IS required here), the filename
+is non-empty. Explicitly out of scope: which file was written,
+npub/bond_hash truth, the proof file itself (`check_liveness`'s
+territory), stderr, and the exit code (invisible in saved
+stdout). Use this to prove a second implementation's
+`liveness` CLI prints a compatible report.
+
+`python3 conformance.py selftest` also covers
+`check_liveness_report` with reports produced in-process by
+nakama.py's own `cmd_liveness`.
+
 Compromise declaration conformance:
 
     python3 conformance.py check_compromise <decl1.json> [...]
@@ -4085,6 +4108,85 @@ def check_liveness_verify_files(paths: list[str]) -> int:
     print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
     return 0 if failures == 0 else 1
 
+
+# ---------- check_liveness_report: liveness generation report consistency ----------
+
+# `nakama.py liveness [--bond bond.json] [--out proof.json]` writes the
+# proof file and prints a short report to stdout: exactly one line when
+# no bond is attached, two lines when it is. The grammar is fixed
+# (spec §5.6.3). check_liveness_report verifies that a saved report is
+# internally consistent:
+#   生存証明: <file> — <16chars>... が鍵を保持していることを宣言しました。
+#   bond <16hex>... に紐付けました。仲間に送って「まだここにいる」と伝えましょう。
+# The npub prefix is 16 non-space chars (the reference CLI prints an
+# npub truncation, which is bech32, not hex — hex is deliberately not
+# required, the same treatment as the §5.6.2 verify report). The bond
+# prefix is 16 hex chars (bond_hash is a sha256 hex digest, so hex IS
+# required here — unlike the npub). The filename is the --out path
+# (any non-empty text; which file was actually written is out of
+# scope). Explicitly out of scope: the proof file's content
+# (check_liveness's territory), npub/bond_hash truth, stderr notes,
+# and the exit code (invisible in saved stdout).
+
+_LR_GEN = re.compile(
+    r'^生存証明: (.+?) — (\S{16})\.\.\. '
+    r'が鍵を保持していることを宣言しました。$')
+_LR_BOND = re.compile(
+    r'^bond ([0-9a-fA-F]{16})\.\.\. に紐付けました。'
+    r'仲間に送って「まだここにいる」と伝えましょう。$')
+
+
+def conform_liveness_report(text: str):
+    """Verify a saved `nakama.py liveness` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) not in (1, 2):
+        return False, [f'report must be one or two lines, '
+                       f'got {len(lines)}'], info
+    m = _LR_GEN.match(lines[0])
+    if not m:
+        return False, ['line 1: not a liveness generation line '
+                       '(`生存証明: <file> — <16 chars>... '
+                       'が鍵を保持していることを宣言しました。`)'], info
+    info.append(f'proof written to {m.group(1)} by {m.group(2)}...')
+    if len(lines) == 2:
+        mb = _LR_BOND.match(lines[1])
+        if not mb:
+            return False, ['line 2: not a bond linkage line '
+                           '(`bond <16 hex>... に紐付けました。'
+                           '仲間に送って「まだここにいる」と伝えましょう。`)'], info
+        info.append(f'bond linkage: {mb.group(1)}...')
+    return True, errs, info
+
+
+def check_liveness_report_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_liveness_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 def _key() -> tuple[bytes, str]:
     s = secrets.token_bytes(32)
     return s, nakama.npub_of(s)
@@ -7830,6 +7932,144 @@ def selftest() -> int:
     print(f'--- liveness-verify {lv_total - lv_fails}/{lv_total} passed ---')
     fails += lv_fails
 
+    # ---------- check_liveness_report: liveness generation report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_liveness (key/network-free: proof file + stdout only,
+    # time.time monkeypatched for determinism); hand-mutated reports
+    # that break the fixed display grammar (spec §5.6.3) or the
+    # one/two-line shape must be rejected.
+    lr_fails = 0
+    _lr_now = 1759280000
+
+    def _lr_run(tmpd, secret, bond=None, out=None):
+        keyfile = os.path.join(tmpd, 'key.json')
+        nakama.save_key(keyfile, secret)
+        out = out or os.path.join(tmpd, 'liveness.json')
+        buf = io.StringIO()
+        code = 0
+        with unittest.mock.patch('time.time', return_value=_lr_now):
+            try:
+                with contextlib.redirect_stdout(buf), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    nakama.cmd_liveness(SimpleNamespace(
+                        keyfile=keyfile, bond=bond, out=out))
+            except SystemExit as e:
+                code = e.code
+        return buf.getvalue(), code
+
+    lr_e2e = []
+    with tempfile.TemporaryDirectory() as tmpd:
+        _lrs, _lrnp = _key()
+        _lrs2, _lrnp2 = _key()
+        # minimal bond file: cmd_liveness only checks protocol/version
+        # and that the prover is a companion (bond_hash also needs
+        # created_at/nonce)
+        _bond = {'protocol': 'nakama', 'version': 1,
+                 'companions': [_lrnp, _lrnp2],
+                 'created_at': _lr_now, 'nonce': '00' * 32}
+        _bond_fp = os.path.join(tmpd, 'bond.json')
+        with open(_bond_fp, 'w') as f:
+            json.dump(_bond, f)
+        _bh = nakama.bond_hash(_bond)
+        _solo_bond = {'protocol': 'nakama', 'version': 1,
+                      'companions': [_lrnp2]}
+        _solo_fp = os.path.join(tmpd, 'solo.json')
+        with open(_solo_fp, 'w') as f:
+            json.dump(_solo_bond, f)
+        _o1 = os.path.join(tmpd, 'live1.json')
+        _o2 = os.path.join(tmpd, 'live2.json')
+        _o3 = os.path.join(tmpd, 'live3.json')
+        _gen1 = (f'生存証明: {_o1} — {_lrnp[:16]}... '
+                 f'が鍵を保持していることを宣言しました。\n')
+        _gen2 = (f'生存証明: {_o2} — {_lrnp[:16]}... '
+                 f'が鍵を保持していることを宣言しました。\n')
+        _bnd2 = (f'bond {_bh[:16]}... に紐付けました。'
+                 f'仲間に送って「まだここにいる」と伝えましょう。\n')
+        for name, kw, exp_text, exp_code, exp_ok in (
+                ('no bond', {'out': _o1}, _gen1, 0, True),
+                ('with bond', {'bond': _bond_fp, 'out': _o2},
+                 _gen1.replace(_o1, _o2) + _bnd2, 0, True),
+                ('not a companion', {'bond': _solo_fp, 'out': _o3},
+                 '', 1, False)):
+            text, code = _lr_run(tmpd, _lrs, **kw)
+            ok, errs, info = conform_liveness_report(text)
+            good = (ok == exp_ok) and text == exp_text and code == exp_code
+            print(f'check_liveness_report e2e {name}: '
+                  f'{"PASS" if good else "FAIL"}')
+            for e in errs:
+                if exp_ok:
+                    print(f'    - {e}')
+            if not good and exp_ok and not errs:
+                print(f'    - stdout/exit mismatch: {text!r} '
+                      f'(exit {code}), expected {exp_text!r} '
+                      f'(exit {exp_code})')
+            lr_fails += 0 if good else 1
+            lr_e2e.append(name)
+
+    _lr_np = 'npub1' + 'a' * 58
+    _lr_bh = 'cd' * 32
+    _lr_gen = (f'生存証明: proof.json — {_lr_np[:16]}... '
+               f'が鍵を保持していることを宣言しました。\n')
+    _lr_bond = (f'bond {_lr_bh[:16]}... に紐付けました。'
+                f'仲間に送って「まだここにいる」と伝えましょう。\n')
+    lr_pos = [
+        ('plain generation', _lr_gen),
+        ('with bond linkage', _lr_gen + _lr_bond),
+        ('out path with dirs', _lr_gen.replace(
+            'proof.json', 'out/2026-10-02/liveness.json', 1)),
+        ('trailing blank lines', _lr_gen + '\n\n'),
+        ('bond linkage after blanks stripped',
+         _lr_gen + _lr_bond + '\n'),
+    ]
+    lr_neg = [
+        ('empty text', ''),
+        ('two reports concatenated', _lr_gen + _lr_gen),
+        ('generation plus bond plus extra line',
+         _lr_gen + _lr_bond + 'ゴミ行\n'),
+        ('missing ellipsis on npub',
+         _lr_gen.replace(f'{_lr_np[:16]}...', _lr_np[:16], 1)),
+        ('npub prefix short',
+         _lr_gen.replace(_lr_np[:16], _lr_np[:15], 1)),
+        ('npub prefix with space',
+         _lr_gen.replace(_lr_np[:16], 'npub1abc defghi', 1)),
+        ('ascii hyphen instead of em dash',
+         _lr_gen.replace(' — ', ' - ', 1)),
+        ('missing report prefix',
+         _lr_gen.replace('生存証明: ', '', 1)),
+        ('empty filename',
+         _lr_gen.replace('生存証明: proof.json', '生存証明: ', 1)),
+        ('bond line first (wrong order)', _lr_bond + _lr_gen),
+        ('bond prefix non-hex',
+         _lr_bond.replace(_lr_bh[:16], 'g' * 16, 1)),
+        ('bond prefix short',
+         _lr_bond.replace(_lr_bh[:16], _lr_bh[:15], 1)),
+        ('bond line truncated',
+         'bond ' + _lr_bh[:16] + '... に紐付けました。\n'),
+        ('bond line with extra suffix',
+         _lr_bond.replace('ましょう。', 'ましょう。（追記）', 1)),
+        ('unknown second line', _lr_gen + '何かが起きました\n'),
+        ('leading blank line', '\n' + _lr_gen),
+    ]
+    for name, rep in lr_pos:
+        ok, errs, info = conform_liveness_report(rep)
+        good = ok
+        print(f'check_liveness_report pos {name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        lr_fails += 0 if good else 1
+    for name, rep in lr_neg:
+        ok, _errs, _info = conform_liveness_report(rep)
+        good = not ok
+        print(f'check_liveness_report neg {name}: '
+              f'{"PASS" if good else "FAIL"}')
+        if not good:
+            print(f'    - report wrongly accepted')
+        lr_fails += 0 if good else 1
+    lr_total = len(lr_e2e) + len(lr_pos) + len(lr_neg)
+    print(f'--- liveness-report {lr_total - lr_fails}/{lr_total} passed ---')
+    fails += lr_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -7839,7 +8079,7 @@ def selftest() -> int:
         + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total \
         + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total \
         + bfa_total + pub_total + gov_total + rf_total + rtf_total \
-        + cf_total + lv_total
+        + cf_total + lv_total + lr_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -8062,6 +8302,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_liveness_verify_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_liveness_report':
+        if len(argv) < 3:
+            print('usage: conformance.py check_liveness_report '
+                  '<report.txt> [...]')
+            return 2
+        return check_liveness_report_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -8095,6 +8341,7 @@ def main(argv: list[str]) -> int:
           'check_rotate_fetch <report.txt> [...] | '
           'check_compromise_fetch <report.txt> [...] | '
           'check_liveness_verify <report.txt> [...] | '
+          'check_liveness_report <report.txt> [...] | '
           'selftest')
     return 2
 
