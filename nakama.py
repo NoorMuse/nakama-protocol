@@ -72,8 +72,9 @@
       公開された草案を購読・検証・マージして表示（--out: <core_hash>.json で保存 — board_cosign にそのまま渡せる、--policy: 草案の threshold 充足・不足の表示）
   nakama.py board_fetch_all <relay> <board_id> [--limit N] [--auth] [--out DIR] [--policy POLICY]
       30110+30111 を 1 回の REQ で購読し同一コアの草案・完成を統合表示（--out: 内部マーカーを剥がした <core_hash>.json、--policy: 成立済みは時点解決・草案は現行政策のみで threshold 表示）
-  nakama.py board_draft_notify <relay> <board_id> [--limit N] [--auth] [--policy POLICY] [--within SECS] [--include-expired] [--dry-run] [--resend] [--from NPUB]
-      期限間近の草案を発行者に NIP-17 DM で通知（--within 既定 24h、送信記録で二重送信防止、宛先は草案イベントの publisher のみ — spec §25）
+  nakama.py board_draft_notify <relay> <board_id> [--limit N] [--auth] [--policy POLICY] [--within SECS] [--include-expired] [--dry-run] [--resend] [--from NPUB] [--cosigners]
+      期限間近の草案を発行者に NIP-17 DM で通知（--within 既定 24h、送信記録で二重送信防止、宛先は草案イベントの publisher のみ — spec §25）。
+      --cosigners で threshold 未達・期限間近の草案の未署名 eligible 承認者にも通知（--policy 必須 — spec §27）
 """
 import argparse, base64, hashlib, json, os, re, secrets, sys, time
 
@@ -2904,16 +2905,94 @@ def draft_notify_message(d, core, reason, relay, policy=None):
     return '\n'.join(lines)
 
 
-def draft_notif_record_path(notif_dir, core, reason):
-    """送信記録のパス: <notif_dir>/<core_hash>:<reason>.json（spec §25.1）。"""
-    return os.path.join(notif_dir, f'{core}:{reason}.json')
+def draft_cosigner_targets(verified, now, within, policy, include_expired):
+    """未署名の eligible 承認者への通知対象を選ぶ（純粋、spec §27.1）。
+
+    verified: draft_notify_targets と同じ [(決定 dict、event の pubkey hex（草案の
+    publisher）、event の created_at)]。
+    policy（検証済み board-policy cert）の eligible・threshold で判定する。
+    返り値: [(core_hash, d, recipient_hex, reason)]（草案は created_at 昇順、
+    宛先は eligible 順）。reason の意味論は draft_notify_targets と同一。
+    対象は (1) 期限間近（--within）または --include-expired 時の期限切れのみ、
+    (2) threshold 未達の草案のみ。宛先はマージ済み approvals に含まれず、
+    かつ publisher でもない eligible の npub（hex 変換）。
+    """
+    merged = merge_decision_approvals([d for d, _, _ in verified])
+    first_pub = {}
+    for d, pub, ca in verified:
+        core = decision_core_hash(d)
+        if core not in first_pub or ca < first_pub[core][1]:
+            first_pub[core] = (pub, ca)
+    out = []
+    eligible = list(policy['eligible'])
+    for md in merged:
+        core = decision_core_hash(md)
+        ea = md.get('payload', {}).get('expires_at')
+        if not isinstance(ea, int) or isinstance(ea, bool):
+            continue  # 期限なし・不正型は対象外
+        rem = ea - now
+        if rem > within:
+            continue
+        reason = 'expiring_soon' if rem > 0 else 'expired'
+        if reason == 'expired' and not include_expired:
+            continue
+        # §21.5: 草案の threshold 判定は現行政策のみ（時点解決は現行で十分）
+        ok, _, _ = fetch_threshold_status(md, policy, [])
+        if ok:
+            continue  # threshold 達成済み → 承認者にやることはない
+        approved = {a.get('npub') for a in md.get('approvals', [])}
+        publisher_hex = first_pub[core][0]
+        for enpub in eligible:
+            if enpub in approved:
+                continue  # 署名済みは対象外
+            ehex = npub_to_hex(enpub)
+            if ehex is None or ehex == publisher_hex:
+                continue  # publisher は発行者通知（§25.1）でカバー / 形式不正
+            out.append((core, md, ehex, reason))
+    return out
 
 
-def draft_notif_already_sent(notif_dir, core, reason, now, within):
-    """同一草案・同一 reason の送信記録が --within 以内にあれば True（I/O のみ）。
+def draft_cosigner_message(d, core, reason, relay, policy):
+    """未署名の承認者宛ての DM 平文（kind 14 rumor の content）。形式は spec §27.1
+    に固定（純粋）。--cosigners 時のみ使う（--policy 必須のため threshold 行は
+    常に表示）。命令形を避け、現状の告知にとどめる（§27.2）。"""
+    ok, n_, m = fetch_threshold_status(d, policy, [])
+    ea = d['payload']['expires_at']
+    utc = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(ea))
+    lines = ['[nakama] draft needs cosignatures',
+             f'board: {d["board_id"]}',
+             f'decision: {d["decision"]} ({core[:12]})',
+             f'expires_at: {ea} ({utc})',
+             f'threshold: {n_}/{m} {"充足" if ok else "不足"}',
+             '---',
+             'you are eligible to cosign this draft but have not yet.',
+             f'to cosign: board_draft_fetch {relay} {d["board_id"]} --out <dir> '
+             '→ board_cosign → board_draft_pub',
+             f'verify the draft yourself with: board_draft_fetch {relay} {d["board_id"]}']
+    return '\n'.join(lines)
+
+
+def draft_notif_record_path(notif_dir, core, reason, recipient_hex=None):
+    """送信記録のパス（spec §25.1 / §27.1）。
+
+    発行者通知は <notif_dir>/<core_hash>:<reason>.json（§25.1 の既定形）。
+    --cosigners の承認者宛て通知は宛先ごとに <core_hash>:<reason>:<recipient_hex>.json
+    とし、発行者通知の記録とファイル名で区別して互いに干渉しない（§27.1）。
+    """
+    name = f'{core}:{reason}'
+    if recipient_hex:
+        name += f':{recipient_hex}'
+    return os.path.join(notif_dir, f'{name}.json')
+
+
+def draft_notif_already_sent(notif_dir, core, reason, now, within,
+                             recipient_hex=None):
+    """同一草案・同一 reason（--cosigners 時は同一宛先も）の送信記録が
+    --within 以内にあれば True（I/O のみ）。
     記録なし・壊れた記録・記録が古ければ False（＝送ってよい）。"""
     try:
-        with open(draft_notif_record_path(notif_dir, core, reason)) as f:
+        with open(draft_notif_record_path(notif_dir, core, reason,
+                                          recipient_hex)) as f:
             rec = json.load(f)
     except (OSError, ValueError):
         return False
@@ -2921,11 +3000,15 @@ def draft_notif_already_sent(notif_dir, core, reason, now, within):
     return isinstance(sent_at, int) and (now - sent_at) < within
 
 
-def draft_notif_record(notif_dir, core, reason, recipient_hex, sender_npub, now):
+def draft_notif_record(notif_dir, core, reason, recipient_hex, sender_npub, now,
+                       recipient_file=False):
     """送信記録を保存（送信時刻・宛先・送信者の npub）。通知は主張であり到達の
-    証明ではない — 受け手は board_draft_fetch で自分で確認する（§25.2）。"""
+    証明ではない — 受け手は board_draft_fetch で自分で確認する（§25.2）。
+    recipient_file=True のときは宛先ごとに別記録（§27.1 の --cosigners 用）。"""
     os.makedirs(notif_dir, exist_ok=True)
-    with open(draft_notif_record_path(notif_dir, core, reason), 'w') as f:
+    path = draft_notif_record_path(notif_dir, core, reason,
+                                   recipient_hex if recipient_file else None)
+    with open(path, 'w') as f:
         json.dump({'core_hash': core, 'reason': reason,
                    'recipient_hex': recipient_hex,
                    'sender_npub': sender_npub, 'sent_at': now},
@@ -2942,6 +3025,11 @@ def cmd_board_draft_notify(args):
     送信は nip17_build_seal/gift_wrap ＋ nostr_publish（dm_pub と同型、--auth 対応）。
     同一 reason の再送は送信記録で --within 以内は抑制（--resend で強制再送）。
     --dry-run は対象草案と宛先の一覧のみ表示（送信も記録もしない）。
+    --cosigners（spec §27）指定時は、さらに threshold 未達・期限間近の草案に
+    ついて未署名の eligible 承認者にも NIP-17 DM で通知する。--cosigners 時は
+    --policy が必須（eligible 集合・threshold の判定に必要なため、なしでは
+    exit 1）。承認者通知の送信記録は宛先ごと（<core>:<reason>:<hex>.json）で、
+    発行者通知の記録とは独立。--cosigners なしの既定動作は不変（opt-in）。
     exit: 送信成功・対象なし・スキップのみで 0、fetch 失敗・DM 構築失敗・
     publish 拒否は 1（既存の publish 系と同型の clean fail）。
     """
@@ -2974,6 +3062,10 @@ def cmd_board_draft_notify(args):
             print('policy の board_id が取得対象の board_id と一致しません',
                   file=sys.stderr)
             sys.exit(1)
+    if getattr(args, 'cosigners', False) and policy is None:
+        print('--cosigners には --policy が必須です（eligible 集合・threshold の判定に必要）',
+              file=sys.stderr)
+        sys.exit(1)
     filt = {'kinds': [DRAFT_NOSTR_KIND()], '#h': [args.board_id], 'limit': args.limit}
     sub_id = secrets.token_hex(8)
     events = nostr_request(args.relay, ['REQ', sub_id, filt],
@@ -2988,7 +3080,12 @@ def cmd_board_draft_notify(args):
     targets = draft_notify_targets(verified, now, args.within)
     if not args.include_expired:
         targets = [t for t in targets if t[3] == 'expiring_soon']
-    if not targets:
+    cosigner_targets = []
+    if getattr(args, 'cosigners', False):
+        # --policy なしの拒否は fetch 前に済んでいる（fail-fast）
+        cosigner_targets = draft_cosigner_targets(verified, now, args.within,
+                                                  policy, args.include_expired)
+    if not targets and not cosigner_targets:
         print('通知対象の草案はありませんでした')
         return
     notif_dir = getattr(args, 'notif_dir', None) or DRAFT_NOTIFS_DEFAULT
@@ -3019,6 +3116,36 @@ def cmd_board_draft_notify(args):
             continue
         draft_notif_record(notif_dir, core, reason, publisher_hex, sender_npub, now)
         print(f'[sent] {tag} → {publisher_hex[:16]}... (id={wrap["id"]})')
+    # --- v0.24: 承認者への草案通知 (spec §27: --cosigners) ---
+    for core, d, recipient_hex, reason in cosigner_targets:
+        tag = f'{core[:12]} ({reason})'
+        if args.dry_run:
+            print(f'[dry-run] cosigner {tag} → {recipient_hex[:16]}... '
+                  f'({d["decision"]})')
+            continue
+        if not args.resend and draft_notif_already_sent(
+                notif_dir, core, reason, now, args.within,
+                recipient_hex=recipient_hex):
+            print(f'[skip] cosigner {tag} — {args.within}s 以内に送信済み')
+            continue
+        msg = draft_cosigner_message(d, core, reason, args.relay, policy)
+        try:
+            seal = nip17_build_seal(secret, recipient_hex, msg)
+            wrap = nip17_build_gift_wrap(seal, recipient_hex)
+        except Exception as e:
+            print(f'DM の構築に失敗しました (cosigner {tag}): {e}',
+                  file=sys.stderr)
+            failed += 1
+            continue
+        accepted, r = nostr_publish(args.relay, wrap,
+                                    auth_secret=secret if args.auth else None)
+        if not accepted:
+            print(f'publish 拒否 (cosigner {tag}): {r}', file=sys.stderr)
+            failed += 1
+            continue
+        draft_notif_record(notif_dir, core, reason, recipient_hex,
+                           sender_npub, now, recipient_file=True)
+        print(f'[sent] cosigner {tag} → {recipient_hex[:16]}... (id={wrap["id"]})')
     if failed:
         sys.exit(1)
 
@@ -3514,6 +3641,7 @@ def main():
     s.add_argument('--resend', action='store_true', help='送信記録があっても強制的に再送する')
     s.add_argument('--from', dest='from_npub', default=None, help='送信者の npub（keyfile の鍵と一致しなければ拒否 — 取り違え防止）')
     s.add_argument('--notif-dir', default=None, help='送信記録のディレクトリ (既定: ~/.config/nakama/draft_notifs)')
+    s.add_argument('--cosigners', action='store_true', help='threshold 未達・期限間近の草案について、未署名の eligible 承認者にも通知する（--policy 必須、spec §27）')
 
     args = ap.parse_args()
     {'init': cmd_init, 'whoami': cmd_whoami, 'propose': cmd_propose,

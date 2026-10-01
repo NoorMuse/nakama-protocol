@@ -1,7 +1,7 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.3
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21）。v0.17 完了 — 30103+30104 横断 fetch の統合（§22）。v0.18 完了 — fetch 時点の政策スナップショットの保存（§23））。v0.19 完了 — 草案の期限（§24）。v0.20 完了 — 草案への自動通知（§25））。v0.21 設計完了 — kind 30100–30104 の正式割当申請（§26）、v0.22 完了 — NIP ドラフト文書の作成（§26）。v0.23 完了 — 既存採用の確認結果と kind 再マップ実装（30100–30104→30107–30111、§26.9・§26.10）。v0.24 設計 — 承認者への草案通知（§27、設計のみ）
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21）。v0.17 完了 — 30103+30104 横断 fetch の統合（§22）。v0.18 完了 — fetch 時点の政策スナップショットの保存（§23））。v0.19 完了 — 草案の期限（§24）。v0.20 完了 — 草案への自動通知（§25））。v0.21 設計完了 — kind 30100–30104 の正式割当申請（§26）、v0.22 完了 — NIP ドラフト文書の作成（§26）。v0.23 完了 — 既存採用の確認結果と kind 再マップ実装（30100–30104→30107–30111、§26.9・§26.10）。v0.24 完了 — 承認者への草案通知（§27）
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -252,7 +252,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.21**（設計完了）: kind 30100–30104 の正式割当申請（NIP 化）（§26）。§24.4・§25.3 のスコープ外項目を昇格: 5 kinds（revocation 30100 / compromise 30101 / rotation 30102 / decision 30103 / draft 30104、すべて parameterized replaceable）の一覧固定、NIP ドラフト文書（`docs/NIP-nakama.md`）の構成案（概要・kind 一覧・tags/content/署名者/置換ルール・三段階検証・互換性・セキュリティ考慮）、衝突時のフォールバック（kind 定数の再マップ・移行期間の両 kind 購読・公開済みは再公開しない）、手順（repo 内草案→既存採用の確認→nips PR）。正直に書く: 30000–39999 は誰でも使える名前空間のため申請は独占ではなく文書化＋衝突回避、NIP 登録は合意形成であって強制ではなく署名検証が本質、PR 投稿・レビュー対応は人間社会の承認プロセスで 人間の確認が必要。コード変更なし（実装は v0.22 で文書作成）。
 - **v0.22**（完了）: NIP ドラフト文書 `docs/NIP-nakama.md` を §26.3 の構成案どおりに作成（commit fcc2f8e）。概要・5 kind の tags/content/署名者/スロット・三段階検証・互換性・セキュリティ考慮・既存採用の確認手順（§26.4）・正直な注記。コード変更なし（文書のみ）。
 - **v0.23**（完了）: 既存採用の確認結果と kind 再マップ実装（§26.9・§26.10）。2026-10-01 のリレー調査で 30100–30104 すべてに他者の先行採用を確認（job マーケットプレイス風アプリの 30100、ポルトガル語圏投票アプリの 30100/30101/30102/30104）。nakama イベントは未公開のためクリーンカット: 新ブロック 30107–30111（revocation→30107 / compromise→30108 / rotation→30109 / decision→30110 / draft→30111）。実装: kind 定数 5 つを環境変数上書き可能な関数に変更（`NAKAMA_KIND_REVOCATION` 等、既定 30107–30111。非 int・30000–39999 範囲外は使用時に exit 1 で拒否）、fetch 系の購読 kind・`board_fetch_all` のホワイトリストを定数ベース化、`decision_nostr_event` / `verify_board_decision_nostr_event` の既定 kind を使用時解決に変更。spec の kind 参照を一括更新（§12/13/17/19/21/22/24/25、§26.1 に再マップ注記）。旧 kinds の購読・互換サポートはスコープ外のまま。テスト `test_kind_remap.py` 新規 5 ケース群通過＋全 16 テストファイル回帰維持。
-- **v0.24**（設計中）: 承認者への草案通知（§27）。§25.3 のスコープ外項目を昇格: `board_draft_notify --cosigners` で threshold 未達・期限間近の草案について未署名の eligible メンバーにも NIP-17 DM で通知（`--policy` 必須、宛先ごとの送信記録 `<core_hash>:<reason>:<recipient_hex>.json`、既定動作は不変の opt-in）。テスト計画 10 ケース（オフライン）; コードは次ラン。
+- **v0.24**（完了）: 承認者への草案通知（§27）。`board_draft_notify --cosigners` を実装: threshold 未達・期限間近の草案について未署名の eligible メンバーに NIP-17 DM（`--policy` 必須、宛先ごとの送信記録 `<core_hash>:<reason>:<recipient_hex>.json`、発行者通知と並行、`--cosigners` なしの既定動作は不変）。テスト `test_draft_cosigners.py` 9 ケース通過＋全 17 スイート回帰維持。
 
 ---
 
@@ -1625,7 +1625,7 @@ relay.damus.io・nos.lol・relay.primal.net・relay.nostr.band に対し kinds=[
 
 ---
 
-## 27. v0.24 設計: 承認者への草案通知（設計のみ）
+## 27. v0.24: 承認者への草案通知（実装完了）
 
 §25.3 のスコープ外項目「承認者への通知」を昇格。§25（v0.20）の `board_draft_notify` は発行者（publisher）のみに通知するが、期限間近で threshold 未達の草案は、署名していない承認者がその存在を知らないまま黙って死ぬ。通知が「正直な運用者のための仕組み」（§25）であるなら、署名の機会を知らせることも同じ思想の範囲内。ただし §25.1 の設計判断（承認者に「成立しないかもしれない」と知る義務はなく、gift wrap の乱発を避ける）は維持する: 既定動作は不変で、`--cosigners` を付けた場合のみ宛先が広がる（opt-in の狭いチャネル）。
 
@@ -1684,6 +1684,19 @@ verify the draft yourself with: board_draft_fetch <relay> <board_id>
 8. `--dry-run` → 送信せず一覧のみ（発行者＋承認者の宛先表示）、nostr_publish 不呼び出し、記録ディレクトリも作らない。
 9. メッセージ形式の確認（1 行目 `[nakama] draft needs cosignatures`、threshold 不足行、`board_draft_fetch` への誘導）。
 10. 既存全スイートの回帰維持。
+
+### 27.5 実装記録（2026-10-01、v0.24 完了）
+
+§27.1 の設計をコード化。新規コマンドなし — `board_draft_notify` に `--cosigners` フラグを 1 つ追加（fetch・対象選択・DM 構築・送信記録は §25.1 の流用）。
+
+- `nakama.py`:
+  - `draft_cosigner_targets(verified, now, within, policy, include_expired)`（純粋）: §27.1 の対象選択。期限なし・不正型の expires_at は除外、`0 < expires_at - now <= within` → expiring_soon、`--include-expired` 時の期限切れ → expired。`fetch_threshold_status(md, policy, [])`（§21.5 の草案=現行政策のみ）で threshold 未達のものだけ。宛先はマージ済み approvals の npub に含まれず、かつ `first_pub`（最も古い event の publisher hex）とも異なる eligible の npub を `npub_to_hex` で hex 化（形式不正は除外）。
+  - `draft_cosigner_message(d, core, reason, relay, policy)`（純粋）: §27.1 の雛形どおり（`[nakama] draft needs cosignatures`、board・decision（core 先頭 12 hex）・expires_at（UTC 人間可読）・threshold 行は常時表示（`--policy` 必須のため）、footer の自分で確認する旨）。
+  - `draft_notif_record_path` / `draft_notif_already_sent` に `recipient_hex=None` 引数を追加（§25.1 の発行者通知の既定形 `<core>:<reason>.json` は不変）。`draft_notif_record` に `recipient_file=False` フラグを追加（`--cosigners` 時は宛先ごとの `<core>:<reason>:<hex>.json`）。
+  - `cmd_board_draft_notify`: `--cosigners` かつ `--policy` なし → fetch 前に exit 1（fail-fast）。cosigner ターゲットは発行者通知と並行処理（`--dry-run` は発行者＋承認者の一覧、`[skip]`/`[sent]` は cosigner タグ付き、`--resend` は両系統に適用。`failed` は両系統で共有、exit は §25.1 と同型）。
+  - argparse に `--cosigners` を追加、usage 行も更新。
+- テスト `test_draft_cosigners.py` 新規 9 ケース通過（§27.4 の計画 10 ケースのうち 1–9 を実装、内容: 発行者＋未署名 eligible への DM・宛先の gift wrap p タグ確認・宛先ごとの記録 `<core>:expiring_soon:<hex>.json`、達成済み・署名済み・publisher・期限なしの対象外、`--policy` なしの exit 1 拒否、宛先ごとの `[skip]`／個別再送／`--resend`、`--dry-run` の一覧・記録なし、DM 形式。計画 10 の回帰は全 17 テストファイルで実施しすべて通過）。
+- §25.1 の既定動作（`--cosigners` なし）は不変 — `test_draft_notify.py` 9 ケースがそのまま通過。
 
 ---
 
@@ -1746,4 +1759,4 @@ Contributions that shaped this spec and the code. Built by many hands.
 - 2026-10-01: v0.22 完了 — §26.3 の設計に基づき NIP ドラフト文書 `docs/NIP-nakama.md` を作成（概要・動機、5-kind 表、tags/content/署名者/置換ルール、三段階検証、互換性、セキュリティ考慮、既存採用の確認手順 §26.4 の文書化、正直な注記: 30000–39999 は公共空間で独占ではない）。既存採用の確認は v0.23 で実施。ロードマップ §7 に v0.22（完了）、ヘッダの日付行も更新。
 - 2026-10-01: v0.23 設計 — §26.4 の手順 2「既存採用の確認」を実施。damus/nos.lol/primal の wss ワイルドカード REQ（nostr.band API は到達不能）で 30100–30104 すべてに他者の先行採用を確認（job マーケットプレイス風アプリの 30100、ポルトガル語圏投票アプリの 30100/30101/30102/30104）。nakama イベントは未公開のためクリーンカット: 連続した静かなブロック 30107–30111 に再マップ（revocation→30107/compromise→30108/rotation→30109/decision→30110/draft→30111）。代替ブロック調査で 30107–30112・30114–30120 が無反応。NIP ドラフト §6 に調査結果を記録、草案の kind 表を新ブロックに更新＋再マップ経緯を注記。§26.9（調査記録）・§26.10（再マップ設計）を spec に固定。ロードマップ §7 に v0.23（設計中）、ヘッダの日付行も更新。
 - 2026-10-01: v0.23 完了 — §26.10 の設計を実装。`_kind_from_env` ヘルパー新設、kind 定数 5 つを環境変数上書き可能な関数に変更（`NAKAMA_KIND_REVOCATION`・`NAKAMA_KIND_COMPROMISE`・`NAKAMA_KIND_ROTATION`・`NAKAMA_KIND_DECISION`・`NAKAMA_KIND_DRAFT`、既定 30107–30111。非 int・30000–39999 範囲外は使用時に exit 1 で拒否、無関係なコマンドは壊さない）。fetch 系 6 コマンドの購読 kind と `board_fetch_all` のホワイトリストを定数ベース化。`decision_nostr_event` / `verify_board_decision_nostr_event` の kind 既定引数を `None` 化し関数内で使用時解決（デフォルト引数評価時の環境変数読みを回避）。spec の kind 参照を一括更新（§12/13/17/19/21/22/24/25 の現行記述、§26.1 に「再マップ済み（v0.23）」注記。§7・開発ログ・§26.9 の旧番号は実装当時の記録として残す）。`test_kind_remap.py` 新規 5 ケース群通過（既定値・単独上書き・不正値拒否＋使用時検証の証明・既定 kind の使用・ホワイトリストの定数ベース）＋全 16 テストファイル回帰維持。ロードマップ §7 に v0.23（完了）、ヘッダの日付行も更新。
-- 2026-10-01: v0.24 設計 — 承認者への草案通知を spec §27 に固定（設計のみ、実装は次ラン）。§25.3 のスコープ外「承認者への通知」を昇格。設計の要点: (1) 既存 `board_draft_notify` に `--cosigners` フラグを追加（新規コマンドなし — fetch・対象選択・DM 構築・送信記録は §25.1 の流用）。(2) `--cosigners` 時は `--policy` 必須（eligible 集合＋threshold がなければ宛先と未達が判定できない、なければ exit 1）。(3) 宛先はマージ済み approvals に含まれず publisher でもない eligible の npub。対象は threshold 未達・期限間近（`--within`、既定 24h）の草案のみ（§25.1 の既定動作は不変の opt-in、spam 抑制の設計判断は維持）。(4) 宛先ごとの送信記録 `<core_hash>:<reason>:<recipient_hex>.json`（発行者通知の記録とファイル名で区別）。(5) DM 平文は `[nakama] draft needs cosignatures` の雛形（命令形を避け現状告知にとどめる）。正直に書く: §25.2 の 3 点（気休め・誰でも送れる・spam）は適用継続、宛先が広がる分 spam 面は §25 より大きいが (1)(2)(3) で緩和、通知は義務ではなく知る機会。スコープ外: デーモン化・既読追跡・threshold 達成済み草案への通知・policy-update 決定の草案化。テスト計画 10 ケース（オフライン）。コード変更なし。ロードマップ §7 に v0.24（設計中）、ヘッダの日付行も更新。なお本ラン開始時に §26.10 の残課題「nostr.band 検索 API での再確認」を再試行したが到達不能（`curl: (52) Empty reply from server`）— 引き続き PR 提出前に再実施として記録継続。
+- 2026-10-01: v0.24 完了 — §27 の設計を実装。新規コマンドなし、`board_draft_notify` に `--cosigners` フラグを追加。threshold 未達・期限間近（`--within`、既定 24h）の草案について、未署名の eligible メンバーに NIP-17 DM で通知（`--policy` 必須、なければ fetch 前に exit 1。対象選択は `draft_cosigner_targets`（純粋）— 期限なし・達成済み・署名済み・publisher は対象外。DM 平文は `draft_cosigner_message`（`[nakama] draft needs cosignatures` の雛形、threshold 行は常時表示）。送信記録は宛先ごとに `<core>:<reason>:<hex>.json`（発行者通知の `<core>:<reason>.json` と独立）。`test_draft_cosigners.py` 新規 9 ケース通過＋全 17 テストファイル回帰維持。`--cosigners` なしの既定動作は不変。
