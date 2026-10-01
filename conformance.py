@@ -103,6 +103,9 @@ UX).
 Passing `check_liveness` on your liveness proofs (optionally with
 `--bond`) proves liveness-proof wire compatibility (signature over
 the canonical liveness message, bond linkage, and freshness
+semantics). Passing `check_compromise` on your declaration files
+proves compromise-declaration wire compatibility (declarant
+signature over the canonical compromise message, withdrawn
 semantics).
 
 Platform-binding certificate conformance:
@@ -147,6 +150,28 @@ reference implementation.
 reference proofs built by nakama.py's own primitives (pass
 `--now` to the checker for deterministic freshness checks in
 your own tests).
+
+Compromise declaration conformance:
+
+    python3 conformance.py check_compromise <decl1.json> [...]
+
+Verifies each file is a key-compromise-declaration as written by
+`build_compromise_declaration` (spec §13): shape checks
+(protocol/version/type, valid subject/declarant npubs, created_at
+int, withdrawn bool, 128-hex sig, optional 64-hex bond_hash,
+optional string reason/evidence) plus the declarant's Schnorr
+signature over compromise_message(subject_hex, declarant_hex,
+created_at, withdrawn, bond_hash?, reason?, evidence?),
+mirroring the reference `verify_compromise_event` acceptance
+rule. Empty optional fields are excluded from the signed message
+exactly as in the reference; `withdrawn` is always signed. The
+local compromise registry (import dedup/update semantics) is a
+local-operational step outside wire compatibility. Use this to
+prove a second implementation's compromise declarations are
+wire-compatible with the reference implementation.
+
+`python3 conformance.py selftest` also covers `check_compromise`
+with reference declarations built by nakama.py's own primitives.
 """
 
 import json
@@ -899,6 +924,114 @@ def check_liveness_files(bond_path: str | None, max_age: int,
     return 0 if failures == 0 else 1
 
 
+# ---------- check_compromise: key-compromise-declaration conformance ----------
+
+def conform_compromise(d: dict):
+    """Verify a key-compromise-declaration as written by
+    `build_compromise_declaration` (spec §13).
+
+    Shape checks (protocol/version/type, valid subject/declarant
+    npubs, created_at int, withdrawn bool, 128-hex sig, optional
+    64-hex bond_hash, optional string reason/evidence) plus the
+    declarant's Schnorr signature over
+    compromise_message(subject_hex, declarant_hex, created_at,
+    withdrawn, bond_hash?, reason?, evidence?) — same acceptance
+    rule as the reference `verify_compromise_event`. Empty optional
+    fields are excluded from the signed message exactly as in the
+    reference; withdrawn is always included. The local compromise
+    registry (import_compromise_event dedup/update semantics) is a
+    local-operational step outside wire compatibility.
+    Returns (ok, errs, info).
+    """
+    errs: list[str] = []
+    info: list[str] = []
+    if not isinstance(d, dict):
+        return False, ['compromise declaration is not a JSON object'], info
+    if d.get('protocol') != 'nakama':
+        errs.append('protocol != "nakama"')
+    if d.get('version') != 1:
+        errs.append('version != 1')
+    if d.get('type') != 'key-compromise-declaration':
+        errs.append('type != "key-compromise-declaration"')
+    shape_ok = True
+    subject = d.get('subject')
+    declarant = d.get('declarant')
+    for label, v in (('subject', subject), ('declarant', declarant)):
+        if not isinstance(v, str) or nakama.npub_to_hex(v) is None:
+            errs.append(f'{label} must be a valid npub')
+            shape_ok = False
+    if not isinstance(d.get('created_at'), int) \
+            or isinstance(d.get('created_at'), bool):
+        errs.append('created_at must be an int')
+        shape_ok = False
+    withdrawn = d.get('withdrawn')
+    if not isinstance(withdrawn, bool):
+        errs.append('withdrawn must be a bool')
+        shape_ok = False
+    sig_hex = d.get('sig')
+    sig_b = None
+    if not isinstance(sig_hex, str):
+        errs.append('sig must be a 128-hex-char string')
+        shape_ok = False
+    else:
+        try:
+            sig_b = bytes.fromhex(sig_hex)
+            if len(sig_b) != 64:
+                raise ValueError
+        except ValueError:
+            errs.append('sig must be 128 hex chars (64 bytes)')
+            sig_b = None
+            shape_ok = False
+    bh = d.get('bond_hash', '')
+    if bh and not (isinstance(bh, str)
+                   and re.fullmatch(r'[0-9a-f]{64}', bh)):
+        errs.append('bond_hash must be 64 hex chars when present')
+        shape_ok = False
+    reason = d.get('reason', '')
+    evidence = d.get('evidence', '')
+    for label, v in (('reason', reason), ('evidence', evidence)):
+        if not isinstance(v, str):
+            errs.append(f'{label} must be a string when present')
+            shape_ok = False
+    if shape_ok:
+        try:
+            msg = nakama.compromise_message(
+                nakama.npub_to_hex(subject),
+                nakama.npub_to_hex(declarant),
+                int(d['created_at']), withdrawn, bh, reason, evidence)
+            if not nakama.verify_schnorr(declarant, sig_b, msg):
+                errs.append('invalid signature over '
+                            'compromise_message(subject_hex, declarant_hex, '
+                            'created_at, withdrawn, bond_hash?, reason?, '
+                            'evidence?)')
+        except Exception as e:
+            errs.append(f'signature check failed: {e}')
+    info.append(subject if isinstance(subject, str) else '?')
+    info.append('withdrawn' if withdrawn is True else 'active')
+    return (len(errs) == 0), errs, info
+
+
+def check_compromise_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            d = json.load(open(p))
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_compromise(d)
+        if ok:
+            print(f"{p}: PASS ({'; '.join(info)})")
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- selftest: reference events built by nakama.py ----------
 
 def _key() -> tuple[bytes, str]:
@@ -1377,8 +1510,81 @@ def selftest() -> int:
     print(f'--- liveness {live_total - live_fails}/{live_total} passed ---')
     fails += live_fails
 
+    # Compromise declaration conformance: reference declarations
+    # built with nakama.py's build_compromise_declaration must verify;
+    # malformed, wrong-signer, and wrong-type ones must be rejected.
+    # withdrawn=True is a signed field (always included in the
+    # message), so it is tested as a positive case, not an exception.
+    cp_fails = 0
+    s_n, np_n = _key()
+    s_o, np_o = _key()
+    cp_now = int(time.time())
+    decl = nakama.build_compromise_declaration(
+        s_n, np_o, cp_now, reason='conformance selftest',
+        evidence='https://example.invalid/evidence',
+        bond_hash_hex='cd' * 32)
+    decl_wd = nakama.build_compromise_declaration(
+        s_n, np_o, cp_now, withdrawn=True,
+        reason='conformance selftest (withdrawn)')
+
+    cp_pos = [('valid declaration', decl),
+              ('valid withdrawn declaration', decl_wd)]
+    for name, dd in cp_pos:
+        ok, errs, info = conform_compromise(dd)
+        print(f'compromise/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        cp_fails += 0 if ok else 1
+
+    cp_neg = []
+    bad_sig = json.loads(json.dumps(decl))
+    bad_sig['sig'] = '00' * 128
+    cp_neg.append(('tampered signature', bad_sig))
+    wrong_signer = json.loads(json.dumps(decl))
+    wrong_signer['sig'] = nakama.sign_schnorr(
+        s_o, nakama.compromise_message(
+            nakama.npub_to_hex(np_o), nakama.npub_to_hex(np_n),
+            cp_now, False, 'cd' * 32,
+            'conformance selftest', 'https://example.invalid/evidence')
+    ).hex()
+    cp_neg.append(('sig from subject instead of declarant', wrong_signer))
+    bad_type = json.loads(json.dumps(decl))
+    bad_type['type'] = 'key-compromise-accusation'
+    cp_neg.append(('wrong type', bad_type))
+    bad_subject = json.loads(json.dumps(decl))
+    bad_subject['subject'] = 'npub1invalid'
+    cp_neg.append(('invalid subject npub', bad_subject))
+    bad_declarant = json.loads(json.dumps(decl))
+    bad_declarant['declarant'] = 'npub1invalid'
+    cp_neg.append(('invalid declarant npub', bad_declarant))
+    bad_ca = json.loads(json.dumps(decl))
+    bad_ca['created_at'] = 'not-a-time'
+    cp_neg.append(('created_at not an int', bad_ca))
+    bad_wd = json.loads(json.dumps(decl))
+    bad_wd['withdrawn'] = 1
+    cp_neg.append(('withdrawn not a bool', bad_wd))
+    bad_bh = json.loads(json.dumps(decl))
+    bad_bh['bond_hash'] = 'zz' * 32
+    cp_neg.append(('bond_hash not hex', bad_bh))
+    no_sig = json.loads(json.dumps(decl))
+    del no_sig['sig']
+    cp_neg.append(('missing sig', no_sig))
+
+    for name, dd in cp_neg:
+        ok, errs, info = conform_compromise(dd)
+        good = not ok
+        print(f'compromise-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            cp_fails += 1
+
+    cp_total = len(cp_pos) + len(cp_neg)
+    print(f'--- compromise {cp_total - cp_fails}/{cp_total} passed ---')
+    fails += cp_fails
+
     grand = total + dm_total + board_total + dec_total + bond_total \
-        + binding_total + live_total
+        + binding_total + live_total + cp_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -1454,6 +1660,11 @@ def main(argv: list[str]) -> int:
                   '[--max-age secs] [--now unixts] <liveness.json> [...]')
             return 2
         return check_liveness_files(bond_path, max_age, now, rest)
+    if len(argv) >= 2 and argv[1] == 'check_compromise':
+        if len(argv) < 3:
+            print('usage: conformance.py check_compromise <decl1.json> [...]')
+            return 2
+        return check_compromise_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -1464,6 +1675,7 @@ def main(argv: list[str]) -> int:
           'check_binding <binding.json> [...] | '
           'check_liveness [--bond bond.json] [--max-age secs] [--now unixts] '
           '<liveness.json> [...] | '
+          'check_compromise <decl.json> [...] | '
           'selftest')
     return 2
 
