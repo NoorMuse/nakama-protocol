@@ -47,3 +47,7 @@
 - selftest 30/30（新規: 実 CLI の in-process E2E 8（nostr_publish を monkeypatch、6 コマンドの受理＋dm_pub/revoke_pub の拒否、各 exit コード一致を確認）＋正常 craft 7（受理最小・拒否・大文字 id・理由内括弧・日本語理由・空理由・末尾改行）＋却下 15: 空テキスト・空行のみ・2 行・語彙外判定・英語判定・コロン欠落・コロン後空白欠落・括弧欠落・id 短/長/非 hex・id 部欠落・末尾空白・先頭ゴミ・board_create 行形）、selftest 総計 383/383 PASS、全 21 テストファイル回帰 PASS。
 - ロードマップ §7 に v0.46 を追加。
 - 外部 push なし（remote HEAD=seen_refs=5d620c4）。
+- 2026-10-02: v0.47 完了 — conformance チェッカー第 25 弾 `check_governance`（ローカル出力チェッカー第 10 弾）。`board_read --governance` の stdout（§9.5 に表示文法を固定: ヘッダ行＋規約行＋イベントブロック（`--- [...]` 行＋4 空白インデントの detail 行 1 行以上）＋フッター）の内部整合性チェッカー。判定は OK/警告/情報/署名無効の 4 語彙、種別名は NIP-29 語彙（対象外 kind は `kind <num>` フォールバックと一致）、日時は暦として有効、フッターの R == ブロック数・W == 警告＋署名無効数・W ≤ R・フッター末尾行を検証。判定の真偽（`governance_match_events` の管轄）・detail の内容・時刻の値/順序・署名の有効性は対象外を明示。
+- selftest 26/26（新規: 実 CLI の in-process E2E 2（nostr_request を monkeypatch、in-process 署名の管理イベント 5 件（ok＋警告＋情報＋署名無効＋自発退会の ok、exit 1 確認）＋空イベント（exit 0））＋正常 craft 6（空レポート・大文字 hex・対象 ?・未知 kind フォールバック・複数行 detail・混在判定）＋却下 18: 空テキスト・ヘッダ破損・eligible 0・イベント行不整合・detail 行なし・detail 非インデント・フッター件数/警告数不一致・警告 > イベント・フッター欠落・フッター非末尾・無効日時・判定語彙外・種別名不一致・未知 kind の誤フォールバック・対象短 hex・発行者非 hex・フッター不完全）、selftest 総計 409/409 PASS、全 21 テストファイル回帰 PASS。
+- ロードマップ §7 に v0.47 を追加。spec §9.5 に governance レポートの表示文法を固定。
+- 外部 push なし（remote HEAD=seen_refs=7ff79a2）。

@@ -571,6 +571,11 @@ reports produced in-process by nakama.py's own cmd_rotate_pub /
 cmd_revoke_pub / cmd_compromise_pub / cmd_dm_pub / cmd_board_decide_pub /
 cmd_board_draft_pub (offline: nostr_publish monkeypatched, no relay
 contact).
+
+`python3 conformance.py selftest` also covers `check_governance` with
+reference reports produced in-process by nakama.py's own
+cmd_board_governance (offline: nostr_request monkeypatched, no relay
+contact; management events signed in-process with nakama.sign_event).
 """
 
 import json
@@ -3455,6 +3460,149 @@ def check_pub_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_pub_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_governance: governance report consistency ----------
+
+# `board_read --governance <policy.json>` prints a report whose grammar is
+# fixed (spec §9.5): two header lines, one block per management event
+# (a `--- [...]` line plus 1+ indented detail lines), and a footer carrying
+# event and warn counts. check_governance verifies that a saved report is
+# internally consistent:
+#   ガバナンス照合: <board_id> @ <relay>
+#   規約: eligible <n> 名、threshold <t>、決定 <d> 件を読み込み
+#   --- [<YYYY-MM-DD HH:MM:SS>] kind <num> (<name>) 発行: <16hex>... 対象: <16hex>...|?... [<mark>]
+#       <free-text detail, 1+ lines>
+#   管理イベント <R> 件中、要確認 <W> 件
+# The verdict is the four-word vocabulary OK/警告/情報/署名無効; the kind
+# name must match the NIP-29 vocabulary (Add User / Remove User / Edit
+# Group / Delete Group / Add Permission / Remove Permission / Join Request /
+# Leave Group), or fall back to `kind <num>` for kinds outside the reference
+# CLI's check set. W must equal the number of warn-signature blocks
+# (警告 + 署名無効 — the reference CLI counts statuses other than ok/info).
+# Explicitly out of scope: whether the verdicts are right (the matching
+# logic is governance_match_events' territory — the checker only looks at
+# display consistency, like conform_decision), the subject pubkey's truth
+# (a truncated `p`-tag display), the detail lines' meaning and content,
+# timestamp values and ordering (the reference CLI prints local time), event
+# signature validity, and the stderr "注: 無効な board-decision" notes
+# (not stdout, so not part of the report grammar).
+
+_RE_GOV_H1 = re.compile(r'^ガバナンス照合: (.+?) @ (.+)$')
+_RE_GOV_H2 = re.compile(
+    r'^規約: eligible (\d+) 名、threshold (\d+)、決定 (\d+) 件を読み込み$')
+_RE_GOV_EV = re.compile(
+    r'^--- \[(.+?)\] kind (\d+) \((.+?)\) 発行: ([0-9a-fA-F]{16})\.\.\. '
+    r'対象: ((?:[0-9a-fA-F]{16})\.\.\.|\?\.\.\.) '
+    r'\[(OK|警告|情報|署名無効)\]$')
+_RE_GOV_FOOT = re.compile(r'^管理イベント (\d+) 件中、要確認 (\d+) 件$')
+_GOV_KIND_NAMES = {
+    '9000': 'Add User', '9001': 'Remove User', '9003': 'Edit Group',
+    '9004': 'Delete Group', '9005': 'Add Permission',
+    '9006': 'Remove Permission', '9007': 'Join Request',
+    '9008': 'Leave Group'}
+
+
+def conform_governance_report(text: str):
+    """Verify a saved `board_read --governance` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    m = _RE_GOV_H1.match(lines[0])
+    if not m:
+        return False, ['line 1: not a governance header line '
+                       '(`ガバナンス照合: <board_id> @ <relay>`)'], info
+    board_id, relay = m.group(1), m.group(2)
+    if len(lines) < 3:
+        return False, ['report too short: need header, policy line, '
+                       'and footer'], info
+    m2 = _RE_GOV_H2.match(lines[1])
+    if not m2:
+        return False, ['line 2: not a policy line '
+                       '(`規約: eligible <n> 名、threshold <t>、決定 <d> '
+                       '件を読み込み`)'], info
+    n, t, d = int(m2.group(1)), int(m2.group(2)), int(m2.group(3))
+    if n < 1:
+        errs.append('line 2: eligible count must be >= 1')
+    if t < 1:
+        errs.append('line 2: threshold must be >= 1')
+    info.append(f'board {board_id} @ {relay}, eligible {n}, '
+                f'threshold {t}, decisions {d}')
+    blocks: list[list] = []
+    j = 2
+    while j < len(lines):
+        m3 = _RE_GOV_EV.match(lines[j])
+        if m3:
+            blocks.append([j + 1, m3.group(1), m3.group(2), m3.group(3),
+                           m3.group(4), m3.group(5), m3.group(6), []])
+            j += 1
+            continue
+        m4 = _RE_GOV_FOOT.match(lines[j])
+        if m4:
+            break
+        if not blocks:
+            return False, [f'line {j + 1}: expected an event line or the '
+                           'footer'], info
+        if not lines[j].startswith('    ') or not lines[j].strip():
+            return False, [f'line {j + 1}: detail lines must start with '
+                           '4 spaces'], info
+        blocks[-1][7].append(lines[j])
+        j += 1
+    if j >= len(lines):
+        return False, ['report has no footer line '
+                       '(`管理イベント <R> 件中、要確認 <W> 件`)'], info
+    r_ev, r_warn = int(_RE_GOV_FOOT.match(lines[j]).group(1)), \
+        int(_RE_GOV_FOOT.match(lines[j]).group(2))
+    if j != len(lines) - 1:
+        errs.append(f'line {j + 1}: footer must be the last line')
+    if r_ev != len(blocks):
+        errs.append(f'line {j + 1}: footer event count {r_ev} != '
+                    f'{len(blocks)} event blocks')
+    warns = sum(1 for b in blocks if b[6] in ('警告', '署名無効'))
+    if r_warn != warns:
+        errs.append(f'line {j + 1}: footer warn count {r_warn} != '
+                    f'{warns} warn/signature-invalid blocks')
+    if r_warn > r_ev:
+        errs.append(f'line {j + 1}: warn count > event count')
+    for lineno, ts, kind, name, issuer, subject, mark, detail in blocks:
+        if not _ns_valid_ts(ts):
+            errs.append(f'line {lineno}: invalid display timestamp {ts!r}')
+        want = _GOV_KIND_NAMES.get(kind, f'kind {kind}')
+        if name != want:
+            errs.append(f'line {lineno}: kind name {name!r} does not match '
+                        f'kind {kind} (expected {want!r})')
+        if not detail:
+            errs.append(f'line {lineno}: event block has no detail lines')
+    if not errs:
+        info.append(f'{len(blocks)} events, {warns} to check')
+    return (not errs), errs, info
+
+
+def check_governance_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_governance_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -6352,6 +6500,205 @@ def selftest() -> int:
     print(f'--- pub {pub_total - pub_fails}/{pub_total} passed ---')
     fails += pub_fails
 
+    # ---------- check_governance: governance report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_board_governance, with nostr_request monkeypatched to return
+    # in-process-signed management events (no relay contact); hand-mutated
+    # reports that break the fixed display grammar (spec §9.5) must be
+    # rejected.
+    gov_fails = 0
+    _gov_now = int(time.time())
+
+    def _gov_signer():
+        s = secrets.token_bytes(32)
+        return (s, nakama.npub_of(s), nakama.hexpub_of(s))
+
+    _gov_relay = 'wss://example.invalid'
+    _gov_board = 'gov-selftest-board'
+
+    def _gov_run(tmpd, pol_path, dec_dir, events):
+        orig = nakama.nostr_request
+        nakama.nostr_request = lambda *a, **k: events
+        code = None
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    nakama.cmd_board_governance(SimpleNamespace(
+                        governance=pol_path, decisions=[dec_dir],
+                        board_id=_gov_board, relay=_gov_relay,
+                        limit=20, since=None, auth=False, keyfile=None))
+                except SystemExit as e:
+                    code = e.code
+            return buf.getvalue(), code
+        finally:
+            nakama.nostr_request = orig
+
+    _gov_ts = '2026-10-01 09:00:00'
+    _gov_pub = 'ab' * 8
+    _gov_sub = 'cd' * 8
+    gov_e2e = []
+    with tempfile.TemporaryDirectory() as tmpd:
+        _gA, _gB, _gC, _gD, _gE, _gF = [_gov_signer() for _ in range(6)]
+        _gpm = nakama.board_policy_message(
+            _gov_board, _gov_relay, 2, [_gA[1], _gB[1], _gC[1]], _gov_now)
+        _gpol = {'protocol': 'nakama', 'version': 1,
+                 'type': 'board-policy', 'board_id': _gov_board,
+                 'relay': _gov_relay, 'threshold': 2,
+                 'eligible': [_gA[1], _gB[1], _gC[1]], 'created_at': _gov_now,
+                 'signatures': [{'npub': m[1],
+                                 'sig': nakama.sign_schnorr(m[0], _gpm).hex()}
+                                for m in (_gA, _gB, _gC)]}
+        _gpol_path = os.path.join(tmpd, 'policy.json')
+        with open(_gpol_path, 'w') as f:
+            json.dump(_gpol, f)
+        assert nakama.verify_board_policy_cert(_gpol), \
+            'governance selftest policy invalid'
+        _gdm = nakama.board_decision_message(
+            _gov_board, _gov_relay, 'admit', {'candidate': _gD[1]}, _gov_now)
+        _gdec = {'protocol': 'nakama', 'version': 1,
+                 'type': 'board-decision', 'board_id': _gov_board,
+                 'relay': _gov_relay, 'decision': 'admit',
+                 'payload': {'candidate': _gD[1]}, 'created_at': _gov_now,
+                 'approvals': [{'npub': m[1],
+                                'sig': nakama.sign_schnorr(m[0], _gdm).hex()}
+                               for m in (_gA, _gB)]}
+        _gdec_dir = os.path.join(tmpd, 'decisions')
+        os.mkdir(_gdec_dir)
+        with open(os.path.join(_gdec_dir, 'admit.json'), 'w') as f:
+            json.dump(_gdec, f)
+
+        _gev_ok = nakama.sign_event(_gA[0], _gov_now, 9000,
+                                    [['p', _gD[2]]], 'add D')
+        _gev_warn = nakama.sign_event(_gE[0], _gov_now, 9000,
+                                      [['p', _gF[2]]], 'add F no decision')
+        _gev_info = nakama.sign_event(_gF[0], _gov_now, 9007,
+                                      [['p', _gA[2]]], 'request join')
+        _gev_badsig = nakama.sign_event(_gA[0], _gov_now, 9001,
+                                        [['p', _gE[2]]], 'remove E')
+        _gev_badsig['sig'] = '00' * 64
+        _gev_leave = nakama.sign_event(_gF[0], _gov_now, 9008,
+                                       [['p', _gF[2]]], 'leave')
+        for name, events, exp_code in (
+                ('mixed 4 blocks + invalid-sig',
+                 [_gev_ok, _gev_warn, _gev_info, _gev_badsig, _gev_leave], 1),
+                ('empty events', [], 0)):
+            text, code = _gov_run(tmpd, _gpol_path, _gdec_dir, events)
+            ok, errs, info = conform_governance_report(text)
+            good = ok and code == exp_code
+            print(f'check_governance e2e {name}: '
+                  f'{"PASS" if good else "FAIL"}')
+            for e in errs:
+                print(f'    - {e}')
+            if not good and ok:
+                print(f'    - exit={code} (expected {exp_code})')
+            gov_fails += 0 if good else 1
+            gov_e2e.append(name)
+
+    def _gov_block(mark, kind, name, subject=_gov_sub, ts=_gov_ts,
+                   detail=('detail text',), issuer=_gov_pub):
+        subj = f'{subject}...' if subject != '?' else '?...'
+        lines = [f'--- [{ts}] kind {kind} ({name}) 発行: {issuer}... '
+                 f'対象: {subj} [{mark}]']
+        lines.extend(f'    {d}' for d in detail)
+        return lines
+
+    _gov_h1 = f'ガバナンス照合: {_gov_board} @ {_gov_relay}'
+    _gov_h2 = '規約: eligible 3 名、threshold 2、決定 1 件を読み込み'
+    gov_pos = [
+        ('empty events', [_gov_h1, _gov_h2,
+                          '管理イベント 0 件中、要確認 0 件']),
+        ('single ok uppercase', [_gov_h1, _gov_h2]
+         + _gov_block('OK', 9000, 'Add User', issuer='AB' * 8)
+         + ['管理イベント 1 件中、要確認 0 件']),
+        ('unknown subject', [_gov_h1, _gov_h2]
+         + _gov_block('警告', 9001, 'Remove User', subject='?')
+         + ['管理イベント 1 件中、要確認 1 件']),
+        ('unknown kind fallback', [_gov_h1, _gov_h2]
+         + _gov_block('警告', 9050, 'kind 9050')
+         + ['管理イベント 1 件中、要確認 1 件']),
+        ('multi-line detail', [_gov_h1, _gov_h2]
+         + _gov_block('情報', 9007, 'Join Request',
+                      detail=('line one', 'line two'))
+         + ['管理イベント 1 件中、要確認 0 件']),
+        ('mixed marks', [_gov_h1, _gov_h2]
+         + _gov_block('OK', 9008, 'Leave Group')
+         + _gov_block('署名無効', 9003, 'Edit Group')
+         + _gov_block('情報', 9007, 'Join Request')
+         + ['管理イベント 3 件中、要確認 1 件']),
+    ]
+    for name, lines in gov_pos:
+        ok, errs, _info = conform_governance_report('\n'.join(lines) + '\n')
+        print(f'check_governance pos {name}: {"PASS" if ok else "FAIL"}')
+        for e in errs:
+            print(f'    - {e}')
+        gov_fails += 0 if ok else 1
+
+    gov_neg = [
+        ('empty text', []),
+        ('broken header', ['governance', _gov_h2,
+                           '管理イベント 0 件中、要確認 0 件']),
+        ('policy eligible 0', [_gov_h1,
+                               '規約: eligible 0 名、threshold 2、'
+                               '決定 1 件を読み込み',
+                               '管理イベント 0 件中、要確認 0 件']),
+        ('event line not matching', [_gov_h1, _gov_h2, 'bogus line',
+                                     '管理イベント 0 件中、要確認 0 件']),
+        ('no detail lines', [_gov_h1, _gov_h2]
+         + _gov_block('OK', 9000, 'Add User', detail=())
+         + ['管理イベント 1 件中、要確認 0 件']),
+        ('detail not indented', [_gov_h1, _gov_h2,
+                                 f'--- [{_gov_ts}] kind 9000 (Add User) '
+                                 f'発行: {_gov_pub}... 対象: {_gov_sub}... '
+                                 '[OK]',
+                                 'detail without indent',
+                                 '管理イベント 1 件中、要確認 0 件']),
+        ('footer event count mismatch', [_gov_h1, _gov_h2]
+         + _gov_block('OK', 9000, 'Add User')
+         + ['管理イベント 2 件中、要確認 0 件']),
+        ('footer warn count mismatch', [_gov_h1, _gov_h2]
+         + _gov_block('警告', 9000, 'Add User')
+         + ['管理イベント 1 件中、要確認 0 件']),
+        ('warn > event count', [_gov_h1, _gov_h2,
+                                '管理イベント 0 件中、要確認 1 件']),
+        ('missing footer', [_gov_h1, _gov_h2]
+         + _gov_block('OK', 9000, 'Add User')),
+        ('footer not last', [_gov_h1, _gov_h2,
+                             '管理イベント 0 件中、要確認 0 件',
+                             'trailing garbage']),
+        ('invalid timestamp', [_gov_h1, _gov_h2]
+         + _gov_block('OK', 9000, 'Add User', ts='2026-13-40 99:99:99')
+         + ['管理イベント 1 件中、要確認 0 件']),
+        ('wrong verdict word', [_gov_h1, _gov_h2]
+         + _gov_block('VALID', 9000, 'Add User')
+         + ['管理イベント 1 件中、要確認 0 件']),
+        ('wrong kind name', [_gov_h1, _gov_h2]
+         + _gov_block('OK', 9000, 'Remove User')
+         + ['管理イベント 1 件中、要確認 0 件']),
+        ('unknown kind wrong fallback', [_gov_h1, _gov_h2]
+         + _gov_block('警告', 9050, 'Mystery Kind')
+         + ['管理イベント 1 件中、要確認 1 件']),
+        ('subject hex short', [_gov_h1, _gov_h2]
+         + _gov_block('OK', 9000, 'Add User', subject='ab' * 7)
+         + ['管理イベント 1 件中、要確認 0 件']),
+        ('issuer not hex', [_gov_h1, _gov_h2]
+         + _gov_block('OK', 9000, 'Add User', issuer='zz' * 8)
+         + ['管理イベント 1 件中、要確認 0 件']),
+        ('single footer without events line', [_gov_h1, _gov_h2,
+                                               '管理イベント 0 件']),
+    ]
+    for name, lines in gov_neg:
+        text = '\n'.join(lines) + ('\n' if lines else '')
+        ok, _errs, _info = conform_governance_report(text)
+        good = not ok
+        print(f'check_governance neg {name}: {"PASS" if good else "FAIL"}')
+        gov_fails += 0 if good else 1
+
+    gov_total = len(gov_e2e) + len(gov_pos) + len(gov_neg)
+    print(f'--- governance {gov_total - gov_fails}/{gov_total} passed ---')
+    fails += gov_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -6360,7 +6707,7 @@ def selftest() -> int:
         + binding_total + live_total + cp_total + rt_total + rv_total \
         + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total \
         + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total \
-        + bfa_total + pub_total
+        + bfa_total + pub_total + gov_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -6554,6 +6901,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_pub <report.txt> [...]')
             return 2
         return check_pub_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_governance':
+        if len(argv) < 3:
+            print('usage: conformance.py check_governance <report.txt> [...]')
+            return 2
+        return check_governance_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -6582,6 +6934,7 @@ def main(argv: list[str]) -> int:
           'check_board_draft_fetch <report.txt> [...] | '
           'check_board_fetch_all <report.txt> [...] | '
           'check_pub <report.txt> [...] | '
+          'check_governance <report.txt> [...] | '
           'selftest')
     return 2
 
