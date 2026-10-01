@@ -102,3 +102,8 @@
 - selftest 31/31（新規: 実 CLI の in-process E2E 4（実鍵ペア＋temp keyfile — 素レポート・`--no-expiry`・`--markdown`・0 日、各 stdout＋exit 完全一致）＋正常 craft 7（最小・no-expiry・末尾空行・改行なし・markdown 付き・0 日・空白入りファイル名）＋却下 20: 空テキスト・ゴミ行・`accept` レポート・1 行のみ・2 行のみ・npub 短・npub1 接頭辞欠落・npub 内空白・期限行改変・存在しない日付・日数負数・日数非数値・no-expiry 行改変・markdown 空行欠落・ヘッダ改変・マーカー種別違い・開始 fence 違い・本文非 base64url・終了 fence 欠落・fence 後追記）、selftest 総計 939/939 PASS、全 21 テストファイル回帰 PASS（`grand` 合計への `+ pr_total` 追加を含む）。
 - ロードマップ §7 に v0.69 を追加。spec §2.2.1 に propose レポートの表示文法を固定。spec をリポジトリに同期。
 - 外部 push なし（run 開始時 remote HEAD=seen_refs=489086c）。
+
+- 2026-10-02: v0.70 完了 — conformance チェッカー第 48 弾 `check_accept`（ローカル出力チェッカー第 33 弾）。§2.2.2 に accept レポートの表示文法を固定。
+- selftest 32/32（新規: 実 CLI の in-process E2E 4（cmd_propose＋cmd_accept、実鍵ペア＋temp keyfile — 素・--markdown・空白入り out 名・--from-b64）＋正常 craft 7＋却下 21）、selftest 総計 971/971 PASS、全 21 テストファイル回帰 PASS。
+- §7 に v0.69（前回追加漏れ）・v0.70 を追加。spec を files/ と同期。
+- 外部 push なし（run 開始時 remote HEAD=seen_refs=69a4c45）。

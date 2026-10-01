@@ -907,6 +907,32 @@ real key pairs + temp keyfiles — a plain report, a `--no-expiry` report,
 a `--markdown` report, and a zero-day report, each with exact stdout+exit
 matches).
 
+Accept report conformance:
+
+    python3 conformance.py check_accept <report1.txt> [...]
+
+Verifies a saved `nakama.py accept` stdout report is internally
+consistent (spec §2.2.2): line 1 — `bond 完成: <out> — 仲間の証です。
+大切に保管してください。` (the bond file name, non-empty, arbitrary);
+an optional `--markdown` tail — a blank line + the fixed header
+`投稿用ブロック（返信に貼る）:` + the detection marker
+`<!-- nakama-bond:v1 -->` + the fence open ` ```nakama-bond ` + a
+non-empty base64url payload line (padding allowed) + the closing fence
+` ``` `. Trailing blank lines tolerated; a leading blank line is
+rejected. Explicitly out of scope: the bond file's existence and
+content (`check_bond`'s territory), the markdown payload's content
+(base64url shape only), the §15 compromise warnings (stderr), and the
+exit code (invisible in saved stdout text). The `propose` report
+(§2.2.1, `proposal を …`) is a different grammar — the two checkers
+reject each other's reports. Use this to prove a second
+implementation's `accept` CLI prints a compatible report.
+
+`python3 conformance.py selftest` also covers `check_accept` with
+reports produced in-process by nakama.py's own `cmd_propose` +
+`cmd_accept` (offline: real key pairs + temp keyfiles — a plain accept,
+a `--markdown` accept, a spaces-in-out-name accept, and a `--from-b64`
+accept, each with exact stdout+exit matches).
+
 Board-read report conformance:
 
     python3 conformance.py check_board_read <report1.txt> [...]
@@ -4709,6 +4735,107 @@ def check_propose_files(paths: list[str]) -> int:
         ok, errs, info = conform_propose_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_accept: accept report consistency ----------
+
+# `nakama.py accept <proposal> [--out <file>] [--from-b64 <base64url>]
+# [--markdown]` prints a short report to stdout whose grammar is fixed
+# (spec §2.2.2): one line, plus an optional markdown block only when
+# --markdown was used:
+#   bond 完成: <out> — 仲間の証です。大切に保管してください。
+#   (blank)
+#   投稿用ブロック（返信に貼る）:
+#   <!-- nakama-bond:v1 -->
+#   ```nakama-bond
+#   <base64url of the completed bond JSON>
+#   ```
+# check_accept verifies that a saved report is internally consistent:
+# the first line names the bond file (non-empty, arbitrary), and the
+# optional markdown tail is exactly the fixed header + detection marker
+# + fenced base64url block. Trailing blank lines tolerated; a leading
+# blank line is rejected.
+# Explicitly out of scope: the bond file's existence and content
+# (`check_bond`'s territory), the markdown payload's content (base64url
+# shape only — decoding it is the bond file's territory), the §15
+# compromise warnings (stderr), and the exit code (invisible in saved
+# stdout text). The `propose` report (§2.2.1, `proposal を …`) is a
+# different grammar — the two checkers reject each other's reports. Use
+# this to prove a second implementation's `accept` CLI prints a
+# compatible report.
+
+_RE_AC_L1 = re.compile(
+    r'^bond 完成: (.+) — 仲間の証です。大切に保管してください。$')
+_AC_MD_HEADER = '投稿用ブロック（返信に貼る）:'
+_AC_MD_MARKER = '<!-- nakama-bond:v1 -->'
+_AC_MD_FENCE = '```nakama-bond'
+
+
+def conform_accept_report(text: str):
+    """Verify a saved `nakama.py accept` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    m = _RE_AC_L1.match(lines[0])
+    if not m:
+        return False, ['line 1: not an accept completion line '
+                       '(`bond 完成: <out> — 仲間の証です。'
+                       '大切に保管してください。`)'], info
+    info.append(f'bond file: {m.group(1)}')
+    if len(lines) == 1:
+        info.append('no markdown block')
+        return True, errs, info
+    tail = lines[1:]
+    if len(tail) != 6:
+        return False, [f'markdown tail must be exactly six lines, '
+                       f'got {len(tail)}'], info
+    if tail[0] != '':
+        return False, ['line 2: blank separator expected before the '
+                       'markdown block'], info
+    if tail[1] != _AC_MD_HEADER:
+        return False, ['markdown header line mismatch '
+                       '(`投稿用ブロック（返信に貼る）:` expected)'], info
+    if tail[2] != _AC_MD_MARKER:
+        return False, ['markdown detection marker mismatch '
+                       '(`<!-- nakama-bond:v1 -->` expected)'], info
+    if tail[3] != _AC_MD_FENCE:
+        return False, ['markdown fence mismatch '
+                       '(` ```nakama-bond ` expected)'], info
+    if not _RE_B64U.match(tail[4]):
+        return False, ['markdown body is not base64url'], info
+    if tail[5] != '```':
+        return False, ['markdown closing fence missing'], info
+    info.append('markdown block present')
+    return True, errs, info
+
+
+def check_accept_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_accept_report(text)
+        if ok:
+            print(f'{p}: PASS ("{"; ".join(info)}")')
         else:
             print(f'{p}: FAIL')
             for e in errs:
@@ -9360,6 +9487,204 @@ def selftest() -> int:
     print(f'--- propose {pr_total - pr_fails}/{pr_total} passed ---')
     fails += pr_fails
 
+    # ---------- check_accept: accept report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_propose + cmd_accept (offline: real key pairs + temp keyfiles —
+    # a plain accept, a --markdown accept, a spaces-in-out-name accept,
+    # and a --from-b64 accept (paste form), each with exact stdout+exit
+    # matches; the expected stdout is rebuilt from the bond file the
+    # reference CLI itself wrote, so the comparison stays exact despite
+    # time-dependent fields); hand-crafted reports that break the grammar
+    # (completion line, markdown block) must be rejected, as must the
+    # sibling `propose` report (`proposal を …`).
+    ac_fails = 0
+    _ac_sa, _ac_npa = _key()
+    _ac_sb, _ac_npb = _key()
+
+    def _ac_run(tmpd, name, markdown=False, from_b64=False):
+        kfa = os.path.join(tmpd, 'key_a.json')
+        nakama.save_key(kfa, _ac_sa)
+        kfb = os.path.join(tmpd, 'key_b.json')
+        nakama.save_key(kfb, _ac_sb)
+        ppath = os.path.join(tmpd, f'{name}.proposal.json')
+        with contextlib.redirect_stderr(io.StringIO()):
+            nakama.cmd_propose(SimpleNamespace(
+                npub=_ac_npb, keyfile=kfa, out=ppath,
+                expires_days=30, no_expiry=False, markdown=False))
+        with open(ppath) as f:
+            prop = json.load(f)
+        bpath = os.path.join(tmpd, f'{name}.bond.json')
+        buf = io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                nakama.cmd_accept(SimpleNamespace(
+                    proposal=None if from_b64 else ppath,
+                    from_b64=nakama.b64u_encode(prop) if from_b64 else None,
+                    keyfile=kfb, out=bpath, markdown=markdown,
+                    compromise_registry=tmpd))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        rep = buf.getvalue()
+        with open(bpath) as f:
+            bond = json.load(f)
+        want = [f'bond 完成: {bpath} — 仲間の証です。大切に保管してください。']
+        if markdown:
+            want += ['', '投稿用ブロック（返信に貼る）:',
+                     '<!-- nakama-bond:v1 -->',
+                     '```nakama-bond',
+                     nakama.b64u_encode(bond), '```']
+        return rep, code, '\n'.join(want) + '\n'
+
+    _ac_e2e = []
+    with tempfile.TemporaryDirectory() as _ac_td:
+        _rep, _code, _want = _ac_run(_ac_td, 'plain')
+        _ac_e2e.append(('plain', _rep, _code, 0, _want))
+        _rep, _code, _want = _ac_run(_ac_td, 'markdown', markdown=True)
+        _ac_e2e.append(('markdown', _rep, _code, 0, _want))
+        _rep, _code, _want = _ac_run(_ac_td, 'my bond', markdown=True)
+        _ac_e2e.append(('out with spaces', _rep, _code, 0, _want))
+        _rep, _code, _want = _ac_run(_ac_td, 'fromb64', from_b64=True)
+        _ac_e2e.append(('from-b64', _rep, _code, 0, _want))
+    for _name, _rep, _code, _want_code, _want_rep in _ac_e2e:
+        _exact = (_rep == _want_rep) and (_code == _want_code)
+        _ok, _errs, _info = conform_accept_report(_rep)
+        _good = _exact and _ok
+        print(f'accept-e2e/{_name}: '
+              f'{"PASS" if _good else "FAIL"} ("{"; ".join(_info)}")')
+        if not _good:
+            if not _exact:
+                print(f'    - stdout/exit mismatch: {_rep!r} code={_code}')
+                print(f'    - expected: {_want_rep!r} code={_want_code}')
+            for _e in _errs:
+                print(f'    - {_e}')
+            ac_fails += 1
+
+    # hand-crafted positives
+    _apay = 'e30'  # short base64url payload shape (b64u of `{}`)
+    ac_pos = [
+        ('minimal',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n'),
+        ('markdown',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n\n'
+         '投稿用ブロック（返信に貼る）:\n'
+         '<!-- nakama-bond:v1 -->\n```nakama-bond\n'
+         f'{_apay}\n```\n'),
+        ('trailing blanks',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n\n\n'),
+        ('no trailing newline',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。'),
+        ('markdown, payload with padding',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n\n'
+         '投稿用ブロック（返信に貼る）:\n'
+         '<!-- nakama-bond:v1 -->\n```nakama-bond\n'
+         'e30=\n```\n'),
+        ('out with spaces',
+         'bond 完成: my bond.json — 仲間の証です。大切に保管してください。\n'),
+        ('markdown, trailing blanks',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n\n'
+         '投稿用ブロック（返信に貼る）:\n'
+         '<!-- nakama-bond:v1 -->\n```nakama-bond\n'
+         f'{_apay}\n```\n\n'),
+    ]
+    for _name, _rep in ac_pos:
+        _ok, _errs, _info = conform_accept_report(_rep)
+        print(f'accept-pos/{_name}: '
+              f'{"PASS" if _ok else "FAIL"} ("{"; ".join(_info)}")')
+        if not _ok:
+            for _e in _errs:
+                print(f'    - {_e}')
+            ac_fails += 1
+
+    # hand-crafted negatives (must be rejected)
+    ac_neg = [
+        ('empty', ''),
+        ('garbage', 'hello\n'),
+        ('propose report (mutual rejection)',
+         'proposal を proposal.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: npub1{"a" * 58}\n有効期限: なし（--no-expiry）\n'),
+        ('line 1 truncated', 'bond 完成: bond.json\n'),
+        ('dash instead of em-dash',
+         'bond 完成: bond.json - 仲間の証です。大切に保管してください。\n'),
+        ('suffix altered',
+         'bond 完成: bond.json — 仲間の証です。大切に保存してください。\n'),
+        ('out empty',
+         'bond 完成:  — 仲間の証です。大切に保管してください。\n'),
+        ('completion verb altered',
+         'bond 完成しました: bond.json — 仲間の証です。大切に保管してください。\n'),
+        ('markdown without blank separator',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n'
+         '投稿用ブロック（返信に貼る）:\n'
+         '<!-- nakama-bond:v1 -->\n```nakama-bond\n'
+         f'{_apay}\n```\n'),
+        ('markdown header altered (propose header)',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n\n'
+         '投稿用ブロック（相手のスレッド/コメント欄に貼る）:\n'
+         '<!-- nakama-bond:v1 -->\n```nakama-bond\n'
+         f'{_apay}\n```\n'),
+        ('markdown marker wrong kind',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n\n'
+         '投稿用ブロック（返信に貼る）:\n'
+         '<!-- nakama-proposal:v1 -->\n```nakama-bond\n'
+         f'{_apay}\n```\n'),
+        ('markdown fence wrong kind',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n\n'
+         '投稿用ブロック（返信に貼る）:\n'
+         '<!-- nakama-bond:v1 -->\n```nakama-proposal\n'
+         f'{_apay}\n```\n'),
+        ('markdown payload not base64url',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n\n'
+         '投稿用ブロック（返信に貼る）:\n'
+         '<!-- nakama-bond:v1 -->\n```nakama-bond\n'
+         'hello world!\n```\n'),
+        ('markdown closing fence missing',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n\n'
+         '投稿用ブロック（返信に貼る）:\n'
+         '<!-- nakama-bond:v1 -->\n```nakama-bond\n'
+         f'{_apay}\n'),
+        ('closing fence with trailing space',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n\n'
+         '投稿用ブロック（返信に貼る）:\n'
+         '<!-- nakama-bond:v1 -->\n```nakama-bond\n'
+         f'{_apay}\n``` \n'),
+        ('text after closing fence',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n\n'
+         '投稿用ブロック（返信に貼る）:\n'
+         '<!-- nakama-bond:v1 -->\n```nakama-bond\n'
+         f'{_apay}\n```\nextra\n'),
+        ('leading blank',
+         '\nbond 完成: bond.json — 仲間の証です。大切に保管してください。\n'),
+        ('second line without markdown',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n'
+         '余計な行\n'),
+        ('markdown tail too short',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n\n'
+         '投稿用ブロック（返信に貼る）:\n'
+         '<!-- nakama-bond:v1 -->\n```nakama-bond\n'
+         f'{_apay}\n'),
+        ('junk line instead of blank separator',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n'
+         'つづき\n'
+         '投稿用ブロック（返信に貼る）:\n'
+         '<!-- nakama-bond:v1 -->\n```nakama-bond\n'
+         f'{_apay}\n```\n'),
+        ('two reports concatenated',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n'
+         'bond 完成: bond2.json — 仲間の証です。大切に保管してください。\n'),
+    ]
+    for _name, _rep in ac_neg:
+        _ok, _errs, _info = conform_accept_report(_rep)
+        _good = not _ok
+        print(f'accept-neg/{_name}: '
+              f'{"PASS (rejected)" if _good else "FAIL (accepted!)"}')
+        if not _good:
+            ac_fails += 1
+
+    ac_total = len(_ac_e2e) + len(ac_pos) + len(ac_neg)
+    print(f'--- accept {ac_total - ac_fails}/{ac_total} passed ---')
+    fails += ac_fails
+
     # ---------- check_board_read: board_read report consistency ----------
     # Reference reports are produced in-process with nakama.py's own
     # cmd_board_read, with nostr_request monkeypatched to return crafted
@@ -12667,7 +12992,7 @@ def selftest() -> int:
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
         + bj_total + bs_total + bc_total + vbd_total + bvr_total \
         + bdc_total + bcs_total + dmr_total + vrt_total + bpl_total \
-        + bps_total + vbp_total + vrf_total + pr_total
+        + bps_total + vbp_total + vrf_total + pr_total + ac_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -12995,6 +13320,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_propose <report.txt> [...]')
             return 2
         return check_propose_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_accept':
+        if len(argv) < 3:
+            print('usage: conformance.py check_accept <report.txt> [...]')
+            return 2
+        return check_accept_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -13046,6 +13376,7 @@ def main(argv: list[str]) -> int:
           'check_verify_board_policy <report.txt> [...] | '
           'check_verify <report.txt> [...] | '
           'check_propose <report.txt> [...] | '
+          'check_accept <report.txt> [...] | '
           'selftest')
     return 2
 
