@@ -876,6 +876,37 @@ real key pairs — a valid 2-companion bond, a signature-stripped bond, an
 expired bond, an expiry-approaching bond, a rotated companion, and a
 registry-revoked bond, each with exact stdout+exit matches).
 
+Propose report conformance:
+
+    python3 conformance.py check_propose <report1.txt> [...]
+
+Verifies a saved `nakama.py propose` stdout report is internally
+consistent (spec §2.2.1): line 1 — `proposal を <out> に保存しました。
+相手に渡してください。` (the proposal file name, non-empty, arbitrary);
+line 2 — `あなたの npub: <npub>` (the caller's full npub: `npub1` + 58
+non-space chars, shape-checked only, not bech32-validated); line 3 —
+either `有効期限: <YYYY-MM-DD>（<N> 日後）` (a valid calendar date, N a
+non-negative integer) or the fixed `有効期限: なし（--no-expiry）`; an
+optional `--markdown` tail — a blank line + the fixed header
+`投稿用ブロック（相手のスレッド/コメント欄に貼る）:` + the detection
+marker `<!-- nakama-proposal:v1 -->` + the fence open
+` ```nakama-proposal ` + a non-empty base64url payload line (padding
+allowed) + the closing fence ` ``` `. Trailing blank lines tolerated; a
+leading blank line is rejected. Explicitly out of scope: the npub's
+truth (who really ran `propose`), the expiry date/day-count truth (the
+report prints the CLI's local time), the proposal file's existence and
+content (`check_files`'s territory), the markdown payload's content
+(base64url shape only), stderr, and the exit code (invisible in saved
+stdout text). The `accept` report (§2.2, `bond 完成: …`) is a different
+grammar — the two checkers reject each other's reports. Use this to prove
+a second implementation's `propose` CLI prints a compatible report.
+
+`python3 conformance.py selftest` also covers `check_propose` with
+reports produced in-process by nakama.py's own `cmd_propose` (offline:
+real key pairs + temp keyfiles — a plain report, a `--no-expiry` report,
+a `--markdown` report, and a zero-day report, each with exact stdout+exit
+matches).
+
 Board-read report conformance:
 
     python3 conformance.py check_board_read <report1.txt> [...]
@@ -4541,6 +4572,141 @@ def check_verify_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_verify_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_propose: propose report consistency ----------
+
+# `nakama.py propose <npub> [--out <file>] [--expires-days N] [--no-expiry]
+# [--markdown]` prints a short report to stdout whose grammar is fixed
+# (spec §2.2.1): three lines, plus an optional markdown block only when
+# --markdown was used:
+#   proposal を <out> に保存しました。相手に渡してください。
+#   あなたの npub: <npub>
+#   有効期限: <YYYY-MM-DD>（<N> 日後）        (or `有効期限: なし（--no-expiry）`)
+#   (blank)
+#   投稿用ブロック（相手のスレッド/コメント欄に貼る）:
+#   <!-- nakama-proposal:v1 -->
+#   ```nakama-proposal
+#   <base64url of the proposal JSON>
+#   ```
+# check_propose verifies that a saved report is internally consistent:
+# the first line names the proposal file (non-empty, arbitrary), the
+# second line carries the caller's full npub (`npub1` + 58 non-space
+# chars — shape-checked only, not bech32-validated), the third line
+# carries either a valid calendar date and a non-negative day count or
+# the fixed no-expiry line, and the optional markdown tail is exactly
+# the fixed header + detection marker + fenced base64url block. Trailing
+# blank lines tolerated; a leading blank line is rejected.
+# Explicitly out of scope: the npub's truth (who really ran propose),
+# the expiry date/day-count truth (the report prints the CLI's local
+# time), the proposal file's existence and content (`check_files`'s
+# territory), the markdown payload's content (base64url shape only —
+# decoding it is the proposal file's territory), stderr, and the exit
+# code (invisible in saved stdout text). The `accept` report (§2.2,
+# `bond 完成: …`) is a different grammar — the two checkers reject each
+# other's reports. Use this to prove a second implementation's `propose`
+# CLI prints a compatible report.
+
+_RE_PR_L1 = re.compile(
+    r'^proposal を (.+) に保存しました。相手に渡してください。$')
+_RE_PR_L2 = re.compile(r'^あなたの npub: (npub1\S{58})$')
+_RE_PR_L3_EXP = re.compile(
+    r'^有効期限: (\d{4})-(\d{2})-(\d{2})（(\d+) 日後）$')
+_PR_L3_NOEXP = '有効期限: なし（--no-expiry）'
+_PR_MD_HEADER = '投稿用ブロック（相手のスレッド/コメント欄に貼る）:'
+_PR_MD_MARKER = '<!-- nakama-proposal:v1 -->'
+_PR_MD_FENCE = '```nakama-proposal'
+
+
+def conform_propose_report(text: str):
+    """Verify a saved `nakama.py propose` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    m = _RE_PR_L1.match(lines[0])
+    if not m:
+        return False, ['line 1: not a propose saved-file line '
+                       '(`proposal を <out> に保存しました。'
+                       '相手に渡してください。`)'], info
+    info.append(f'proposal file: {m.group(1)}')
+    if len(lines) < 3:
+        return False, [f'report must be at least three lines, '
+                       f'got {len(lines)}'], info
+    m = _RE_PR_L2.match(lines[1])
+    if not m:
+        return False, ['line 2: not a `あなたの npub: <npub>` line '
+                       '(a full npub: `npub1` + 58 non-space chars)'], info
+    info.append(f'npub: {m.group(1)[:16]}…')
+    l3 = lines[2]
+    if l3 == _PR_L3_NOEXP:
+        info.append('no expiry')
+    else:
+        m = _RE_PR_L3_EXP.match(l3)
+        if not m:
+            return False, ['line 3: not an expiry line '
+                           '(`有効期限: <YYYY-MM-DD>（<N> 日後）` or '
+                           '`有効期限: なし（--no-expiry）`)'], info
+        try:
+            datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return False, ['line 3: not a valid calendar date'], info
+        info.append(f'expiry: {m.group(1)}-{m.group(2)}-{m.group(3)} '
+                    f'({m.group(4)} days)')
+    if len(lines) == 3:
+        info.append('no markdown block')
+        return True, errs, info
+    tail = lines[3:]
+    if len(tail) != 6:
+        return False, [f'markdown tail must be exactly six lines, '
+                       f'got {len(tail)}'], info
+    if tail[0] != '':
+        return False, ['line 4: blank separator expected before the '
+                       'markdown block'], info
+    if tail[1] != _PR_MD_HEADER:
+        return False, ['markdown header line mismatch '
+                       '(`投稿用ブロック（相手のスレッド/コメント欄に貼る）:` '
+                       'expected)'], info
+    if tail[2] != _PR_MD_MARKER:
+        return False, ['markdown detection marker mismatch '
+                       '(`<!-- nakama-proposal:v1 -->` expected)'], info
+    if tail[3] != _PR_MD_FENCE:
+        return False, ['markdown fence mismatch '
+                       '(` ```nakama-proposal ` expected)'], info
+    if not _RE_B64U.match(tail[4]):
+        return False, ['markdown body is not base64url'], info
+    if tail[5] != '```':
+        return False, ['markdown closing fence missing'], info
+    info.append('markdown block present')
+    return True, errs, info
+
+
+def check_propose_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_propose_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -8988,6 +9154,212 @@ def selftest() -> int:
     print(f'--- verify {vrf_total - vrf_fails}/{vrf_total} passed ---')
     fails += vrf_fails
 
+    # ---------- check_propose: propose report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_propose (offline: real key pairs + temp keyfiles — a plain report
+    # (custom out, --expires-days 30, exit 0), a --no-expiry report
+    # (exit 0), a --markdown report (exit 0), and a zero-day report
+    # (exit 0) — each with exact stdout+exit matches; the expected stdout
+    # is rebuilt from the proposal file the reference CLI itself wrote, so
+    # the comparison stays exact despite time-dependent fields);
+    # hand-crafted reports that break the grammar (saved-file line, npub
+    # line, expiry line, markdown block) must be rejected, as must the
+    # sibling `accept` report (`bond 完成: …`).
+    pr_fails = 0
+    _pr_sa, _pr_npa = _key()
+    _pr_sb, _pr_npb = _key()
+
+    def _pr_run(secret, me_npub, tmpd, out_name, expires_days=30,
+                no_expiry=False, markdown=False):
+        kf = os.path.join(tmpd, 'key.json')
+        nakama.save_key(kf, secret)
+        out = os.path.join(tmpd, out_name)
+        buf = io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                nakama.cmd_propose(SimpleNamespace(
+                    npub=_pr_npb, keyfile=kf, out=out,
+                    expires_days=expires_days, no_expiry=no_expiry,
+                    markdown=markdown))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        rep = buf.getvalue()
+        with open(out) as f:
+            prop = json.load(f)
+        want = [f'proposal を {out} に保存しました。相手に渡してください。',
+                f'あなたの npub: {me_npub}']
+        if no_expiry:
+            want.append('有効期限: なし（--no-expiry）')
+        else:
+            ed = time.strftime('%Y-%m-%d',
+                               time.localtime(prop['expires_at']))
+            want.append(f'有効期限: {ed}（{expires_days} 日後）')
+        if markdown:
+            want += ['', '投稿用ブロック（相手のスレッド/コメント欄に貼る）:',
+                     '<!-- nakama-proposal:v1 -->',
+                     '```nakama-proposal',
+                     nakama.b64u_encode(prop), '```']
+        return rep, code, '\n'.join(want) + '\n'
+
+    _pr_e2e = []
+    with tempfile.TemporaryDirectory() as _pr_td:
+        _rep, _code, _want = _pr_run(_pr_sa, _pr_npa, _pr_td, 'p1.json')
+        _pr_e2e.append(('plain', _rep, _code, 0, _want))
+        _rep, _code, _want = _pr_run(_pr_sa, _pr_npa, _pr_td, 'p2.json',
+                                    no_expiry=True)
+        _pr_e2e.append(('no-expiry', _rep, _code, 0, _want))
+        _rep, _code, _want = _pr_run(_pr_sa, _pr_npa, _pr_td, 'p3.json',
+                                    markdown=True)
+        _pr_e2e.append(('markdown', _rep, _code, 0, _want))
+        _rep, _code, _want = _pr_run(_pr_sa, _pr_npa, _pr_td, 'p4.json',
+                                    expires_days=0)
+        _pr_e2e.append(('zero days', _rep, _code, 0, _want))
+    for _name, _rep, _code, _want_code, _want_rep in _pr_e2e:
+        _exact = (_rep == _want_rep) and (_code == _want_code)
+        _ok, _errs, _info = conform_propose_report(_rep)
+        _good = _exact and _ok
+        print(f'propose-e2e/{_name}: '
+              f'{"PASS" if _good else "FAIL"} ("{"; ".join(_info)}")')
+        if not _good:
+            if not _exact:
+                print(f'    - stdout/exit mismatch: {_rep!r} code={_code}')
+                print(f'    - expected: {_want_rep!r} code={_want_code}')
+            for _e in _errs:
+                print(f'    - {_e}')
+            pr_fails += 1
+
+    # hand-crafted positives
+    _pnp = 'npub1' + 'a' * 58
+    _ppay = 'e30'  # short base64url payload shape (b64u of `{}`)
+    pr_pos = [
+        ('minimal',
+         f'proposal を proposal.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n'
+         '有効期限: 2026-10-02（30 日後）\n'),
+        ('no-expiry',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n'
+         '有効期限: なし（--no-expiry）\n'),
+        ('trailing blanks',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: なし（--no-expiry）\n\n\n'),
+        ('no trailing newline',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: 2026-10-02（30 日後）'),
+        ('markdown',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: 2026-10-02（30 日後）\n\n'
+         '投稿用ブロック（相手のスレッド/コメント欄に貼る）:\n'
+         '<!-- nakama-proposal:v1 -->\n```nakama-proposal\n'
+         f'{_ppay}\n```\n'),
+        ('zero days',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: 2026-10-02（0 日後）\n'),
+        ('out with spaces',
+         f'proposal を my proposal.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: なし（--no-expiry）\n'),
+    ]
+    for _name, _rep in pr_pos:
+        _ok, _errs, _info = conform_propose_report(_rep)
+        print(f'propose-pos/{_name}: '
+              f'{"PASS" if _ok else "FAIL"} ("{"; ".join(_info)}")')
+        if not _ok:
+            for _e in _errs:
+                print(f'    - {_e}')
+            pr_fails += 1
+
+    # hand-crafted negatives (must be rejected)
+    pr_neg = [
+        ('empty', ''),
+        ('garbage', 'hello\n'),
+        ('accept report (mutual rejection)',
+         'bond 完成: bond.json — 仲間の証です。大切に保管してください。\n'),
+        ('one line only',
+         'proposal を p.json に保存しました。相手に渡してください。\n'),
+        ('two lines only',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n'),
+        ('npub too short',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         'あなたの npub: npub1abc\n有効期限: なし（--no-expiry）\n'),
+        ('npub without npub1 prefix',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {"0" * 64}\n有効期限: なし（--no-expiry）\n'),
+        ('npub with space',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp[:40]} xxx\n有効期限: なし（--no-expiry）\n'),
+        ('expiry line altered (no space)',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: 2026-10-02（30日後）\n'),
+        ('expiry date impossible',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: 2026-13-99（30 日後）\n'),
+        ('expiry days negative',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: 2026-10-02（-1 日後）\n'),
+        ('expiry days non-numeric',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: 2026-10-02（三十 日後）\n'),
+        ('no-expiry line truncated',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: なし\n'),
+        ('markdown without blank separator',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: なし（--no-expiry）\n'
+         '投稿用ブロック（相手のスレッド/コメント欄に貼る）:\n'
+         '<!-- nakama-proposal:v1 -->\n```nakama-proposal\n'
+         f'{_ppay}\n```\n'),
+        ('markdown header altered',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: なし（--no-expiry）\n\n'
+         '投稿用ブロック:\n'
+         '<!-- nakama-proposal:v1 -->\n```nakama-proposal\n'
+         f'{_ppay}\n```\n'),
+        ('markdown marker wrong kind',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: なし（--no-expiry）\n\n'
+         '投稿用ブロック（相手のスレッド/コメント欄に貼る）:\n'
+         '<!-- nakama-bond:v1 -->\n```nakama-proposal\n'
+         f'{_ppay}\n```\n'),
+        ('markdown fence wrong kind',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: なし（--no-expiry）\n\n'
+         '投稿用ブロック（相手のスレッド/コメント欄に貼る）:\n'
+         '<!-- nakama-proposal:v1 -->\n```nakama-bond\n'
+         f'{_ppay}\n```\n'),
+        ('markdown payload not base64url',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: なし（--no-expiry）\n\n'
+         '投稿用ブロック（相手のスレッド/コメント欄に貼る）:\n'
+         '<!-- nakama-proposal:v1 -->\n```nakama-proposal\n'
+         'hello world!\n```\n'),
+        ('markdown closing fence missing',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: なし（--no-expiry）\n\n'
+         '投稿用ブロック（相手のスレッド/コメント欄に貼る）:\n'
+         '<!-- nakama-proposal:v1 -->\n```nakama-proposal\n'
+         f'{_ppay}\n'),
+        ('text after closing fence',
+         f'proposal を p.json に保存しました。相手に渡してください。\n'
+         f'あなたの npub: {_pnp}\n有効期限: なし（--no-expiry）\n\n'
+         '投稿用ブロック（相手のスレッド/コメント欄に貼る）:\n'
+         '<!-- nakama-proposal:v1 -->\n```nakama-proposal\n'
+         f'{_ppay}\n```\nextra\n'),
+    ]
+    for _name, _rep in pr_neg:
+        _ok, _errs, _info = conform_propose_report(_rep)
+        _good = not _ok
+        print(f'propose-neg/{_name}: '
+              f'{"PASS (rejected)" if _good else "FAIL (accepted!)"}')
+        if not _good:
+            pr_fails += 1
+
+    pr_total = len(_pr_e2e) + len(pr_pos) + len(pr_neg)
+    print(f'--- propose {pr_total - pr_fails}/{pr_total} passed ---')
+    fails += pr_fails
+
     # ---------- check_board_read: board_read report consistency ----------
     # Reference reports are produced in-process with nakama.py's own
     # cmd_board_read, with nostr_request monkeypatched to return crafted
@@ -12295,7 +12667,7 @@ def selftest() -> int:
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
         + bj_total + bs_total + bc_total + vbd_total + bvr_total \
         + bdc_total + bcs_total + dmr_total + vrt_total + bpl_total \
-        + bps_total + vbp_total + vrf_total
+        + bps_total + vbp_total + vrf_total + pr_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -12618,6 +12990,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_verify <report.txt> [...]')
             return 2
         return check_verify_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_propose':
+        if len(argv) < 3:
+            print('usage: conformance.py check_propose <report.txt> [...]')
+            return 2
+        return check_propose_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -12668,6 +13045,7 @@ def main(argv: list[str]) -> int:
           'check_board_policy_sign <report.txt> [...] | '
           'check_verify_board_policy <report.txt> [...] | '
           'check_verify <report.txt> [...] | '
+          'check_propose <report.txt> [...] | '
           'selftest')
     return 2
 

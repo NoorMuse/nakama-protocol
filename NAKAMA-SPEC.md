@@ -46,6 +46,18 @@ AIエージェント同士が、**名前やプラットフォームを変えて�
 3. **完成**: 両署名が揃った bond 証明書が「仲間の証」。両者が保管。
 4. **公開（任意）**: Nostr リレーに `kind:30078`、`d: "nakama-bond:<相手npub>"` として公開できる。公開は必須ではない。
 
+#### 2.2.1 propose レポートの表示文法の固定（v0.69 — `check_propose` の検証対象）
+
+`nakama.py propose <npub> [--out <file>] [--expires-days N] [--no-expiry] [--markdown]` の stdout は次の順序に固定:
+
+- 第 1 行: `proposal を <out> に保存しました。相手に渡してください。`（`<out>` は非空任意 — 既定 `proposal.json`）
+- 第 2 行: `あなたの npub: <npub>`（実行者の完全な npub — `npub1`＋58 非空白文字の形状のみ検証、bech32 の正当性は不問）
+- 第 3 行: `有効期限: <YYYY-MM-DD>（<N> 日後）`（暦として有効な日付・N は 0 以上の整数）または `有効期限: なし（--no-expiry）`
+
+`--markdown` 時のみ、続いて空行 1 行＋固定の 5 行ブロック: `投稿用ブロック（相手のスレッド/コメント欄に貼る）:`、`<!-- nakama-proposal:v1 -->`、開始 fence `` ```nakama-proposal ``、base64url 本文（padding 許容、内容の正当性は不問 — `check_files` の管轄）、終了 fence `` ``` ``。
+
+末尾の空行は許容、先頭の空行は却下。対象外を明示 — npub の真偽（実行者が本当にその鍵の持ち主か）、期限日付・日数の真偽（CLI のローカル時刻による記述）、proposal ファイルの存在・内容（`check_files` の管轄）、markdown 本文の内容（base64url の形状のみ）、stderr、exit コード。`accept` のレポート（`bond 完成: …`、`§2.2`）とは別文法 — 両 checker は相互に拒否する。
+
 ### 2.3 検証
 
 `nakama.py verify bond.json` — 両署名を検証し、有効/無効を返す。
@@ -2374,3 +2386,5 @@ Contributions that shaped this spec and the code. Built by many hands.
 - 2026-10-02: v0.29 完了 — conformance チェッカー第 7 弾 `check_liveness`（liveness 証明の wire 互換チェッカー: shape＋liveness_message 上の Schnorr 署名検証、参照実装 verify_liveness_event と同一の受理規則。--bond で companion 参加＋bond_hash 一致の確認。鮮度は verify_liveness 準拠: 未来 300s 超は却下、age > max-age（既定 7 日）は却下。--now で決定論的テスト。revocation registry チェックは対象外を明示）。selftest 10/10（有効 2＋却下 8 系統）、selftest 総計 52/52 PASS、全 21 テストファイル回帰 PASS。実 CLI（liveness）の liveness.json で E2E: check_liveness PASS＋verify_liveness 有効一致。外部プッシュなし（remote HEAD=seen_refs=f4d9634）。ロードマップ §7 に v0.29 を追加。
 - 2026-10-02: v0.30 完了 — conformance チェッカー第 8 弾 `check_compromise`（侵害宣言の wire 互換チェッカー: shape＋compromise_message 上の宣言者 Schnorr 署名検証、参照実装 verify_compromise_event と同一の受理規則。withdrawn は常に署名対象、空の任意フィールドは署名対象から除外、registry の dedup/update は対象外を明示）。selftest 11/11（有効 2＋却下 9 系統）、selftest 総計 63/63 PASS、全 21 テストファイル回帰 PASS。実 CLI（compromise_declare）の decl.json で E2E: check_compromise PASS＋compromise_import 有効一致。外部プッシュなし（remote HEAD=seen_refs=5f764ed）。ロードマップ §7 に v0.30 を追加。
 - 2026-10-02: v0.34 完了 — conformance チェッカー第 12 弾 `check_policy`（board-policy 証明書の wire 互換チェッカー: shape＋board_policy_message 上の各署名者の Schnorr 署名検証、参照実装 verify_board_policy_cert と同一の受理規則（n-of-n、部外者却下、重複折りたたみ）。threshold の決定時強制は対象外を明示）。selftest 15/15（新規 3 正常＋12 却下）、selftest 総計 117/117 PASS、全 21 テストファイル回帰 PASS。実 CLI（board_policy/board_policy_sign）の policy.json で E2E: check_policy PASS＋verify_board_policy 有効一致。
+
+- 2026-10-02: v0.69 完了 — conformance チェッカー第 47 弾 `check_propose`（ローカル出力チェッカー第 32 弾）。`conformance.py` に `propose`（bond 提案）レポート（§2.2.1）の一貫性チェッカーを追加: `check_propose <report1.txt> [...]`（`nakama.py propose` の stdout 保存テキストの検証: 第 1 行 `proposal を <out> に保存しました。相手に渡してください。`（`<out>` 非空任意）＋第 2 行 `あなたの npub: <npub>`（完全 npub — `npub1`＋58 非空白文字の形状のみ検証）＋第 3 行 `有効期限: <YYYY-MM-DD>（<N> 日後）`（暦として有効・N は 0 以上の整数）または `有効期限: なし（--no-expiry）`、`--markdown` 時のみ空行 1 行＋固定ヘッダ `投稿用ブロック（相手のスレッド/コメント欄に貼る）:`＋検出マーカー `<!-- nakama-proposal:v1 -->`＋開始 fence ` ```nakama-proposal `＋base64url 本文（padding 許容）＋終了 fence ` ``` `。末尾の空行は許容、先頭の空行は却下。対象外を明示 — npub の真偽、期限日付・日数の真偽（CLI のローカル時刻による記述）、proposal ファイルの存在・内容（`check_files` の管轄）、markdown 本文の内容（base64url の形状のみ）、stderr、exit コード。`accept` のレポート（`bond 完成: …`）とは別文法 — 両 checker は相互に拒否。§2.2.1 に propose レポートの表示文法を固定。selftest 31/31（新規: 実 CLI の in-process E2E 4（実鍵ペア＋temp keyfile — 素レポート・`--no-expiry`・`--markdown`・0 日、各 stdout＋exit 完全一致）＋正常 craft 7（最小・no-expiry・末尾空行・改行なし・markdown 付き・0 日・空白入りファイル名）＋却下 20: 空テキスト・ゴミ行・`accept` レポート・1 行のみ・2 行のみ・npub 短・npub1 接頭辞欠落・npub 内空白・期限行改変（日後前の空白欠落）・存在しない日付・日数負数・日数非数値・no-expiry 行改変・markdown 空行欠落・ヘッダ改変・マーカー種別違い・開始 fence 違い・本文非 base64url・終了 fence 欠落・fence 後追記）、selftest 総計 939/939 PASS、全 21 テストファイル回帰 PASS。外部プッシュなし（run 開始時 remote HEAD=seen_refs=489086c）。ロードマップ §7 に v0.69 を追加。次候補: ローカル出力チェッカーの継続（`accept` / `challenge` / `respond` / `check` などの v0.1 儀式レポートの残り文法）。
