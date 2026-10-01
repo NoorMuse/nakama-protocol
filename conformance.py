@@ -4915,6 +4915,73 @@ def check_challenge_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_check: check report consistency ----------
+
+# `nakama.py check <npub> <nonce> <sig>` prints a one-line verdict report
+# to stdout whose grammar is fixed (spec §3.2):
+#   本人です 🤝   (signature verifies — exit 0)
+#   検証失敗       (signature does not verify — exit 1)
+# check_check verifies that a saved report is internally consistent:
+# exactly one line, and that line is one of the two fixed literals.
+# Trailing blank lines are tolerated; a leading blank line is rejected.
+# There is no internal arithmetic to check — the verdict is a two-word
+# vocabulary with no derivable fields.
+# The `challenge`/`respond` reports (a single line of 64 lowercase hex)
+# are a different grammar and are naturally rejected here, just as
+# `check`'s reports were naturally rejected by check_challenge.
+# Explicitly out of scope: the verdict's truth (a cryptographic claim —
+# `verify_schnorr`'s territory, the checker sees only the saved text),
+# the npub/nonce/sig truth, the §14.2 compromise warnings (stderr), and
+# the exit code (invisible in saved stdout text). Use this to prove a
+# second implementation's `check` CLI prints a compatible verdict line.
+
+_CHECK_VERDICTS = ('本人です 🤝', '検証失敗')
+
+
+def conform_check_report(text: str):
+    """Verify a saved `nakama.py check` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    if len(lines) != 1:
+        return False, [f'report must be a single verdict line, '
+                       f'found {len(lines)} lines'], info
+    if lines[0] not in _CHECK_VERDICTS:
+        return False, ['line 1: not a check verdict line '
+                       '(`本人です 🤝` or `検証失敗`)'], info
+    info.append(f'verdict {"本人" if lines[0] == "本人です 🤝" else "失敗"}')
+    return True, errs, info
+
+
+def check_check_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_check_report(text)
+        if ok:
+            print(f'{p}: PASS ("{"; ".join(info)}")')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- check_pub: publish-result line consistency ----------
 
 # Every Nostr publish command (rotate_pub, revoke_pub, compromise_pub,
@@ -9844,6 +9911,107 @@ def selftest() -> int:
     print(f'--- challenge {ch_total - ch_fails}/{ch_total} passed ---')
     fails += ch_fails
 
+    # ---------- check_check: check report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_check (no relay contact — pure Schnorr verification); hand-mutated
+    # reports that break the two-vocabulary single-line grammar must be
+    # rejected.
+    ck_fails = 0
+
+    def _ck_run(tmpd, npub, nonce, sig):
+        buf = io.StringIO()
+        _code = None
+        with contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                nakama.cmd_check(SimpleNamespace(
+                    npub=npub, nonce=nonce, sig=sig,
+                    compromise_registry=tmpd))
+            except SystemExit as _e:
+                _code = _e.code
+        return buf.getvalue(), _code
+
+    _ck_e2e = []
+    with tempfile.TemporaryDirectory() as _ck_td:
+        _s, _np = _key()
+        _nonce = 'cd' * 32
+        _good_sig = nakama.sign_schnorr(_s, bytes.fromhex(_nonce)).hex()
+        _rep, _code = _ck_run(_ck_td, _np, _nonce, _good_sig)
+        _ck_e2e.append(('valid signature (success, exit 0)',
+                        _rep, _code, '本人です 🤝\n', 0))
+        # a tampered signature byte no longer verifies
+        _bad = bytearray.fromhex(_good_sig)
+        _bad[-1] ^= 0x01
+        _rep, _code = _ck_run(_ck_td, _np, _nonce, bytes(_bad).hex())
+        _ck_e2e.append(('tampered signature (failure, exit 1)',
+                        _rep, _code, '検証失敗\n', 1))
+        # a signature by a different key does not verify against this npub
+        _s2, _ = _key()
+        _other_sig = nakama.sign_schnorr(_s2, bytes.fromhex(_nonce)).hex()
+        _rep, _code = _ck_run(_ck_td, _np, _nonce, _other_sig)
+        _ck_e2e.append(('wrong-key signature (failure, exit 1)',
+                        _rep, _code, '検証失敗\n', 1))
+    for _name, _rep, _code, _want_rep, _want_code in _ck_e2e:
+        _exact = _rep == _want_rep and _code == _want_code
+        _ok, _errs, _info = conform_check_report(_rep)
+        _good = _exact and _ok
+        print(f'check-e2e/{_name}: '
+              f'{"PASS" if _good else "FAIL"} ("{"; ".join(_info)}")')
+        if not _good:
+            if not _exact:
+                print(f'    - stdout/exit mismatch: {_rep!r} exit={_code}')
+            for _e in _errs:
+                print(f'    - {_e}')
+            ck_fails += 1
+
+    # hand-crafted positives
+    ck_pos = [
+        ('minimal success', '本人です 🤝\n'),
+        ('success, no trailing newline', '本人です 🤝'),
+        ('success, trailing blanks', '本人です 🤝\n\n\n'),
+        ('minimal failure', '検証失敗\n'),
+        ('failure, no trailing newline', '検証失敗'),
+        ('failure, trailing blanks', '検証失敗\n\n'),
+    ]
+    for _name, _rep in ck_pos:
+        _ok, _errs, _info = conform_check_report(_rep)
+        print(f'check-pos/{_name}: '
+              f'{"PASS" if _ok else "FAIL"} ("{"; ".join(_info)}")')
+        if not _ok:
+            for _e in _errs:
+                print(f'    - {_e}')
+            ck_fails += 1
+
+    # hand-crafted negatives (must be rejected)
+    ck_neg = [
+        ('empty', ''),
+        ('garbage', 'hello\n'),
+        ('whitespace only', '  \n'),
+        ('two reports concatenated', '本人です 🤝\n検証失敗\n'),
+        ('two failures concatenated', '検証失敗\n検証失敗\n'),
+        ('leading blank', '\n本人です 🤝\n'),
+        ('trailing junk line', '本人です 🤝\nextra\n'),
+        ('success with trailing space', '本人です 🤝 \n'),
+        ('success missing emoji', '本人です\n'),
+        ('success with suffix', '本人です 🤝 です\n'),
+        ('failure with suffix', '検証失敗 です\n'),
+        ('english verdict', 'verified\n'),
+        # challenge/respond reports are a different grammar — rejected
+        ('challenge report (64 hex)', 'ab' * 32 + '\n'),
+        ('leading space', ' 本人です 🤝\n'),
+    ]
+    for _name, _rep in ck_neg:
+        _ok, _errs, _info = conform_check_report(_rep)
+        _good = not _ok
+        print(f'check-neg/{_name}: '
+              f'{"PASS (rejected)" if _good else "FAIL (accepted!)"}')
+        if not _good:
+            ck_fails += 1
+
+    ck_total = len(_ck_e2e) + len(ck_pos) + len(ck_neg)
+    print(f'--- check {ck_total - ck_fails}/{ck_total} passed ---')
+    fails += ck_fails
+
     # ---------- check_board_read: board_read report consistency ----------
     # Reference reports are produced in-process with nakama.py's own
     # cmd_board_read, with nostr_request monkeypatched to return crafted
@@ -13152,7 +13320,7 @@ def selftest() -> int:
         + bj_total + bs_total + bc_total + vbd_total + bvr_total \
         + bdc_total + bcs_total + dmr_total + vrt_total + bpl_total \
         + bps_total + vbp_total + vrf_total + pr_total + ac_total \
-        + ch_total
+        + ch_total + ck_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -13490,6 +13658,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_challenge <report.txt> [...]')
             return 2
         return check_challenge_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_check':
+        if len(argv) < 3:
+            print('usage: conformance.py check_check <report.txt> [...]')
+            return 2
+        return check_check_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -13542,6 +13715,8 @@ def main(argv: list[str]) -> int:
           'check_verify <report.txt> [...] | '
           'check_propose <report.txt> [...] | '
           'check_accept <report.txt> [...] | '
+          'check_challenge <report.txt> [...] | '
+          'check_check <report.txt> [...] | '
           'selftest')
     return 2
 

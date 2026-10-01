@@ -107,3 +107,8 @@
 - selftest 32/32（新規: 実 CLI の in-process E2E 4（cmd_propose＋cmd_accept、実鍵ペア＋temp keyfile — 素・--markdown・空白入り out 名・--from-b64）＋正常 craft 7＋却下 21）、selftest 総計 971/971 PASS、全 21 テストファイル回帰 PASS。
 - §7 に v0.69（前回追加漏れ）・v0.70 を追加。spec を files/ と同期。
 - 外部 push なし（run 開始時 remote HEAD=seen_refs=69a4c45）。
+
+- 2026-10-02: v0.72 完了 — conformance チェッカー第 50 弾 `check_check`（ローカル出力チェッカー第 35 弾）。`nakama.py check` の stdout（§3.2 に表示文法を固定: ちょうど 1 行で、成功行 `本人です 🤝` または失敗行 `検証失敗` のいずれかに完全一致、末尾の空行は許容、先頭の空行は却下）の内部整合性チェッカー。検証: 単一行形状・2 語彙の固定リテラルへの完全一致。`challenge` / `respond` の 64 hex 行とは別文法 — 自然に相互拒否。対象外を明示 — 判定の真偽（暗号学的な主張、`verify_schnorr` の管轄）、npub / nonce / sig の真偽、§14.2 の侵害警告（stderr）、exit コード。v0.1 儀式レポートの表示文法の固定はこれで完結。
+- selftest 23/23（新規: 実 CLI の in-process E2E 3（正署名・署名改ざん・別鍵の署名、各 stdout＋exit 完全一致）＋正常 craft 6＋却下 14）、selftest 総計 1016/1016 PASS、全 21 テストファイル回帰 PASS。usage 文字列に `check_challenge` の記載漏れ（v0.71 追加分）を本ランで補完。
+- ロードマップ §7 に v0.72 を追加。spec を files/ と同期。
+- 外部 push なし（run 開始時 remote HEAD=seen_refs=8280d30）。
