@@ -337,6 +337,29 @@ compatible report.
 `check_board_create` with reports produced in-process by
 nakama.py's own `cmd_board_create` (with `nostr_publish` monkeypatched).
 
+Verify-board-decision report conformance:
+
+    python3 conformance.py check_verify_board_decision <report1.txt> [...]
+
+Verifies a saved `nakama.py verify_board_decision` stdout report is
+internally consistent (spec §9.6): exactly one line — the valid form
+`board-decision は有効です: 承認署名 <n>/<t>（決定 "<name>"）` or the
+invalid form `board-decision は無効です: 承認署名 <n>/<t>（threshold
+未達または署名不正）`. Checks: the single line, the fixed two-word
+verdict vocabulary, non-negative n/t integers, a non-empty quoted
+decision name, and the report's only internal arithmetic — a valid
+verdict must claim n >= t. Trailing blank lines tolerated. Explicitly
+out of scope: the verdict's truth (`verify_board_decision`'s territory),
+the decision name's membership in the BOARD_DECISION_TYPES vocabulary,
+the signatures' validity, stderr's compromise advisories, and the exit
+code. Use this to prove a second implementation's `verify_board_decision`
+CLI prints a compatible report.
+
+`python3 conformance.py selftest` also covers
+`check_verify_board_decision` with reports produced in-process by
+nakama.py's own `cmd_verify_board_decision` (offline: policy and
+decision fixtures built in-process with real Schnorr signatures).
+
 Compromise declaration conformance:
 
     python3 conformance.py check_compromise <decl1.json> [...]
@@ -4909,6 +4932,81 @@ def check_board_create_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_board_create_report(text)
+        if ok:
+            print(f'{p}: PASS ({ "; ".join(info) })')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_verify_board_decision: verify_board_decision report consistency ----------
+
+# verify_board_decision's stdout is a single line stating the threshold
+# verdict, and its grammar is fixed (spec §9.6). check_verify_board_decision
+# verifies that a saved report is internally consistent:
+#
+#   valid:   board-decision は有効です: 承認署名 <n>/<t>（決定 "<name>"）
+#   invalid: board-decision は無効です: 承認署名 <n>/<t>（threshold 未達または署名不正）
+#
+# Checks: exactly one line, the fixed two-word verdict vocabulary,
+# n/t non-negative integers, the quoted decision name non-empty, and —
+# the only piece of internal arithmetic the report supports — a valid
+# verdict claims n >= t (a "valid" claim with fewer approvals than the
+# threshold is self-contradictory). The decision name is free text; its
+# membership in BOARD_DECISION_TYPES is verify_board_decision's territory
+# (like the verdict truth itself, the signatures' validity, stderr's
+# compromise advisories, and the exit code). Use this to prove a second
+# implementation's verify_board_decision CLI prints a compatible report.
+
+_RE_VBD_VALID = re.compile(
+    r'^board-decision は有効です: 承認署名 (\d+)/(\d+)（決定 "([^"\n]+)"）$')
+_RE_VBD_INVALID = re.compile(
+    r'^board-decision は無効です: 承認署名 '
+    r'(\d+)/(\d+)（threshold 未達または署名不正）$')
+
+
+def conform_verify_board_decision_report(text: str):
+    """Verify a saved `nakama.py verify_board_decision` stdout report is
+    internally consistent. Returns (ok, errors, info)."""
+    info = []
+    lines = [l for l in text.split('\n') if l.strip() != '']
+    if len(lines) != 1:
+        return False, [f'expected exactly 1 report line, found {len(lines)}'], \
+            info
+    line = lines[0]
+    m = _RE_VBD_VALID.match(line)
+    if m:
+        n, t = int(m.group(1)), int(m.group(2))
+        if n < t:
+            return False, [f'valid verdict claims {n}/{t} approvals: '
+                           f'fewer approvals than the threshold'], info
+        info.append(f'verdict=valid, signatures={n}/{t}, '
+                    f'decision={m.group(3)!r}')
+        return True, [], info
+    m = _RE_VBD_INVALID.match(line)
+    if m:
+        info.append(f'verdict=invalid, signatures={m.group(1)}/'
+                    f'{m.group(2)}')
+        return True, [], info
+    return False, ['line matches neither the valid nor the invalid '
+                   'verify_board_decision report form'], info
+
+
+def check_verify_board_decision_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_verify_board_decision_report(text)
         if ok:
             print(f'{p}: PASS ({ "; ".join(info) })')
         else:
@@ -9531,6 +9629,177 @@ def selftest() -> int:
     print(f'--- board-create {bc_total - bc_fails}/{bc_total} passed ---')
     fails += bc_fails
 
+    # ---------- check_verify_board_decision: verify_board_decision report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_verify_board_decision (offline: policy and decision fixtures
+    # built in-process with real Schnorr signatures — a 2-of-3 policy,
+    # a valid admit decision, a threshold-short decision, and a
+    # tampered-signature decision); hand-mutated reports that break the
+    # single-line grammar must be rejected.
+    vbd_fails = 0
+    _vbd_now = int(time.time())
+    _vbd_relay = 'wss://example.invalid'
+    _vbd_bid = 'vbd-board-001'
+
+    def _vbd_signer():
+        s = secrets.token_bytes(32)
+        return (s, nakama.npub_of(s))
+
+    _vbd_a, _vbd_b, _vbd_c = _vbd_signer(), _vbd_signer(), _vbd_signer()
+
+    def _vbd_policy():
+        msg = nakama.board_policy_message(_vbd_bid, _vbd_relay, 2,
+                                          [_vbd_a[1], _vbd_b[1], _vbd_c[1]],
+                                          _vbd_now)
+        return {
+            'protocol': 'nakama', 'version': 1, 'type': 'board-policy',
+            'board_id': _vbd_bid, 'relay': _vbd_relay, 'threshold': 2,
+            'eligible': [_vbd_a[1], _vbd_b[1], _vbd_c[1]],
+            'created_at': _vbd_now,
+            'signatures': [
+                {'npub': m[1],
+                 'sig': nakama.sign_schnorr(m[0], msg).hex()}
+                for m in (_vbd_a, _vbd_b, _vbd_c)],
+        }
+
+    def _vbd_decision(decname, payload, approvers):
+        msg = nakama.board_decision_message(_vbd_bid, _vbd_relay, decname,
+                                            payload, _vbd_now)
+        return {
+            'protocol': 'nakama', 'version': 1, 'type': 'board-decision',
+            'board_id': _vbd_bid, 'relay': _vbd_relay, 'decision': decname,
+            'payload': payload, 'created_at': _vbd_now,
+            'approvals': [{'npub': a[1],
+                           'sig': nakama.sign_schnorr(a[0], msg).hex()}
+                          for a in approvers],
+        }
+
+    def _vbd_run(dec, pol):
+        buf = io.StringIO()
+        code = None
+        with tempfile.TemporaryDirectory() as tmpd:
+            dec_path = os.path.join(tmpd, 'decision.json')
+            pol_path = os.path.join(tmpd, 'policy.json')
+            with open(dec_path, 'w') as f:
+                json.dump(dec, f)
+            with open(pol_path, 'w') as f:
+                json.dump(pol, f)
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    nakama.cmd_verify_board_decision(
+                        SimpleNamespace(decision=dec_path, policy=pol_path))
+                except SystemExit as e:
+                    code = e.code
+        return buf.getvalue(), code
+
+    _vbd_pol = _vbd_policy()
+    assert nakama.verify_board_policy_cert(_vbd_pol), 'vbd policy fixture'
+    _vbd_d = _vbd_signer()
+    _vbd_dec_ok = _vbd_decision('admit', {'candidate': _vbd_d[1]},
+                               [_vbd_a, _vbd_b])
+    _vbd_dec_short = _vbd_decision('admit', {'candidate': _vbd_d[1]},
+                                  [_vbd_a])
+    _vbd_dec_bad = _vbd_decision('admit', {'candidate': _vbd_d[1]},
+                                [_vbd_a, _vbd_b])
+    _vbd_dec_bad['approvals'][1]['sig'] = '00' * 64
+
+    _vbd_rep_ok, _vbd_code_ok = _vbd_run(_vbd_dec_ok, _vbd_pol)
+    _vbd_rep_short, _vbd_code_short = _vbd_run(_vbd_dec_short, _vbd_pol)
+    _vbd_rep_bad, _vbd_code_bad = _vbd_run(_vbd_dec_bad, _vbd_pol)
+
+    vbd_e2e = [
+        ('valid decision', _vbd_rep_ok, _vbd_code_ok, 0,
+         'board-decision は有効です: 承認署名 2/2（決定 "admit"）\n'),
+        ('threshold short', _vbd_rep_short, _vbd_code_short, 1,
+         'board-decision は無効です: 承認署名 1/2（threshold 未達または署名不正）\n'),
+        ('tampered signature', _vbd_rep_bad, _vbd_code_bad, 1,
+         'board-decision は無効です: 承認署名 1/2（threshold 未達または署名不正）\n'),
+    ]
+    for name, rep, code, want_code, want_rep in vbd_e2e:
+        exact = (rep == want_rep) and (code == want_code)
+        ok, errs, info = conform_verify_board_decision_report(rep)
+        good = exact and ok
+        print(f'verify-board-decision-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({ "; ".join(info) })')
+        if not good:
+            if not exact:
+                print(f'    - stdout/exit mismatch: {rep!r} code={code}')
+            for e in errs:
+                print(f'    - {e}')
+            vbd_fails += 1
+
+    _vbd_ok_line = ('board-decision は有効です: '
+                    '承認署名 2/2（決定 "policy-update"）')
+    _vbd_bad_line = ('board-decision は無効です: '
+                     '承認署名 1/3（threshold 未達または署名不正）')
+    vbd_pos = [
+        ('valid', _vbd_ok_line + '\n'),
+        ('valid no trailing newline', _vbd_ok_line),
+        ('valid trailing blanks', _vbd_ok_line + '\n\n  \n'),
+        ('valid n > threshold', 'board-decision は有効です: '
+                                '承認署名 3/2（決定 "admit"）\n'),
+        ('valid zero approvals zero threshold',
+         'board-decision は有効です: 承認署名 0/0（決定 "close"）\n'),
+        ('valid unicode decision name', 'board-decision は有効です: '
+                                        '承認署名 2/2（決定 "緊急 措置"）\n'),
+        ('invalid', _vbd_bad_line + '\n'),
+        ('invalid no trailing newline', _vbd_bad_line),
+        ('invalid trailing blanks', _vbd_bad_line + '\n\n'),
+        ('invalid zero/zero', 'board-decision は無効です: '
+                              '承認署名 0/0（threshold 未達または署名不正）\n'),
+    ]
+    vbd_neg = [
+        ('empty text', ''),
+        ('two reports', _vbd_ok_line + '\n' + _vbd_ok_line + '\n'),
+        ('wrong verdict vocab',
+         _vbd_ok_line.replace('有効です', '成立です') + '\n'),
+        ('english verdict',
+         'board-decision is valid: 2/2 ("admit")\n'),
+        ('valid n < threshold',
+         'board-decision は有効です: 承認署名 1/2（決定 "admit"）\n'),
+        ('invalid with decision tail',
+         'board-decision は無効です: 承認署名 1/2（決定 "admit"）\n'),
+        ('valid with invalid tail',
+         'board-decision は有効です: 承認署名 2/2（threshold 未達または署名不正）\n'),
+        ('missing quotes around decision',
+         'board-decision は有効です: 承認署名 2/2（決定 admit）\n'),
+        ('empty decision name',
+         'board-decision は有効です: 承認署名 2/2（決定 ""）\n'),
+        ('decision name with quote',
+         'board-decision は有効です: 承認署名 2/2（決定 "a"b"）\n'),
+        ('non-numeric counts',
+         'board-decision は有効です: 承認署名 x/2（決定 "admit"）\n'),
+        ('missing decision tail',
+         'board-decision は有効です: 承認署名 2/2\n'),
+        ('trailing garbage', _vbd_ok_line + '\nおまけ\n'),
+        ('leading garbage', '前置き\n' + _vbd_ok_line + '\n'),
+        ('swapped order',
+         'board-decision は有効です: 承認署名 2/3（決定） "admit"\n'),
+        ('verdict word truncated',
+         'board-decision は有効で: 承認署名 2/2（決定 "admit"）\n'),
+    ]
+    for name, rep in vbd_pos:
+        ok, errs, info = conform_verify_board_decision_report(rep)
+        good = ok
+        print(f'check_verify_board_decision pos {name}: '
+              f'{"PASS" if good else "FAIL"} ({ "; ".join(info) })')
+        for e in errs:
+            print(f'    - {e}')
+        vbd_fails += 0 if good else 1
+    for name, rep in vbd_neg:
+        ok, _errs, _info = conform_verify_board_decision_report(rep)
+        good = not ok
+        print(f'check_verify_board_decision neg {name}: '
+              f'{"PASS" if good else "FAIL"}')
+        if not good:
+            print(f'    - report wrongly accepted')
+        vbd_fails += 0 if good else 1
+    vbd_total = len(vbd_e2e) + len(vbd_pos) + len(vbd_neg)
+    print(f'--- verify-board-decision {vbd_total - vbd_fails}/{vbd_total} '
+          f'passed ---')
+    fails += vbd_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -9541,7 +9810,7 @@ def selftest() -> int:
         + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total \
         + bfa_total + pub_total + gov_total + rf_total + rtf_total \
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
-        + bj_total + bs_total + bc_total
+        + bj_total + bs_total + bc_total + vbd_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -9806,6 +10075,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_board_create_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_verify_board_decision':
+        if len(argv) < 3:
+            print('usage: conformance.py check_verify_board_decision '
+                  '<report.txt> [...]')
+            return 2
+        return check_verify_board_decision_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -9846,6 +10121,7 @@ def main(argv: list[str]) -> int:
           'check_board_join <report.txt> [...] | '
           'check_board_send <report.txt> [...] | '
           'check_board_create <report.txt> [...] | '
+          'check_verify_board_decision <report.txt> [...] | '
           'selftest')
     return 2
 
