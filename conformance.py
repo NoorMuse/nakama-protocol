@@ -306,6 +306,37 @@ implementation's `board_send` CLI prints a compatible report.
 `check_board_send` with reports produced in-process by
 nakama.py's own `cmd_board_send` (with `nostr_publish` monkeypatched).
 
+Board create report conformance:
+
+    python3 conformance.py check_board_create <report1.txt> [...]
+
+Verifies a saved `nakama.py board_create` stdout report is internally
+consistent (spec §4.6): the per-kind result lines —
+`kind 9002: 受理/拒否 (reason)` first, then
+`kind 34550: 受理/拒否 (reason)` when the 9002 publish was accepted —
+followed, when both were accepted, by the board descriptor output and a
+final `広場 "<name>" を作りました: board_id=nakama-<6 hex>` summary line.
+A 9002 rejection ends the report after line 1; a 34550 rejection ends it
+after line 2. Checks: the fixed per-kind prefixes in the fixed order
+(9002 before 34550 — not the `publish:` shape of `check_pub` nor the
+`参加申請:` / `投稿:` shapes), the two-word verdict vocabulary
+`受理`/`拒否`, an arbitrary reason string (may contain parentheses — the
+checker reads up to the last `)` — and may be empty), the descriptor
+output's shape (a single `descriptor を <out> に保存しました` line or a
+JSON descriptor block whose board_id matches the summary's, so
+concatenated reports are rejected), and the `nakama-<6 hex>` board_id
+namespace in the summary line; trailing blank lines tolerated. Explicitly out of scope: the relay's verdict truth
+(assertion model), the reason's truth, event/tag truth (event signature
+checks are the event checkers' territory), the descriptor output between
+the kind lines and the summary line (its signature is `check_board`'s
+territory), stderr, and the exit code (invisible in saved stdout). Use
+this to prove a second implementation's `board_create` CLI prints a
+compatible report.
+
+`python3 conformance.py selftest` also covers
+`check_board_create` with reports produced in-process by
+nakama.py's own `cmd_board_create` (with `nostr_publish` monkeypatched).
+
 Compromise declaration conformance:
 
     python3 conformance.py check_compromise <decl1.json> [...]
@@ -4729,6 +4760,157 @@ def check_board_send_files(paths: list[str]) -> int:
         ok, errs, info = conform_board_send_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_board_create: board_create report consistency ----------
+
+# `nakama.py board_create <relay> [--out FILE]` prints a multi-line
+# report to stdout whose grammar is fixed (spec §4.6):
+#   kind 9002: 受理 (reason)        <- create-group result line
+#   kind 34550: 受理 (reason)       <- metadata result line (only when 9002
+#                                     was accepted)
+#   <board descriptor output>       <- either a single
+#                                      `descriptor を <out> に保存しました`
+#                                      line (--out), or the JSON descriptor
+#                                      block (stdout mode) — its
+#                                      signature/content is `check_board`'s
+#                                      territory, but its *shape* (save
+#                                      line or JSON with a matching
+#                                      board_id) is checked, so two
+#                                      concatenated reports cannot pass
+#   広場 "<name>" を作りました: board_id=nakama-<6 hex>
+# If the kind 9002 publish is rejected, the report is exactly that one
+# line (the CLI exits 1 before publishing kind 34550). If kind 34550 is
+# rejected, the report is exactly the two kind lines (the CLI exits 1
+# before printing the descriptor).
+# `kind 9002:` / `kind 34550:` are this command's fixed per-kind prefixes —
+# they are NOT the single-line `publish:` shape checked by `check_pub`
+# (v0.46, §4.3, which explicitly excludes board_create's per-kind lines),
+# nor the `参加申請:` shape of `check_board_join` (v0.56, §4.4) nor the
+# `投稿:` shape of `check_board_send` (v0.57, §4.5); `check_board_create`
+# rejects any report whose first line is not a `kind 9002:` result line,
+# so a saved report can only satisfy the checker for the command that
+# actually produced it.
+# check_board_create verifies that a saved report is internally consistent:
+# the fixed per-kind line grammar `kind <9002|34550>: 受理/拒否 (reason)`
+# with the two-word verdict vocabulary `受理`/`拒否`, an arbitrary reason
+# string taken verbatim from the relay (may contain parentheses — the
+# checker reads up to the LAST `)` — and may be empty when the relay's
+# OK carries no message), the kind order 9002-before-34550, early-exit
+# shape (rejection at 9002 ends the report; rejection at 34550 ends it
+# after the second line), and — when both publishes were accepted — a
+# final `広場 "<name>" を作りました: board_id=nakama-<6 hex>` summary
+# line. The board_id hex namespace (`nakama-<3 random bytes>` in the
+# reference implementation) is checked structurally.
+# Trailing blank lines are tolerated.
+# Explicitly out of scope: the relay's accept/reject truth (assertion
+# model — the reference implementation prints the relay's response
+# verbatim), the reason's truth, whether the published events carry the
+# right tags (event signature checks are the event checkers' territory),
+# the descriptor content between the kind lines and the summary line
+# (its signature is checked by `check_board`), stderr, and the exit code
+# (invisible in saved stdout). Use this to prove a second implementation's
+# `board_create` CLI prints a compatible report.
+
+_RE_BC_KIND = re.compile(r'^kind (9002|34550): (受理|拒否) \((.*)\)$')
+_RE_BC_DONE = re.compile(
+    r'^広場 "(.*)" を作りました: board_id=(nakama-[0-9a-f]{6})$')
+
+
+def conform_board_create_report(text: str):
+    """Verify a saved `nakama.py board_create` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    m = _RE_BC_KIND.match(lines[0])
+    if not m or m.group(1) != '9002':
+        return False, ['line 1: not a create-group result line '
+                       '(`kind 9002: 受理/拒否 (reason)`)'], info
+    v1, reason1 = m.group(2), m.group(3)
+    info.append(f'9002 {v1}')
+    if v1 == '拒否':
+        if len(lines) != 1:
+            return False, [f'kind 9002 was rejected, so the report must end '
+                           f'here — found {len(lines)} lines'], info
+        return (not errs), errs, info
+    if len(lines) < 2:
+        return False, ['line 2: missing metadata result line '
+                       '(`kind 34550: 受理/拒否 (reason)`)'], info
+    m2 = _RE_BC_KIND.match(lines[1])
+    if not m2 or m2.group(1) != '34550':
+        return False, ['line 2: not a metadata result line '
+                       '(`kind 34550: 受理/拒否 (reason)`)'], info
+    v2, reason2 = m2.group(2), m2.group(3)
+    info.append(f'34550 {v2}')
+    if v2 == '拒否':
+        if len(lines) != 2:
+            return False, [f'kind 34550 was rejected, so the report must end '
+                           f'after line 2 — found {len(lines)} lines'], info
+        return (not errs), errs, info
+    # both accepted: the last line must be the creation summary; the
+    # descriptor output between the kind lines and the summary must be
+    # the single save line (--out mode) or the descriptor JSON block
+    # (stdout mode). The descriptor's own signature/content stays out of
+    # scope (`check_board`'s territory), but its *shape* pins the report
+    # down so two concatenated reports cannot pass.
+    md = _RE_BC_DONE.match(lines[-1])
+    if not md:
+        return False, ['last line: not a board creation summary line '
+                       '(`広場 "<name>" を作りました: '
+                       'board_id=nakama-<6 hex>`)'], info
+    info.append(f'board_id={md.group(2)}')
+    mid = lines[2:-1]
+    if not mid:
+        return False, ['both publishes accepted, but no descriptor output '
+                       'between the kind lines and the summary line'], info
+    if len(mid) == 1 and mid[0].startswith('descriptor を ') \
+            and mid[0].endswith(' に保存しました'):
+        pass  # --out mode: single save confirmation line
+    else:
+        try:
+            desc = json.loads('\n'.join(mid))
+        except Exception:
+            return False, ['descriptor output between the kind lines and '
+                           'the summary line is neither a '
+                           '`descriptor を <out> に保存しました` line '
+                           'nor a JSON descriptor block'], info
+        if isinstance(desc, dict) and desc.get('board_id') \
+                and desc['board_id'] != md.group(2):
+            return False, [f'descriptor board_id {desc["board_id"]!r} does '
+                           f'not match the summary board_id '
+                           f'{md.group(2)}'], info
+    if reason1:
+        info.append(f'9002 reason: {reason1[:24]}')
+    if reason2:
+        info.append(f'34550 reason: {reason2[:24]}')
+    return (not errs), errs, info
+
+
+def check_board_create_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_board_create_report(text)
+        if ok:
+            print(f'{p}: PASS ({ "; ".join(info) })')
         else:
             print(f'{p}: FAIL')
             for e in errs:
@@ -9193,6 +9375,162 @@ def selftest() -> int:
     print(f'--- board-send {bs_total - bs_fails}/{bs_total} passed ---')
     fails += bs_fails
 
+    # check_board_create: board_create report consistency (v0.58). E2E runs
+    # the real `nakama.py cmd_board_create` in-process with `nostr_publish`
+    # monkeypatched (both accepted / rejected at 9002 / rejected at 34550).
+    # The reported board_id must equal the h/d tags of the captured kind
+    # 9002/34550 events, and the exit code must match the verdicts.
+    bc_fails = 0
+    bc_e2e = []
+
+    def _bc_run(tmpd, results, name, out=None):
+        captured = []
+
+        def _fake_publish(url, event, timeout=15, auth_secret=None):
+            captured.append(event)
+            return results[len(captured) - 1]
+
+        real_publish = nakama.nostr_publish
+        nakama.nostr_publish = _fake_publish
+        try:
+            kpath = os.path.join(tmpd, 'key.txt')
+            nakama.save_key(kpath, secrets.token_bytes(32))
+            buf = io.StringIO()
+            args = _SimpleNamespace(keyfile=kpath,
+                                    relay='wss://relay.example',
+                                    name='テスト広場', about='e2e 用',
+                                    admission='open', out=out,
+                                    auth=False)
+            code = 0
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    nakama.cmd_board_create(args)
+                except SystemExit as e:
+                    code = e.code
+        finally:
+            nakama.nostr_publish = real_publish
+        return buf.getvalue(), captured, code
+
+    with _tempfile.TemporaryDirectory() as tmpd:
+        outp = os.path.join(tmpd, 'descriptor.json')
+        for name, results, exp_code, want_events in (
+                ('accepted (out)', [(True, 'OK'), (True, 'OK')], 0, 2),
+                ('rejected at 9002', [(False, 'auth-required')], 1, 1),
+                ('rejected at 34550',
+                 [(True, 'OK'), (False, 'duplicate')], 1, 2)):
+            text, evs, code = _bc_run(tmpd, results, name,
+                                       outp if name == 'accepted (out)' else None)
+            ok, errs, info = conform_board_create_report(text)
+            good = ok and code == exp_code and len(evs) == want_events
+            if good and want_events == 2 and exp_code == 0:
+                # board_id consistency across the summary line and both
+                # events' tags; kinds must be 9002 then 34550.
+                m_bid = re.search(
+                    r'board_id=(nakama-[0-9a-f]{6})', text)
+                tags_ok = (
+                    m_bid is not None
+                    and evs[0]['kind'] == 9002
+                    and evs[1]['kind'] == 34550
+                    and any(t == ['h', m_bid.group(1)]
+                            for t in evs[0]['tags'])
+                    and any(t == ['d', m_bid.group(1)]
+                            for t in evs[1]['tags']))
+                good = good and tags_ok
+            if good and name == 'accepted (out)':
+                good = good and os.path.isfile(outp) \
+                    and 'descriptor を' in text
+            print(f'check_board_create e2e {name}: '
+                  f'{"PASS" if good else "FAIL"} ({ "; ".join(info) })')
+            for e in errs:
+                if ok:
+                    print(f'    - {e}')
+            if not good:
+                print(f'    - stdout was: {text!r}, exit: {code}, '
+                      f'events: {len(evs)}')
+            bc_fails += 0 if good else 1
+            bc_e2e.append(name)
+
+    _bc_json_mid = '{\n  "protocol": "nakama"\n}\n'
+    _bc_ok_head = 'kind 9002: 受理 (OK)\nkind 34550: 受理 (OK)\n'
+    _bc_ok_save = (_bc_ok_head
+                   + 'descriptor を /tmp/desc.json に保存しました\n'
+                   + '広場 "仲間の広場" を作りました: board_id=nakama-a1b2c3\n')
+    bc_pos = [
+        ('accepted with save line', _bc_ok_save),
+        ('accepted with json middle', _bc_ok_head + _bc_json_mid
+         + '広場 "仲間の広場" を作りました: board_id=nakama-a1b2c3\n'),
+        ('accepted no trailing newline', _bc_ok_save.rstrip('\n')),
+        ('accepted trailing blank lines', _bc_ok_save + '\n\n'),
+        ('accepted empty reasons',
+         'kind 9002: 受理 ()\nkind 34550: 受理 ()\n'
+         'descriptor を /tmp/x.json に保存しました\n'
+         '広場 "広場" を作りました: board_id=nakama-000000\n'),
+        ('accepted reason with parens',
+         'kind 9002: 受理 (承認 (auto))\nkind 34550: 受理 (OK)\n'
+         'descriptor を /tmp/x.json に保存しました\n'
+         '広場 "広場" を作りました: board_id=nakama-abcdef\n'),
+        ('rejected at 9002', 'kind 9002: 拒否 (auth-required)\n'),
+        ('rejected at 9002 no newline', 'kind 9002: 拒否 ()'),
+        ('rejected at 34550',
+         'kind 9002: 受理 (OK)\nkind 34550: 拒否 (duplicate)\n'),
+        ('quoted board name', _bc_ok_save.replace(
+            '広場 "仲間の広場" を作りました',
+            '広場 "a "b" c" を作りました')),
+    ]
+    bc_neg = [
+        ('empty text', ''),
+        ('two reports', _bc_ok_save + _bc_ok_save),
+        ('34550 first', 'kind 34550: 受理 (OK)\n'
+         'kind 9002: 受理 (OK)\n'
+         '広場 "広場" を作りました: board_id=nakama-a1b2c3\n'),
+        ('9002 line twice', 'kind 9002: 受理 (OK)\nkind 9002: 受理 (OK)\n'
+         '広場 "広場" を作りました: board_id=nakama-a1b2c3\n'),
+        ('wrong verdict vocab', _bc_ok_save.replace('受理', '承認', 1)),
+        ('publish prefix (check_pub shape)',
+         'publish: 受理 (OK) id=' + 'ab' * 32 + '\n'),
+        ('board_join prefix', '参加申請: 受理 (OK) id=' + 'ab' * 32 + '\n'),
+        ('board_send prefix', '投稿: 受理 (OK) id=' + 'ab' * 32 + '\n'),
+        ('missing 34550 line',
+         'kind 9002: 受理 (OK)\n'
+         '広場 "広場" を作りました: board_id=nakama-a1b2c3\n'),
+        ('extra line after 9002 rejection',
+         'kind 9002: 拒否 (x)\nkind 34550: 受理 (OK)\n'),
+        ('extra line after 34550 rejection',
+         'kind 9002: 受理 (OK)\nkind 34550: 拒否 (x)\n'
+         '広場 "広場" を作りました: board_id=nakama-a1b2c3\n'),
+        ('missing summary line', _bc_ok_head
+         + 'descriptor を /tmp/desc.json に保存しました\n'),
+        ('board_id without prefix', _bc_ok_save.replace(
+            'board_id=nakama-a1b2c3', 'board_id=a1b2c3')),
+        ('board_id hex too long', _bc_ok_save.replace(
+            'board_id=nakama-a1b2c3', 'board_id=nakama-a1b2c3d4')),
+        ('descriptor board_id mismatch',
+         _bc_ok_head + '{\n  "protocol": "nakama",\n  "board_id": "nakama-deadbe"\n}\n'
+         + '広場 "広場" を作りました: board_id=nakama-a1b2c3\n'),
+        ('descriptor middle not json',
+         _bc_ok_head + 'some garbage middle\n'
+         + '広場 "広場" を作りました: board_id=nakama-a1b2c3\n'),
+    ]
+    for name, rep in bc_pos:
+        ok, errs, info = conform_board_create_report(rep)
+        good = ok
+        print(f'check_board_create pos {name}: '
+              f'{"PASS" if good else "FAIL"} ({ "; ".join(info) })')
+        for e in errs:
+            print(f'    - {e}')
+        bc_fails += 0 if good else 1
+    for name, rep in bc_neg:
+        ok, _errs, _info = conform_board_create_report(rep)
+        good = not ok
+        print(f'check_board_create neg {name}: {"PASS" if good else "FAIL"}')
+        if not good:
+            print(f'    - report wrongly accepted')
+        bc_fails += 0 if good else 1
+    bc_total = len(bc_e2e) + len(bc_pos) + len(bc_neg)
+    print(f'--- board-create {bc_total - bc_fails}/{bc_total} passed ---')
+    fails += bc_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -9203,7 +9541,7 @@ def selftest() -> int:
         + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total \
         + bfa_total + pub_total + gov_total + rf_total + rtf_total \
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
-        + bj_total + bs_total
+        + bj_total + bs_total + bc_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -9462,6 +9800,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_board_send_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_board_create':
+        if len(argv) < 3:
+            print('usage: conformance.py check_board_create '
+                  '<report.txt> [...]')
+            return 2
+        return check_board_create_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -9501,6 +9845,7 @@ def main(argv: list[str]) -> int:
           'check_renew <report.txt> [...] | '
           'check_board_join <report.txt> [...] | '
           'check_board_send <report.txt> [...] | '
+          'check_board_create <report.txt> [...] | '
           'selftest')
     return 2
 
