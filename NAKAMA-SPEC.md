@@ -1,7 +1,7 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.3
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21）。v0.17 完了 — 30103+30104 横断 fetch の統合（§22）。v0.18 完了 — fetch 時点の政策スナップショットの保存（§23））。v0.19 完了 — 草案の期限（§24）。v0.20 完了 — 草案への自動通知（§25））。v0.21 設計中 — kind 30100–30104 の正式割当申請（§26）
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21）。v0.17 完了 — 30103+30104 横断 fetch の統合（§22）。v0.18 完了 — fetch 時点の政策スナップショットの保存（§23））。v0.19 完了 — 草案の期限（§24）。v0.20 完了 — 草案への自動通知（§25））。v0.21 設計完了 — kind 30100–30104 の正式割当申請（§26）、v0.22 完了 — NIP ドラフト文書の作成（§26）。v0.23 設計中 — 既存採用の確認結果と kind 再マップ設計（30100–30104→30107–30111、§26.9・§26.10）
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -249,7 +249,9 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.18**（完了）: fetch 時点の政策スナップショットの保存（§23）。§22.7 のスコープ外項目を昇格。`save_policy_snapshot(out_dir, policy)` ヘルパを追加し、`board_decide_fetch` / `board_draft_fetch` / `board_fetch_all` の 3 コマンドで `--out` と `--policy` の両指定時のみ、検証済みの board-policy を `policy-snapshot-<unixts>.json` としてコピー保存（決定ファイル `<core_hash>.json` とは prefix で区別、board_cosign / board_read --governance --decisions 運用と共存）。検証者はこのファイルを `--policy` に再指定して fetch 時点の threshold 判定を再現できる（§20.2 の時点解決も同一ファイルから再実行で同一結果）。スコープ外（残る）: 草案の期限、草案への自動通知（DM 連携）、kind 30103 / 30104 の正式割当申請。オフライン 12 ケース通過（`test_policy_snapshot.py` 新規）＋全回帰維持。
 - **v0.19**（完了）: 草案の期限（§24）。§22.7 のスコープ外項目を昇格: 決定 payload の任意フィールド `expires_at`（unix 時刻 int、署名対象 — 期限の異なる再発行は別コア＝別 d スロット）。`board_decide --expires-in <秒>` / `--expires-at <unix時刻>`（両指定時は後者優先、`expires_at <= created_at` は拒否。非 int の expires_at も `validate_decision_payload` で拒否）。3 層の強制: `board_cosign` は期限切れ草案への署名を拒否（exit 1、ゾンビ草案対策の主軸）、`board_draft_pub` は期限切れ草案の publish を拒否（exit 1）、`board_draft_fetch` / `board_fetch_all` は期限切れ草案に `[期限切れ]` マーカー（表示のみ、exit 不変。同一コアに期限切れ 30104 と 30103 が混在した場合は「成立済み」表示が優先）。期限は草案（30104）のみ — 成立済み（30103）は §20 の不変性ルールの下で恒久的、`board_read --governance` と `board_decide_pub` は期限を見ない。期限判定は純粋関数 `draft_is_expired(d, now)` に分離。期限なし草案は従来通り無期限（後方互換）。正直に書く: 期限は自己申告（正直な運用者のための仕組み、攻撃者の制約ではない）、期限切れスロットはリレー上に残る（削除はしない）。テスト 11 ケース通過（`test_draft_expiry.py` 新規: 換算・優先・非 int 拒否・created_at 以下拒否・後方互換・cosign 拒否・cosign 回帰・publish 拒否・fetch マーカー 2 系統・成立済み優先・純粋関数の分離）、全スイート回帰維持。スコープ外: 自動通知、kind 正式割当、bond/rotation/revocation への期限、期限切れスロットの自動削除。
 - **v0.20**（完了）: 草案への自動通知（§25）。§24.4 のスコープ外項目を昇格: 新規コマンド `board_draft_notify <relay> <board_id> [--limit] [--auth] [--policy] [--within <秒>] [--include-expired] [--dry-run] [--resend] [--from <npub>]`。30104 fetch を流用し、`0 < expires_at - now <= --within`（既定 24h）の草案を「期限間近」として発行者（草案イベントの publisher）に NIP-17 DM で通知（`nip17_build_seal`/`nip17_build_gift_wrap` + `nostr_publish` 流用、`--auth` 対応）。期限切れは既定で対象外（`--include-expired` で reason=expired のみ対象）、期限なし草案は対象外、承認者は宛先外（spam 抑制）。二重送信防止はローカル送信記録 `~/.config/nakama/draft_notifs/<core_hash>:<reason>.json` で同一 reason の再送を `--within` 以内は抑制（`--resend` で強制再送可）。正直に書く: 通知は気休め（到達保証なし）、誰でも送れる（受け手は `board_draft_fetch` で自分で確認 — 通知は主張であって検証ではない）、spam の悪用可能性（別 reason・別送信者の重複は防げない）。スコープ外: デーモン化・自動スケジューリング、30103 への通知、kind 正式割当、承認者への通知、既読追跡。テスト 9 ケース通過（`test_draft_notify.py`、オフライン）。
-- **v0.21**（設計中）: kind 30100–30104 の正式割当申請（NIP 化）（§26）。§24.4・§25.3 のスコープ外項目を昇格: 5 kinds（revocation 30100 / compromise 30101 / rotation 30102 / decision 30103 / draft 30104、すべて parameterized replaceable）の一覧固定、NIP ドラフト文書（`docs/NIP-nakama.md`）の構成案（概要・kind 一覧・tags/content/署名者/置換ルール・三段階検証・互換性・セキュリティ考慮）、衝突時のフォールバック（kind 定数の再マップ・移行期間の両 kind 購読・公開済みは再公開しない）、手順（repo 内草案→既存採用の確認→nips PR）。正直に書く: 30000–39999 は誰でも使える名前空間のため申請は独占ではなく文書化＋衝突回避、NIP 登録は合意形成であって強制ではなく署名検証が本質、PR 投稿・レビュー対応は人間社会の承認プロセスで 人間の確認が必要。コード変更なし（実装は v0.22 で文書作成）。
+- **v0.21**（設計完了）: kind 30100–30104 の正式割当申請（NIP 化）（§26）。§24.4・§25.3 のスコープ外項目を昇格: 5 kinds（revocation 30100 / compromise 30101 / rotation 30102 / decision 30103 / draft 30104、すべて parameterized replaceable）の一覧固定、NIP ドラフト文書（`docs/NIP-nakama.md`）の構成案（概要・kind 一覧・tags/content/署名者/置換ルール・三段階検証・互換性・セキュリティ考慮）、衝突時のフォールバック（kind 定数の再マップ・移行期間の両 kind 購読・公開済みは再公開しない）、手順（repo 内草案→既存採用の確認→nips PR）。正直に書く: 30000–39999 は誰でも使える名前空間のため申請は独占ではなく文書化＋衝突回避、NIP 登録は合意形成であって強制ではなく署名検証が本質、PR 投稿・レビュー対応は人間社会の承認プロセスで 人間の確認が必要。コード変更なし（実装は v0.22 で文書作成）。
+- **v0.22**（完了）: NIP ドラフト文書 `docs/NIP-nakama.md` を §26.3 の構成案どおりに作成（commit fcc2f8e）。概要・5 kind の tags/content/署名者/スロット・三段階検証・互換性・セキュリティ考慮・既存採用の確認手順（§26.4）・正直な注記。コード変更なし（文書のみ）。
+- **v0.23**（設計中）: 既存採用の確認結果と kind 再マップ設計（§26.9・§26.10）。2026-10-01 のリレー調査で 30100–30104 すべてに他者の先行採用を確認（job マーケットプレイス風アプリの 30100、ポルトガル語圏投票アプリの 30100/30101/30102/30104）。nakama イベントは未公開のためクリーンカット: 新ブロック 30107–30111（revocation→30107 / compromise→30108 / rotation→30109 / decision→30110 / draft→30111。30107–30112・30114–30120 は調査リレーで無反応）。実装は次ラン: kind 定数の環境変数上書き（`NAKAMA_KIND_<name>`）、fetch 系の定数ベース化、spec の kind 参照一括更新。旧 kinds の購読・互換サポートはスコープ外。
 
 ---
 
@@ -1548,8 +1550,8 @@ nakama.py は現在 5 つの Nostr event kind を使っているが、すべて�
 
 ### 26.5 手順
 
-1. v0.22: `docs/NIP-nakama.md` 草案を repo に作成（§26.3 の構成案に沿う）。
-2. 既存採用の確認（§26.4）。衝突があれば草案に kind 代替案を記載。
+1. v0.22: `docs/NIP-nakama.md` 草案を repo に作成（§26.3 の構成案に沿う）。→ 完了（commit fcc2f8e）。
+2. 既存採用の確認（§26.4）。衝突があれば草案に kind 代替案を記載。→ **2026-10-01 に実施（§26.9）: 30100–30104 すべてに他者の先行採用を確認 → 再マップ設計 §26.10 へ。**
 3. nostr-protocol/nips に issue → PR。**PR の投稿とレビュー対応は人間社会の承認プロセスであり、エージェント単独で完遂できる保証はない — 人間の確認・操作が必要な段階であることを明示する。**
 4. 結果（受理 / 却下 / 無応答）を spec §26 に追記し、採用 kind が変われば §26.4 の移行を実施。
 
@@ -1571,7 +1573,55 @@ nakama.py は現在 5 つの Nostr event kind を使っているが、すべて�
 - レビュー観点（次ランの実装前に確認）: 5 kinds の形状が §12/13/17/19/21 と一致しているか、置換ルール（正規スロット）が各 fetch の前提と矛盾しないか、フォールバック手順（§26.4）に抜けがないか。
 - v0.22 の実装計画: `docs/NIP-nakama.md` の作成（§26.3 の構成案どおり）、既存採用の確認手順のメモ化。オフラインテスト不要（文書のみ）。PR 投稿自体は §26.5 の通り人間判断。
 
+### 26.9 既存採用の確認結果（2026-10-01、§26.5 手順 2 完了）
+
+relay.damus.io・nos.lol・relay.primal.net・relay.nostr.band に対し kinds=[30100..30104] のワイルドカード REQ（limit 20、d タグ制約なし）を実施。代替候補として 30105–30120 も同条件で調査（limit 100）。nostr.band の検索 API はこのランでは到達不能だった。
+
+**結果: 30100–30104 は他者による先行採用あり。**
+
+1. job マーケットプレイス風アプリが kind 30100 を利用: タグ `["d", <hex>]`・`["e", <hex>]`・`["status", "completed"]`、content は `Job completed in 237.983s` のようなジョブ完了報告。複数リレー・複数 pubkey で確認。
+2. ポルトガル語圏の集団投票／ショーケースアプリ（"Rodada"、"Vitrine Coletiva"）が kind 30100/30101/30102/30104 を利用: `["d", "rodada-001"]` 形式の d タグ、`["voto", ...]`・`["votantes", ...]` タグ。30105 にも同アプリの使用を確認。
+3. サンプル内に nakama 形状（§2 相当）のイベントは存在しなかった。**衝突は他者同士ではなく、nakama 未公開＋他者の先行使用**という構図 — nakama イベントは一度も公開リレーに publish されていない（公開済みイベントの再公開禁止問題は発生しない）。
+
+代替ブロックの調査: 30105・30106・30113 に軽い使用あり（30105 は上記投票アプリ）。**30107–30112 と 30114–30120 は応答した 3 リレーすべてで無反応**（静か ≠ 世界的に空き、の正直な注記つき。limit-100 のワイルドカード購読で採用の痕跡なし）。
+
+結論: 連続した静かなブロック **30107–30111** に再マップする（設計は §26.10）。NIP ドラフト `docs/NIP-nakama.md` §6 にも同結果を記録し、草案の kind 表は新ブロックに更新済み（草案自体に再マップの経緯を注記）。
+
+### 26.10 kind 再マップの設計（設計のみ、実装は次ラン）
+
+§26.4 のフォールバック手順を具体化する。公開済みイベントが存在しないため、移行は「クリーンカット＋設定で再マップ可能」の二層にする（旧 kinds の両購読は行わない — それは避けたいノイズの再導入になる）。
+
+**新 kind マッピング:**
+
+| 旧 kind | 新 kind | 用途 | d タグ（不変） |
+|---------|---------|------|---------------|
+| 30100 | 30107 | revocation | bond_hash |
+| 30101 | 30108 | key-compromise-declaration | subject_hex:declarant_hex |
+| 30102 | 30109 | rotation 証明書 | 旧鍵の hex pubkey |
+| 30103 | 30110 | board-decision（成立済み） | decision_core_hash |
+| 30104 | 30111 | board-draft（草案・回覧中） | decision_core_hash |
+
+**実装設計（次ラン）:**
+
+1. `nakama.py` の kind 定数 5 つ（`REVOCATION_NOSTR_KIND` / `COMPROMISE_NOSTR_KIND` / `ROTATION_NOSTR_KIND` / `DECISION_NOSTR_KIND` / `DRAFT_NOSTR_KIND` 相当）を環境変数で上書き可能にする: `NAKAMA_KIND_REVOCATION`・`NAKAMA_KIND_COMPROMISE`・`NAKAMA_KIND_ROTATION`・`NAKAMA_KIND_DECISION`・`NAKAMA_KIND_DRAFT`。既定値は新ブロック（30107–30111）。非 int・範囲外（30000–39999 以外）の値は起動時ではなく使用時に検証し、不正ならその操作を exit 1 で拒否（正直な注記: 環境変数は足元の運用のためのもので、他者の kind 使用を変える力はない）。
+2. fetch 系コマンド（`revoke_fetch` / `compromise_fetch` / `rotate_fetch` / `board_decide_fetch` / `board_draft_fetch` / `board_fetch_all`）は定数から購読 kind を組み立てる（現行のハードコードを置換）。`board_fetch_all` の kind ホワイトリストも定数ベースに。
+3. spec の kind 参照を一括更新: §12（30100→30107）、§13（30101→30108）、§17（30102→30109）、§19（30103→30110）、§21（30104→30111）、§22 のホワイトリスト記述。§26.1 の表にも「再マップ済み（v0.23）」の注記。
+4. NIP ドラフト `docs/NIP-nakama.md` は §26.9 の記録通り新ブロック済み（このランで更新）。実装ランでは草案の「Pre-registration remap」注記と整合性を確認するのみ。
+
+**スコープ外:**
+- 旧 kinds（30100–30104）の購読・互換サポート（クリーンカット。公開済み nakama イベントは存在しないため失うものはない）。
+- nostr.band 検索 API での再確認（到達不能だった分。PR 提出前に再実施する — 手順書 §26.5-3 の一部）。
+- nips PR の投稿（§26.5-3: 人間社会の承認プロセス。人間の確認が必要）。
+
+**テスト計画（次ラン、オフライン）:**
+1. 既定値: 5 定数が 30107–30111 であること。
+2. 環境変数で 1 つだけ上書き → その kind のみ変更、他は既定のまま。
+3. 不正値（非 int / 29999 / 40000）→ 対象操作が exit 1 で拒否。
+4. `decision_nostr_event(d, secret, kind=...)` の kind パラメータが既定で新定数を使うこと。
+5. 全既存テストスイートの回帰（kind ハードコードを踏んでいる箇所がないか確認）。
+
 ---
+
 
 ## Contributors
 
