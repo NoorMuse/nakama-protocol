@@ -34,14 +34,30 @@ Use a throwaway recipient keypair; the secret is only used locally.
 `python3 conformance.py selftest` also covers `check_dm` with reference
 wraps built by nakama.py.
 
+Board descriptor conformance:
+
+    python3 conformance.py check_board <descriptor.json> [...]
+
+Verifies each file is a nakama board descriptor as written by
+`board_create`: shape checks (protocol/version/type, board_id, relay,
+moderators, created_at) plus the Schnorr signature by moderators[0]
+over board_descriptor_message(...), mirroring `board_verify`. Use this
+to prove a second implementation creates boards the reference
+implementation accepts.
+
+`python3 conformance.py selftest` also covers `check_board` with
+reference descriptors built by nakama.py's own primitives.
+
 For the second implementer: passing `check` on your own events is the
-criterion-1 evidence the NIP-F5 draft PR needs, and passing `check_dm`
+criterion-1 evidence the NIP-F5 draft PR needs, passing `check_dm`
 on wraps addressed to a nakama-built keypair proves NIP-17 wire
-compatibility with the reference implementation.
+compatibility, and passing `check_board` on your descriptors proves
+NIP-29 board wire compatibility with the reference implementation.
 """
 
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -237,6 +253,86 @@ def check_dm_files(secret_hex: str, paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_board: nakama board descriptor conformance ----------
+
+_BOARD_ID_RE = re.compile(r'^nakama-[0-9a-f]{1,64}$')
+
+
+def conform_board(d: dict) -> tuple[bool, list[str]]:
+    """Verify a nakama board descriptor (as written by `board_create`).
+
+    Shape checks first, then the Schnorr signature by moderators[0] over
+    board_descriptor_message(...). Same acceptance rule as
+    `board_verify`, minus the compromise-warning advisory.
+    """
+    errs: list[str] = []
+    if not isinstance(d, dict):
+        return False, ['descriptor is not a JSON object']
+    if d.get('protocol') != 'nakama':
+        errs.append('protocol != "nakama"')
+    if d.get('version') != 1:
+        errs.append('version != 1')
+    if d.get('type') != 'board':
+        errs.append('type != "board"')
+    board_id = d.get('board_id')
+    if not (isinstance(board_id, str) and _BOARD_ID_RE.match(board_id)):
+        errs.append(f'board_id {board_id!r} must be nakama-<hex>')
+    relay = d.get('relay')
+    if not (isinstance(relay, str)
+            and relay.startswith(('ws://', 'wss://'))):
+        errs.append(f'relay {relay!r} must be a ws(s):// URL')
+    mods = d.get('moderators')
+    if not (isinstance(mods, list) and len(mods) >= 1):
+        errs.append('moderators must be a non-empty list')
+    else:
+        for m in mods:
+            if nakama.npub_to_hex(m) is None:
+                errs.append(f'moderator {m!r} is not a valid npub')
+    if not isinstance(d.get('created_at'), int):
+        errs.append('created_at must be an int')
+    sig = d.get('sig')
+    sig_b = None
+    if isinstance(sig, str):
+        try:
+            sig_b = bytes.fromhex(sig)
+        except ValueError:
+            sig_b = None
+    if sig_b is None or len(sig_b) != 64:
+        errs.append('sig must be 128 hex chars')
+    if not errs:
+        try:
+            msg = nakama.board_descriptor_message(board_id, relay, mods,
+                                                 d['created_at'])
+            if not nakama.verify_schnorr(mods[0], sig_b, msg):
+                errs.append('signature invalid (moderators[0] did not sign '
+                            'this descriptor)')
+        except Exception as e:
+            errs.append(f'signature check failed: {e}')
+    return (len(errs) == 0), errs
+
+
+def check_board_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            d = json.load(open(p))
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs = conform_board(d)
+        if ok:
+            print(f'{p}: PASS (board {d.get("board_id")}, '
+                  f'{len(d.get("moderators") or [])} moderator(s))')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- selftest: reference events built by nakama.py ----------
 
 def _key() -> tuple[bytes, str]:
@@ -345,7 +441,63 @@ def selftest() -> int:
     print(f'--- dm {dm_total - dm_fails}/{dm_total} passed ---')
     fails += dm_fails
 
-    grand = total + dm_total
+    # Board descriptor conformance: reference descriptor built with
+    # nakama.py primitives must verify; tampered ones must be rejected.
+    board_fails = 0
+    s_mod, np_mod = _key()
+    b_now = int(time.time())
+    b_id = 'nakama-' + secrets.token_hex(3)
+    b_relay = 'wss://relay.damus.io'
+    desc = {
+        'protocol': 'nakama', 'version': 1, 'type': 'board',
+        'board_id': b_id, 'relay': b_relay,
+        'moderators': [np_mod], 'admission': 'open',
+        'created_at': b_now,
+    }
+    b_msg = nakama.board_descriptor_message(b_id, b_relay, [np_mod], b_now)
+    desc['sig'] = nakama.sign_schnorr(s_mod, b_msg).hex()
+
+    ok, errs = conform_board(desc)
+    print(f'board/valid descriptor: {"PASS" if ok else "FAIL"}')
+    for e in errs:
+        print(f'    - {e}')
+    board_fails += 0 if ok else 1
+
+    board_neg = []
+    bad_sig = dict(desc)
+    bad_sig['sig'] = '00' * 128
+    board_neg.append(('tampered signature', bad_sig))
+    s_other, np_other = _key()
+    wrong_signer = dict(desc)
+    wrong_signer['sig'] = nakama.sign_schnorr(
+        s_other, b_msg).hex()
+    board_neg.append(('sig from a different key', wrong_signer))
+    tampered_id = dict(desc)
+    tampered_id['board_id'] = 'nakama-' + secrets.token_hex(3)
+    board_neg.append(('board_id changed after signing', tampered_id))
+    bad_id = dict(desc)
+    bad_id['board_id'] = 'other-board'
+    board_neg.append(('non-nakama board_id', bad_id))
+    no_mods = dict(desc)
+    no_mods['moderators'] = []
+    board_neg.append(('empty moderators', no_mods))
+    wrong_type = dict(desc)
+    wrong_type['type'] = 'bond'
+    board_neg.append(('wrong type', wrong_type))
+
+    for name, b in board_neg:
+        ok, errs = conform_board(b)
+        good = not ok
+        print(f'board-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            board_fails += 1
+
+    board_total = 1 + len(board_neg)
+    print(f'--- board {board_total - board_fails}/{board_total} passed ---')
+    fails += board_fails
+
+    grand = total + dm_total + board_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -362,10 +514,16 @@ def main(argv: list[str]) -> int:
                   '<wrap.json> [...]')
             return 2
         return check_dm_files(argv[2], argv[3:])
+    if len(argv) >= 2 and argv[1] == 'check_board':
+        if len(argv) < 3:
+            print('usage: conformance.py check_board <descriptor.json> [...]')
+            return 2
+        return check_board_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
-          'check_dm <recipient_secret_hex> <wrap.json> [...] | selftest')
+          'check_dm <recipient_secret_hex> <wrap.json> [...] | '
+          'check_board <descriptor.json> [...] | selftest')
     return 2
 
 
