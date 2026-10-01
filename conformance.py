@@ -193,6 +193,27 @@ stdout). Use this to prove a second implementation's
 `check_liveness_report` with reports produced in-process by
 nakama.py's own `cmd_liveness`.
 
+Verify-binding report conformance:
+
+    python3 conformance.py check_verify_binding <report1.txt> [...]
+
+Verifies a saved `nakama.py verify_binding` stdout report is internally
+consistent (spec §8.8): one or two lines — the verdict line
+`binding は有効です` / `binding は無効です`, plus, only with the valid
+verdict, the operational note
+`（運用手順）: この binding が実際に該当ハンドルのアカウントから投稿されていることを確認してください`.
+Explicitly out of scope: verdict truth (`verify_binding_cert`'s
+territory), platform/handle match truth (mismatch warnings go to
+stderr, so saved stdout reports never show them), compromise-warning
+presence (§16's `key_compromise_warnings` — stderr as well), stderr,
+and the exit code (invisible in saved stdout). Use this to prove a
+second implementation's `verify_binding` CLI prints a compatible
+report.
+
+`python3 conformance.py selftest` also covers
+`check_verify_binding` with reports produced in-process by
+nakama.py's own `cmd_verify_binding`.
+
 Compromise declaration conformance:
 
     python3 conformance.py check_compromise <decl1.json> [...]
@@ -4187,6 +4208,88 @@ def check_liveness_report_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_verify_binding: verify_binding report consistency ----------
+
+# `nakama.py verify_binding <binding.json> [--platform <name> --handle <name>]`
+# prints a short report to stdout whose grammar is fixed (spec §8.8):
+# one line when the binding is invalid, two lines when it is valid:
+#   binding は有効です
+#   （運用手順）: この binding が実際に該当ハンドルのアカウントから投稿されていることを確認してください
+# or
+#   binding は無効です
+# check_verify_binding verifies that a saved report is internally
+# consistent. The first line is one of the two fixed verdict words; the
+# second (operational) line is only ever present with the valid verdict.
+# Explicitly out of scope: whether the verdict is right (that's
+# verify_binding_cert's territory — signature/platform/handle content),
+# platform/handle match truth (the mismatch warnings go to stderr, so a
+# saved stdout report never shows them), the compromise-warning presence
+# (§16's key_compromise_warnings — stderr as well), stderr in general,
+# and the exit code (invisible in saved stdout). Use this to prove a
+# second implementation's `verify_binding` CLI prints a compatible
+# report.
+
+_VB_VALID = 'binding は有効です'
+_VB_INVALID = 'binding は無効です'
+_VB_NOTE = ('（運用手順）: この binding が実際に該当ハンドルの'
+            'アカウントから投稿されていることを確認してください')
+
+
+def conform_verify_binding_report(text: str):
+    """Verify a saved `nakama.py verify_binding` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) not in (1, 2):
+        return False, [f'report must be one or two lines, '
+                       f'got {len(lines)}'], info
+    verdict = lines[0]
+    if verdict == _VB_VALID:
+        info.append('verdict: valid')
+    elif verdict == _VB_INVALID:
+        info.append('verdict: invalid')
+    else:
+        return False, ['line 1: not a verify_binding verdict line '
+                       '(`binding は有効です` / `binding は無効です`)'], info
+    if len(lines) == 2:
+        if verdict != _VB_VALID:
+            return False, ['line 2: operational note only allowed '
+                           'with a valid verdict'], info
+        if lines[1] != _VB_NOTE:
+            return False, ['line 2: not the fixed operational note '
+                           '(`（運用手順）: この binding が実際に該当ハンドルの'
+                           'アカウントから投稿されていることを確認してください`)'], info
+        info.append('operational note present')
+    return True, errs, info
+
+
+def check_verify_binding_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_verify_binding_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 def _key() -> tuple[bytes, str]:
     s = secrets.token_bytes(32)
     return s, nakama.npub_of(s)
@@ -8070,6 +8173,111 @@ def selftest() -> int:
     print(f'--- liveness-report {lr_total - lr_fails}/{lr_total} passed ---')
     fails += lr_fails
 
+    vb_fails = 0
+
+    def _vb_run(tmpd, binding_dict, platform=None, handle=None,
+                registry=None):
+        bfp = os.path.join(tmpd, 'binding.json')
+        with open(bfp, 'w') as f:
+            json.dump(binding_dict, f, ensure_ascii=False)
+        buf = io.StringIO()
+        code = 0
+        args = SimpleNamespace(binding=bfp, platform=platform,
+                               handle=handle,
+                               compromise_registry=registry or '')
+        with contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                nakama.cmd_verify_binding(args)
+            except SystemExit as e:
+                code = e.code
+        return buf.getvalue(), code
+
+    vb_e2e = []
+    with tempfile.TemporaryDirectory() as tmpd:
+        _vbs, _vbnp = _key()
+        _vb_time = 1759280000
+        _msg = nakama.binding_message('moltbook', 'alex', _vbnp, _vb_time)
+        _binding = {'protocol': 'nakama', 'version': 1,
+                    'type': 'platform-binding',
+                    'platform': 'moltbook', 'handle': 'alex',
+                    'npub': _vbnp, 'created_at': _vb_time,
+                    'sig': nakama.sign_schnorr(_vbs, _msg).hex()}
+        _valid = (_VB_VALID + '\n' + _VB_NOTE + '\n')
+        _invalid = (_VB_INVALID + '\n')
+        _tampered = dict(_binding, handle='someone_else')
+        for name, kw, exp_text, exp_code, exp_ok in (
+                ('valid minimal', {'binding_dict': _binding},
+                 _valid, 0, True),
+                ('valid with platform/handle match',
+                 {'binding_dict': _binding, 'platform': 'moltbook',
+                  'handle': 'alex'}, _valid, 0, True),
+                ('tampered handle (invalid)',
+                 {'binding_dict': _tampered}, _invalid, 1, True),
+                ('platform mismatch (stderr warn, invalid)',
+                 {'binding_dict': _binding, 'platform': 'the-colony'},
+                 _invalid, 1, True),
+                ('handle mismatch (stderr warn, invalid)',
+                 {'binding_dict': _binding, 'handle': 'not_alex'},
+                 _invalid, 1, True)):
+            text, code = _vb_run(tmpd, **kw)
+            ok, errs, info = conform_verify_binding_report(text)
+            good = (ok == exp_ok) and text == exp_text and code == exp_code
+            print(f'check_verify_binding e2e {name}: '
+                  f'{"PASS" if good else "FAIL"}')
+            for e in errs:
+                if exp_ok:
+                    print(f'    - {e}')
+            if not good and exp_ok and not errs:
+                print(f'    - stdout/exit mismatch: {text!r} '
+                      f'(exit {code}), expected {exp_text!r} '
+                      f'(exit {exp_code})')
+            vb_fails += 0 if good else 1
+            vb_e2e.append(name)
+
+    vb_pos = [
+        ('valid minimal', _VB_VALID + '\n' + _VB_NOTE + '\n'),
+        ('invalid minimal', _VB_INVALID + '\n'),
+        ('trailing blank lines', _VB_VALID + '\n' + _VB_NOTE + '\n\n'),
+        ('no trailing newline', _VB_INVALID),
+    ]
+    vb_neg = [
+        ('empty text', ''),
+        ('two reports concatenated',
+         _VB_VALID + '\n' + _VB_NOTE + '\n' + _VB_INVALID + '\n'),
+        ('three lines', _VB_VALID + '\n' + _VB_NOTE + '\nゴミ行\n'),
+        ('operational note on invalid verdict',
+         _VB_INVALID + '\n' + _VB_NOTE + '\n'),
+        ('note truncated',
+         _VB_VALID + '\n（運用手順）: この binding が投稿されています\n'),
+        ('note with extra suffix',
+         _VB_VALID + '\n' + _VB_NOTE + '（追記）\n'),
+        ('unknown verdict', 'binding は確認中です\n'),
+        ('verdict with extra suffix', _VB_VALID + '（要確認）\n'),
+        ('verdict lowercase latin', 'binding is valid\n'),
+        ('leading blank line', '\n' + _VB_INVALID + '\n'),
+        ('note before verdict', _VB_NOTE + '\n' + _VB_VALID + '\n'),
+    ]
+    for name, rep in vb_pos:
+        ok, errs, info = conform_verify_binding_report(rep)
+        good = ok
+        print(f'check_verify_binding pos {name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        vb_fails += 0 if good else 1
+    for name, rep in vb_neg:
+        ok, _errs, _info = conform_verify_binding_report(rep)
+        good = not ok
+        print(f'check_verify_binding neg {name}: '
+              f'{"PASS" if good else "FAIL"}')
+        if not good:
+            print(f'    - report wrongly accepted')
+        vb_fails += 0 if good else 1
+    vb_total = len(vb_e2e) + len(vb_pos) + len(vb_neg)
+    print(f'--- verify-binding {vb_total - vb_fails}/{vb_total} passed ---')
+    fails += vb_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -8079,7 +8287,7 @@ def selftest() -> int:
         + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total \
         + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total \
         + bfa_total + pub_total + gov_total + rf_total + rtf_total \
-        + cf_total + lv_total + lr_total
+        + cf_total + lv_total + lr_total + vb_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -8308,6 +8516,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_liveness_report_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_verify_binding':
+        if len(argv) < 3:
+            print('usage: conformance.py check_verify_binding '
+                  '<report.txt> [...]')
+            return 2
+        return check_verify_binding_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -8342,6 +8556,7 @@ def main(argv: list[str]) -> int:
           'check_compromise_fetch <report.txt> [...] | '
           'check_liveness_verify <report.txt> [...] | '
           'check_liveness_report <report.txt> [...] | '
+          'check_verify_binding <report.txt> [...] | '
           'selftest')
     return 2
 
