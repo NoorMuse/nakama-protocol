@@ -751,6 +751,33 @@ nakama.py's own `cmd_verify_rotation` (offline: real key pairs, real
 Schnorr-signed rotation certs in temp files — valid, and a
 tampered-new_npub invalid case with exact stdout+exit match).
 
+Board-policy creation report conformance:
+
+    python3 conformance.py check_board_policy <report1.txt> [...]
+
+Verifies a saved `nakama.py board_policy` stdout report is internally
+consistent (spec §9.4.1): exactly two lines — the creation line
+`board-policy 案: <out> — あなたの署名 1/<n>（初回は全員 <n>/<n> の署名が必要）`
+(the three <n> are all len(eligible): the reference CLI enforces
+eligible non-empty, so n >= 1; the report's one internal arithmetic rule
+is n1 == n2 == n3) followed by the fixed operational note line.
+With `--markdown`, an empty line + the fixed marker
+`投稿用ブロック（コメント欄に貼る）:` + the 4-line fenced block
+(`<!-- nakama-board-policy:v1 -->`, ` ```nakama-board-policy `,
+non-empty base64url payload, ` ``` `). Trailing blank lines tolerated;
+a leading blank line is rejected. Explicitly out of scope: the
+eligible/threshold truth (the policy file's territory — `check_policy`),
+the out file's existence/content, stderr, and the exit code (invisible
+in saved stdout text). The `board_policy_sign` report and the
+`verify_board_policy` verdict lines are different grammars — the three
+checkers reject each other's reports. Use this to prove a second
+implementation's `board_policy` CLI prints a compatible report.
+
+`python3 conformance.py selftest` also covers
+`check_board_policy` with reports produced in-process by
+nakama.py's own `cmd_board_policy` (offline: real key pair, temp
+keyfile, 3 eligible npubs — plain, and the --markdown variant).
+
 Board-read report conformance:
 
     python3 conformance.py check_board_read <report1.txt> [...]
@@ -3916,6 +3943,128 @@ def check_verify_rotation_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_verify_rotation_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_board_policy: board_policy creation-report consistency ----------
+
+# A saved `nakama.py board_policy` stdout report. Its grammar is fixed
+# (spec §9.4.1). check_board_policy verifies that the report is internally
+# consistent. Exactly two lines:
+#   line 1: board-policy 案: <out> — あなたの署名 1/<n>（初回は全員 <n>/<n> の署名が必要）
+#   line 2: 運用: このファイルを eligible 全員に回覧し、`board_policy_sign` で署名を集めてください。
+# The three <n> are all len(eligible) (the reference CLI enforces
+# eligible non-empty and threshold 1..len(eligible), so n >= 1); the
+# report's one internal arithmetic rule is n1 == n2 == n3.
+# With `--markdown` the reference CLI appends an empty line, the fixed
+# marker line `投稿用ブロック（コメント欄に貼る）:`, and the 4-line fenced
+# block produced by `markdown_block`:
+#   <!-- nakama-board-policy:v1 -->
+#   ```nakama-board-policy
+#   <base64url JSON, non-empty>
+#   ```
+# (the payload line is checked for non-empty base64url shape only — its
+# content is the policy file's territory: `check_policy`). Trailing blank
+# lines tolerated; a leading blank line is rejected. Explicitly out of
+# scope: the eligible/threshold truth (the policy file's territory:
+# `check_policy`), whether the signer is in eligible (stderr advisory),
+# the out file's existence/content, stderr, and the exit code (invisible
+# in saved stdout text). The `board_policy_sign` report
+# (`board-policy: <out> — 署名 <m>/<n>（...）`) and the
+# `verify_board_policy` verdict lines (`board-policy は有効です: ...` /
+# `board-policy は無効です: ...`) are different grammars — the three
+# checkers reject each other's reports. Use this to prove a second
+# implementation's `board_policy` CLI prints a compatible report.
+
+_RE_BPL_LINE1 = re.compile(
+    r'^board-policy 案: (.+) — あなたの署名 1/(\d+)（初回は全員 (\d+)/(\d+) の署名が必要）$')
+_BPL_LINE2 = '運用: このファイルを eligible 全員に回覧し、`board_policy_sign` で署名を集めてください。'
+_BPL_MD_HEADER = '投稿用ブロック（コメント欄に貼る）:'
+_BPL_MD_MARKER = '<!-- nakama-board-policy:v1 -->'
+_BPL_MD_FENCE = '```nakama-board-policy'
+_BPL_MD_CLOSE = '```'
+_RE_BPL_B64U = re.compile(r'^[A-Za-z0-9_-]+={0,2}$')
+
+
+def conform_board_policy_report(text: str):
+    """Verify a saved `nakama.py board_policy` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    m = _RE_BPL_LINE1.match(lines[0])
+    if not m:
+        return False, ['line 1: not a board_policy creation line '
+                       '(`board-policy 案: <out> — あなたの署名 1/<n>'
+                       '（初回は全員 <n>/<n> の署名が必要）`)'], info
+    out, n1, n2, n3 = m.group(1), int(m.group(2)), int(m.group(3)), \
+        int(m.group(4))
+    if out.strip() != out:
+        return False, ['line 1: <out> has leading/trailing whitespace'], info
+    if not (n1 >= 1 and n1 == n2 == n3):
+        return False, [f'line 1: inconsistent eligible counts '
+                       f'(1/{n1}, 全員 {n2}/{n3} — all three must be equal '
+                       f'and >= 1)'], info
+    info.append(f'creation report: out={out} eligible={n1}')
+    if len(lines) < 2:
+        return False, ['line 2: missing the operational note'], info
+    if lines[1] != _BPL_LINE2:
+        return False, ['line 2: not the fixed operational note'], info
+    if len(lines) == 2:
+        info.append('no markdown block')
+        return (not errs), errs, info
+    # --markdown variant: empty line + marker line + 4-line fenced block
+    rest = lines[2:]
+    if len(rest) != 6:
+        return False, [f'markdown section must be 6 lines '
+                       f'(empty + marker + 4 fenced lines), '
+                       f'found {len(rest)}'], info
+    if rest[0] != '':
+        return False, ['markdown section: line 3 must be empty'], info
+    if rest[1] != _BPL_MD_HEADER:
+        return False, ['markdown section: not the fixed header line '
+                       '(`投稿用ブロック（コメント欄に貼る）:`)' ], info
+    if rest[2] != _BPL_MD_MARKER:
+        return False, ['markdown section: not the fixed marker line '
+                       f'(`{_BPL_MD_MARKER}`)'], info
+    if rest[3] != _BPL_MD_FENCE:
+        return False, ['markdown section: not the fixed fence-open line '
+                       f'(`{_BPL_MD_FENCE}`)'], info
+    if not _RE_BPL_B64U.match(rest[4]):
+        return False, ['markdown section: payload line is not non-empty '
+                       'base64url'], info
+    if rest[5] != _BPL_MD_CLOSE:
+        return False, ['markdown section: not the fence-close line '
+                       '(` ``` `)'], info
+    info.append('markdown block present')
+    return (not errs), errs, info
+
+
+def check_board_policy_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_board_policy_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -7619,6 +7768,165 @@ def selftest() -> int:
           f'passed ---')
     fails += vrt_fails
 
+    # ---------- check_board_policy: board_policy creation-report consistency
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_board_policy (offline: real key pair, temp keyfile, 3 eligible
+    # npubs — plain, and the --markdown variant which is conform-checked
+    # only since the payload embeds the current timestamp); hand-mutated
+    # reports that break the two-line grammar (or the markdown section)
+    # must be rejected, as must the sibling board-policy reports
+    # (board_policy_sign, verify_board_policy).
+    bpl_fails = 0
+    _bpl_s, _bpl_np = _key()
+    _bpl_ns = [nakama.npub_of(_key()[0]) for _ in range(2)]
+    _bpl_eligible = [_bpl_np] + _bpl_ns
+
+    def _bpl_run(markdown=False, out_name='board-policy.json'):
+        with tempfile.TemporaryDirectory() as td:
+            kf = os.path.join(td, 'key.json')
+            with open(kf, 'w') as f:
+                json.dump({'secret_hex': _bpl_s.hex()}, f)
+            op = os.path.join(td, out_name)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                nakama.cmd_board_policy(SimpleNamespace(
+                    board_id='nakama-bpl', relay='wss://example.invalid',
+                    threshold=2, eligible=_bpl_eligible, out=op,
+                    keyfile=kf, markdown=markdown))
+            return buf.getvalue(), op
+
+    _bpl_note = ('運用: このファイルを eligible 全員に回覧し、'
+                 '`board_policy_sign` で署名を集めてください。')
+    _bpl_e2e = []
+    _rep, _op = _bpl_run(markdown=False)
+    _bpl_l1 = (f'board-policy 案: {_op} — あなたの署名 1/3'
+               '（初回は全員 3/3 の署名が必要）')
+    _bpl_e2e.append(('plain', _rep, f'{_bpl_l1}\n{_bpl_note}\n'))
+    _rep_md, _op_md = _bpl_run(markdown=True, out_name='policy2.json')
+    for name, rep, want_rep in _bpl_e2e:
+        exact = (rep == want_rep)
+        ok, errs, info = conform_board_policy_report(rep)
+        good = exact and ok
+        print(f'board-policy-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        if not good:
+            if not exact:
+                print(f'    - stdout mismatch: {rep!r}')
+            for e in errs:
+                print(f'    - {e}')
+            bpl_fails += 1
+    # the --markdown variant: conform-check only (payload embeds time.time())
+    _md_lines = _rep_md.splitlines()
+    _md_ok = (len(_md_lines) == 8 and _md_lines[0] == _bpl_l1.replace(
+        _op, _op_md) and _md_lines[1] == _bpl_note and _md_lines[2] == ''
+        and _md_lines[3] == '投稿用ブロック（コメント欄に貼る）:'
+        and _md_lines[4] == '<!-- nakama-board-policy:v1 -->'
+        and _md_lines[5] == '```nakama-board-policy'
+        and _md_lines[7] == '```')
+    ok, errs, info = conform_board_policy_report(_rep_md)
+    good = _md_ok and ok
+    print(f'board-policy-e2e/markdown: '
+          f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+    if not good:
+        if not _md_ok:
+            print(f'    - stdout shape mismatch: {_rep_md!r}')
+        for e in errs:
+            print(f'    - {e}')
+        bpl_fails += 1
+
+    # hand-crafted positives
+    bpl_pos = [
+        ('plain', f'{_bpl_l1}\n{_bpl_note}\n'),
+        ('no trailing newline', f'{_bpl_l1}\n{_bpl_note}'),
+        ('trailing blanks', f'{_bpl_l1}\n{_bpl_note}\n\n\n'),
+        ('markdown variant', f'{_bpl_l1}\n{_bpl_note}\n\n'
+         '投稿用ブロック（コメント欄に貼る）:\n'
+         '<!-- nakama-board-policy:v1 -->\n'
+         '```nakama-board-policy\n'
+         'eyJ0eXBlIjoiYm9hcmQtcG9saWN5In0\n'
+         '```\n'),
+    ]
+    for name, rep in bpl_pos:
+        ok, errs, info = conform_board_policy_report(rep)
+        print(f'board-policy/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        bpl_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    bpl_neg = []
+    bpl_neg.append(('empty report', ''))
+    bpl_neg.append(('garbage line', 'hello\n'))
+    bpl_neg.append(('line 1 only', f'{_bpl_l1}\n'))
+    bpl_neg.append(('mismatched eligible counts',
+                    'board-policy 案: x.json — あなたの署名 1/3'
+                    '（初回は全員 2/2 の署名が必要）\n' + _bpl_note + '\n'))
+    bpl_neg.append(('zero eligible',
+                    'board-policy 案: x.json — あなたの署名 1/0'
+                    '（初回は全員 0/0 の署名が必要）\n' + _bpl_note + '\n'))
+    bpl_neg.append(('wrong numerator (not 1)',
+                    'board-policy 案: x.json — あなたの署名 2/3'
+                    '（初回は全員 3/3 の署名が必要）\n' + _bpl_note + '\n'))
+    bpl_neg.append(('out empty',
+                    'board-policy 案:  — あなたの署名 1/3'
+                    '（初回は全員 3/3 の署名が必要）\n' + _bpl_note + '\n'))
+    bpl_neg.append(('line 2 altered', f'{_bpl_l1}\n運用: 回覧してね\n'))
+    bpl_neg.append(('line 2 missing colon', f'{_bpl_l1}\n'))
+    bpl_neg.append(('board_policy_sign report (different grammar)',
+                    'board-policy: policy.json — 署名 3/3'
+                    '（発効条件（全員署名）を満たしています）\n'))
+    bpl_neg.append(('verify_board_policy valid (different grammar)',
+                    'board-policy は有効です: eligible 3 名全員の署名を確認'
+                    '（threshold 2）\n'))
+    bpl_neg.append(('verify_board_policy invalid (different grammar)',
+                    'board-policy は無効です: 全員の有効署名が揃っていないか、'
+                    '形式が不正です\n'))
+    bpl_neg.append(('markdown missing blank line',
+                    f'{_bpl_l1}\n{_bpl_note}\n'
+                    '投稿用ブロック（コメント欄に貼る）:\n'
+                    '<!-- nakama-board-policy:v1 -->\n'
+                    '```nakama-board-policy\n'
+                    'eyJ0eXBlIjoiYm9hcmQtcG9saWN5In0\n```\n'))
+    bpl_neg.append(('markdown wrong fence kind',
+                    f'{_bpl_l1}\n{_bpl_note}\n\n'
+                    '投稿用ブロック（コメント欄に貼る）:\n'
+                    '<!-- nakama-board-policy:v1 -->\n'
+                    '```nakama-board-decision\n'
+                    'eyJ0eXBlIjoiYm9hcmQtcG9saWN5In0\n```\n'))
+    bpl_neg.append(('markdown payload not base64url',
+                    f'{_bpl_l1}\n{_bpl_note}\n\n'
+                    '投稿用ブロック（コメント欄に貼る）:\n'
+                    '<!-- nakama-board-policy:v1 -->\n'
+                    '```nakama-board-policy\n'
+                    'not base64 at all!!!\n```\n'))
+    bpl_neg.append(('markdown truncated (no fence close)',
+                    f'{_bpl_l1}\n{_bpl_note}\n\n'
+                    '投稿用ブロック（コメント欄に貼る）:\n'
+                    '<!-- nakama-board-policy:v1 -->\n'
+                    '```nakama-board-policy\n'
+                    'eyJ0eXBlIjoiYm9hcmQtcG9saWN5In0\n'))
+    bpl_neg.append(('extra line after markdown block',
+                    f'{_bpl_l1}\n{_bpl_note}\n\n'
+                    '投稿用ブロック（コメント欄に貼る）:\n'
+                    '<!-- nakama-board-policy:v1 -->\n'
+                    '```nakama-board-policy\n'
+                    'eyJ0eXBlIjoiYm9hcmQtcG9saWN5In0\n```\nゴミ行\n'))
+    bpl_neg.append(('leading blank line', f'\n{_bpl_l1}\n{_bpl_note}\n'))
+    for name, rep in bpl_neg:
+        ok, _errs, _info = conform_board_policy_report(rep)
+        good = not ok
+        print(f'board-policy-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            bpl_fails += 1
+
+    bpl_total = len(_bpl_e2e) + 1 + len(bpl_pos) + len(bpl_neg)
+    print(f'--- board-policy {bpl_total - bpl_fails}/{bpl_total} '
+          f'passed ---')
+    fails += bpl_fails
+
     # ---------- check_board_read: board_read report consistency ----------
     # Reference reports are produced in-process with nakama.py's own
     # cmd_board_read, with nostr_request monkeypatched to return crafted
@@ -10925,7 +11233,7 @@ def selftest() -> int:
         + bfa_total + pub_total + gov_total + rf_total + rtf_total \
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
         + bj_total + bs_total + bc_total + vbd_total + bvr_total \
-        + bdc_total + bcs_total + dmr_total + vrt_total
+        + bdc_total + bcs_total + dmr_total + vrt_total + bpl_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -11225,6 +11533,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_verify_rotation_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_board_policy':
+        if len(argv) < 3:
+            print('usage: conformance.py check_board_policy '
+                  '<report.txt> [...]')
+            return 2
+        return check_board_policy_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -11271,6 +11585,7 @@ def main(argv: list[str]) -> int:
           'check_board_cosign <report.txt> [...] | '
           'check_dm_recv <report.txt> [...] | '
           'check_verify_rotation <report.txt> [...] | '
+          'check_board_policy <report.txt> [...] | '
           'selftest')
     return 2
 

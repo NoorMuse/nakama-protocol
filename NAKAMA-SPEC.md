@@ -395,6 +395,7 @@ Nostr への publish 系コマンド（`rotate_pub` §17・`revoke_pub` §12・`
 - **v0.62**（完了）: conformance チェッカー第 40 弾 `check_board_cosign`（ローカル出力チェッカー第 25 弾）。`conformance.py` に board_cosign レポート（§9.8）の一貫性チェッカーを追加: `check_board_cosign <report1.txt> [...]`（`nakama.py board_cosign` の stdout 保存テキストの検証: ちょうど 1 行で、固定接頭辞 `board-decision:`＋非空の `<out>`＋`承認署名 <n> つ`（`<n>` は 0 以上の整数、成功パスでは必ず 1 以上 — `0 つ` は自己矛盾として却下。§9.6 の有効判定 `n ≥ t` 規則と同型）。検証項目: 固定接頭辞 `board-decision:`（`board_decide` の作成確認行 `board-decision 案:`（§9.7）・`verify_board_decision` の検証結果行（§9.6）とは別文法 — 3 つの checker は相互に拒否）。対象外を明示 — payload の妥当性（`validate_decision_payload` の管轄）、承認署名の有効性（`verify_board_decision` の管轄）、`<out>` ファイルの実在と内容（`check_decision` の管轄）、stderr（重複承認の注意書き・改ざん警告）、exit コード。§9.8 に board_cosign レポートの表示文法を固定、§9.7 の「将来のチェッカー候補」の言及を更新。selftest 22/22（新規: 実 CLI の in-process E2E 3（`cmd_board_decide` で実 Schnorr 署名の admit 草案を作成→別 keyfile で cosign（2 つ、exit 0、stdout 完全一致）・同一鍵で再 cosign（重複警告は stderr、stdout は 2 つで変わらず、exit 0）・第 3 の鍵で `--out` 別ファイル（3 つ、exit 0、stdout 完全一致））＋正常 craft 6（2 つ・1 つ・改行なし・末尾空行・空白入り out パス・大件数 100）＋却下 13: 空テキスト・2 レポート連結・`board_decide` 作成確認行・`verify_board_decision` 有効行・無効行・承認署名 0（自己矛盾）・件数非数値・out 空・接頭辞コロン欠落・`—` 欠落・`つ` 欠落・先頭ゴミ・末尾ゴミ）、selftest 総計 756/756 PASS、全 21 テストファイル回帰 PASS。
 - **v0.63**（完了）: conformance チェッカー第 41 弾 `check_dm_recv`（ローカル出力チェッカー第 26 弾）。`conformance.py` に dm_recv レポート（§4.1.1）の一貫性チェッカーを追加: `check_dm_recv <report1.txt> [...]`（`nakama.py dm_recv` の stdout 保存テキストの検証: 成功時は第 1 行が送信者行 `from <16 hex>...:`＋第 2 行以降が復号済み rumor 本文（1 行以上、複数行・空行可。参照実装は `print` を 2 回呼ぶため空コンテンツ rumor は送信者行＋空行になる — 空コンテンツは許容し情報注記を残す）、復号失敗時は単一行 `DM の復号に失敗しました: <理由>`（理由は非空自由テキスト）。検証項目: 送信者 prefix は 16 hex（大文字可）・失敗形はレポート全体がちょうど 1 行の場合のみ有効（失敗行＋追記行・失敗行＋送信者行は却下）。本文行が失敗行の文面と一致しても本文として許容（参照実装は rumor をそのまま表示するため）。対象外を明示 — rumor 本文・送信者 pubkey の真偽（`check_dm` の管轄）、失敗理由の真偽（復号例外の主張）、stderr、exit コード。`dm_fetch` の `--- [日時] from <16 hex>...` ブロック形（§4.1）とは別文法 — 両 checker は相互に拒否。§4.1.1 に dm_recv レポートの表示文法を固定。selftest 23/23（新規: 実 CLI の in-process E2E 3（in-process で実鍵ペア＋NIP-44 seal/gift wrap — 正常（stdout＋exit 0 完全一致）・複数行空行あり本文（stdout＋exit 0 完全一致）・署名改ざんの失敗（`DM の復号に失敗しました: gift wrap の署名が無効です`、exit 1、stdout 完全一致））＋正常 craft 8（1 行本文・複数行空行あり・大文字 hex 送信者・失敗行・改行なし・末尾空行・空コンテンツ・失敗行文面の本文行）＋却下 12: 空テキスト・先頭ゴミ・送信者非 hex・送信者短・省略記号欠落・コロン欠落・失敗行の理由空・失敗行＋追記行・失敗行＋送信者行・2 失敗行連結・dm_fetch ヘッダ行・先頭空行）、selftest 総計 779/779 PASS、全 21 テストファイル回帰 PASS。
 - **v0.64**（完了）: conformance チェッカー第 42 弾 `check_verify_rotation`（ローカル出力チェッカー第 27 弾）。`conformance.py` に verify_rotation レポート（§5.5.3）の一貫性チェッカーを追加: `check_verify_rotation <report1.txt> [...]`（`nakama.py verify_rotation` の stdout 保存テキストの検証: ちょうど 1 行で、有効形 `rotation は有効です: <old16>... → <new16>...`（old/new npub の先頭 16 文字 — bech32 のため 16 非空白文字のみ検証、check_rotate_fetch の revoker prefix と同じ扱い）または無効形 `rotation は無効です`。`...` 省略記号と `→` 矢印はリテラル）。検証項目: 単一行形状（2 行連結は却下）・省略記号の有無・矢印の有無・prefix 16 文字（短・空白混じりは却下）・無効行に接尾辞が付いたら却下。`rotate` の発行レポート（`rotation 証明書: <out>` 行＋同じ矢印行＋注意書き）は別文法 — 両 checker は相互に拒否。対象外を明示 — 判定の真偽（`check_rotation` / `verify_rotation_cert` の管轄）、npub の真偽、stderr、exit コード。§5.5.3 に verify_rotation レポートの表示文法を固定。selftest 19/19（新規: 実 CLI の in-process E2E 2（実鍵ペア＋実 Schnorr 署名の rotation 証明書 — 有効（stdout＋exit 0 完全一致）・new_npub 改ざんの無効（`rotation は無効です`、exit 1、stdout 完全一致））＋正常 craft 4（有効行・無効行・改行なし・末尾空行）＋却下 13: 空テキスト・ゴミ行・2 行連結・省略記号欠落・矢印欠落・old prefix 短・new prefix 短・prefix 内空白・無効行＋接尾辞・無効行＋追記行・rotate 発行レポート・単独の矢印行・先頭空行）、selftest 総計 798/798 PASS、全 21 テストファイル回帰 PASS。次候補: ローカル出力チェッカーの継続（残りのレポート文法 — `rotate_fetch --out` 以外の保存行など）。
+- **v0.65**（完了）: conformance チェッカー第 43 弾 `check_board_policy`（ローカル出力チェッカー第 28 弾）。`conformance.py` に board_policy 作成レポート（§9.4.1）の一貫性チェッカーを追加: `check_board_policy <report1.txt> [...]`（`nakama.py board_policy` の stdout 保存テキストの検証: ちょうど 2 行で、第 1 行は作成確認行 `board-policy 案: <out> — あなたの署名 1/<n>（初回は全員 <n>/<n> の署名が必要）`、第 2 行は運用手順行の固定文。`--markdown` 指定時は空行＋固定見出し行 `投稿用ブロック（コメント欄に貼る）:`＋4 行の fenced ブロック（`<!-- nakama-board-policy:v1 -->`・` ```nakama-board-policy `・非空 base64url ペイロード行（`=` パディング可）・` ``` `）が続く）。検証項目: `<out>` 非空（前後空白なし）・3 つの数値がすべて等しく `>= 1`（内部算術ルール: 作成コマンドは発起人署名をちょうど 1 つ付け、参照実装は eligible 空・threshold 範囲外を拒否）・運用手順行は一字一句一致・markdown 部は空行＋見出し＋fence 4 行の固定形状・ペイロード行は非空 base64url。末尾の空行は許容、先頭の空行は却下。`board_policy_sign` のレポート（`board-policy: <out> — 署名 <m>/<n>（...）`、1 行）・`verify_board_policy` の検証結果行（`board-policy は有効です: ...` / `board-policy は無効です: ...`、1 行）とは別文法 — 3 つの checker は相互に拒否。対象外を明示 — eligible / threshold の真偽（政策ファイルの管轄: `check_policy`）、`<out>` ファイルの実在と内容、stderr、exit コード。§9.4.1 に board_policy レポートの表示文法を固定。selftest 24/24（新規: 実 CLI の in-process E2E 2（実鍵ペア＋temp keyfile＋eligible 3 npub — 素のレポート（stdout 完全一致）・`--markdown` 変種（形状＋conform 検証 — ペイロードは時刻を含むため exact 一致は不可））＋正常 craft 4（素・改行なし・末尾空行・markdown 変種）＋却下 18: 空テキスト・ゴミ行・第 1 行のみ・件数不一致・eligible 0・分子 2・out 空・手順行改変・手順行欠落・`board_policy_sign` レポート・`verify_board_policy` 有効行・無効行・markdown 空行欠落・fence 種別違い・ペイロード非 base64url・fence 閉じ欠落・markdown 後の追記行・先頭空行）、selftest 総計 822/822 PASS、全 21 テストファイル回帰 PASS。次候補: ローカル出力チェッカーの継続（`board_policy_sign` / `verify_board_policy` レポートなどの残り文法）。
 
 
 ---
@@ -629,6 +630,24 @@ checker の対象外: hash の真偽（bond ファイルの管轄）、日付・
 - `admit` 決定が成立しても kind 9000 の publish 自体は moderator の鍵で行う — 決定証明書と Nostr 管理イベントの紐付けは運用（決定成立後に publish）で担保する。
 
 ---
+
+### 9.4.1 board_policy レポートの表示文法の固定（v0.65 — `check_board_policy` の検証対象）
+
+`nakama.py board_policy` の stdout レポートは次の 2 行に固定される:
+
+```
+board-policy 案: <out> — あなたの署名 1/<n>（初回は全員 <n>/<n> の署名が必要）
+運用: このファイルを eligible 全員に回覧し、`board_policy_sign` で署名を集めてください。
+```
+
+- 第 1 行: `<out>` は非空の任意テキスト（`--out`、既定 `board-policy.json`）。3 つの `<n>` はいずれも `len(eligible)` — 参照実装は eligible 空・`threshold` 範囲外を拒否するため `n >= 1`。第 1 行の内部算術ルールは 1 つだけ: 3 つの数値がすべて等しいこと（`1/<n1>` の分子は固定リテラル `1` — 作成コマンドは発起人の署名をちょうど 1 つ付ける）。
+- 第 2 行: 一字一句固定の運用手順行。
+- `--markdown` 指定時は、第 2 行の後に空行＋固定の見出し行 `投稿用ブロック（コメント欄に貼る）:`＋`markdown_block` の 4 行（`<!-- nakama-board-policy:v1 -->`、` ```nakama-board-policy `、非空の base64url ペイロード行（`=` パディング可）、` ``` `）が続く。ペイロード行は表示文法のみ検証し、内容（政策ファイルの管轄）は `check_policy` の対象。
+- 末尾の空行は許容、先頭の空行は却下。
+
+対象外を明示 — eligible / threshold の真偽（政策ファイルの管轄: `check_policy`）、`<out>` ファイルの実在と内容、発起人が eligible に含まれない場合の stderr 注意書き、exit コード。
+
+`board_policy_sign` のレポート（`board-policy: <out> — 署名 <m>/<n>（...）`、1 行）・`verify_board_policy` の検証結果行（`board-policy は有効です: ...` / `board-policy は無効です: ...`、1 行）とは別文法であり、3 つの checker は相互に拒否する。
 
 ### 9.5 governance レポートの表示文法の固定（v0.47 — `check_governance` の検証対象）
 
