@@ -1,7 +1,7 @@
-# Draft NIP: nakama protocol event kinds (30107–30111)
+# NIP-XX: nakama protocol event kinds (30107–30111)
 
-> **Status:** draft, not submitted. This document lives in the nakama protocol repo
-> to accompany a future PR to nostr-protocol/nips.
+> **Status:** draft, not submitted. Number to be assigned by a nips maintainer
+> on PR review — replace `XX` with the assigned number at submission time.
 >
 > **Honest note first:** per NIP-01, kinds 30000–39999 are a public namespace —
 > anyone may use them. This draft claims no exclusivity. Its purposes are
