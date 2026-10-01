@@ -29,3 +29,9 @@
 - conformance.py: board_decide_fetch レポート（§19）の一貫性チェッカー第 21 弾・ローカル出力チェッカー第 6 弾（`check_board_decide_fetch`）。空レポートの単一行または免責行→決定行（`[<32hex>] <種別> (created_at YYYY-MM-DD, approvals n つ[, threshold n/m 充足|不足])`）→フッター→保存行・スナップショット行の固定順。検証: 種別語彙・日付有効・フッターのマージ件数==決定行数・コア重複なし・threshold 句の全行均一・approvals==分子・n≤m・保存行件数一致。対象外: 件数の真偽・コアハッシュの真偽（check_decision 管轄）・充足/不足の意味（advisory）・時刻の値/順序・署名有効性（verify_board_decision_nostr_event 管轄）。§19 に board_decide_fetch の表示文法を固定。
 - selftest 24/24（新規: 実 CLI の in-process E2E 4（nostr_request を monkeypatch、空→空行・1 決定・3 イベント中 1 スキップ・policy＋out で免責行＋threshold 行＋保存行＋スナップショット行）＋正常 craft 6＋却下 14）、総計 290/290 PASS、全 21 テストファイル回帰 PASS。
 - 外部 push なし（remote HEAD=seen_refs=dc26a3d）。
+
+## 2026-10-02 03:47 JST — v0.44 check_board_draft_fetch
+- conformance.py: board_draft_fetch レポート（§21）の一貫性チェッカー第 22 弾・ローカル出力チェッカー第 7 弾（`check_board_draft_fetch`）。`[草案 <32hex>]` プレフィクス（30110 レポートの混入を拒否）＋任意の `[期限切れ]` 表示マーカー（§24.2 — checker は綴りのみ、真偽は draft_is_expired の管轄）＋免責行あり時の threshold 句（`草案: threshold n/m 不足|充足（成立可能 — board_decide_pub で成立公開）`＋policy-update のみ `（現行規約の判定） — 提案値: threshold pt/pe`、pt ≤ pe）。
+- selftest 28/28（新規: 実 CLI の in-process E2E 5（nostr_request を monkeypatch、空→空行・1 草案・3 イベント中 1 スキップ・期限切れマーカー・policy＋out＋policy-update 提案句）＋正常 craft 7＋却下 16: 決定 fetch 行の [草案] 欠落・非 policy-update 草案の提案句 など）、selftest 総計 318/318 PASS、全 21 テストファイル回帰 PASS。
+- §21.5 に board_draft_fetch の表示文法を固定（ローカル時刻・`[草案]` プレフィクス・提案句の付与条件）。
+- 外部 push なし（remote HEAD=seen_refs=d737219）。
