@@ -282,6 +282,30 @@ implementation's `board_join` CLI prints a compatible report.
 `check_board_join` with reports produced in-process by
 nakama.py's own `cmd_board_join` (with `nostr_publish` monkeypatched).
 
+Board send report conformance:
+
+    python3 conformance.py check_board_send <report1.txt> [...]
+
+Verifies a saved `nakama.py board_send` stdout report is internally
+consistent (spec §4.5): exactly one line —
+`投稿: 受理 (reason) id=<64 hex>` or
+`投稿: 拒否 (reason) id=<64 hex>`.
+Checks: the fixed `投稿:` prefix (not the `publish:` prefix of
+`check_pub` nor the `参加申請:` prefix of `check_board_join`), the
+two-word verdict vocabulary `受理`/`拒否`, a 64-char hex kind 9 event
+id (case-insensitive), and an arbitrary reason string (may contain
+parentheses — the checker reads up to the last `) id=` — and may be
+empty when the relay's OK carries no message); trailing blank lines
+tolerated. Explicitly out of scope: the relay's verdict truth
+(assertion model), the reason's truth, id/event match (event signature
+checks are the event checkers' territory), stderr, and the exit code
+(invisible in saved stdout). Use this to prove a second
+implementation's `board_send` CLI prints a compatible report.
+
+`python3 conformance.py selftest` also covers
+`check_board_send` with reports produced in-process by
+nakama.py's own `cmd_board_send` (with `nostr_publish` monkeypatched).
+
 Compromise declaration conformance:
 
     python3 conformance.py check_compromise <decl1.json> [...]
@@ -4637,6 +4661,83 @@ def check_board_join_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_board_send: board_send report consistency ----------
+
+# `nakama.py board_send <relay> <board_id> "MSG"` prints a single
+# publish-result line to stdout whose grammar is fixed (spec §4.5):
+#   投稿: 受理 (reason) id=<64 hex>      (exit 0)
+#   投稿: 拒否 (reason) id=<64 hex>      (exit 1)
+# `投稿:` is this command's fixed prefix — it is NOT the `publish:`
+# line checked by `check_pub` (v0.46, §4.3) nor the `参加申請:` line
+# checked by `check_board_join` (v0.56, §4.4); `check_board_send`
+# rejects both other prefixes (and both those checkers reject
+# `投稿:`-prefixed lines), so a saved report can only satisfy the
+# checker for the command that actually produced it.
+# check_board_send verifies that a saved report is internally consistent:
+# exactly one line, the fixed `投稿:` prefix, the two-word verdict
+# vocabulary `受理`/`拒否`, an arbitrary reason string taken verbatim from
+# the relay (may contain parentheses — the checker reads up to the LAST
+# `) id=`, and may be empty when the relay's OK carries no message), and
+# a 64-char hex kind 9 event id (case-insensitive, like `check_pub`).
+# Trailing blank lines are tolerated.
+# Explicitly out of scope: the relay's accept/reject truth (assertion
+# model — the reference implementation prints the relay's response
+# verbatim), the reason's truth, whether the id matches the published
+# event (event signature checks are the event checkers' territory),
+# stderr, and the exit code (invisible in saved stdout). Use this to prove
+# a second implementation's `board_send` CLI prints a compatible report.
+
+_RE_BS = re.compile(r'^投稿: (受理|拒否) \((.*)\) id=([0-9a-fA-F]{64})$')
+
+
+def conform_board_send_report(text: str):
+    """Verify a saved `nakama.py board_send` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) != 1:
+        return False, [f'report must be a single board_send result line, '
+                       f'found {len(lines)} lines'], info
+    m = _RE_BS.match(lines[0])
+    if not m:
+        return False, ['line 1: not a board_send result line '
+                       '(`投稿: 受理/拒否 (reason) id=<64 hex>`)'], info
+    verdict, reason, eid = m.group(1), m.group(2), m.group(3)
+    info.append(f'{verdict} id={eid[:16]}…')
+    if reason:
+        info.append(f'reason: {reason[:32]}')
+    else:
+        info.append('reason: (empty)')
+    return (not errs), errs, info
+
+
+def check_board_send_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_board_send_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 def _key() -> tuple[bytes, str]:
     s = secrets.token_bytes(32)
     return s, nakama.npub_of(s)
@@ -8971,6 +9072,127 @@ def selftest() -> int:
     print(f'--- board-join {bj_total - bj_fails}/{bj_total} passed ---')
     fails += bj_fails
 
+    # check_board_send: board_send report consistency (v0.57). E2E runs the
+    # real `nakama.py cmd_board_send` in-process with `nostr_publish`
+    # monkeypatched (accepted / rejected / a reason containing parens).
+    # A fresh empty compromise registry keeps the §14.2 stderr warnings
+    # out of the stdout report. The reported event id must equal the
+    # published kind 9 event's id, and the exit code must match the
+    # verdict.
+    bs_fails = 0
+    bs_e2e = []
+
+    def _bs_run(tmpd, accepted, reason):
+        captured = {}
+
+        def _fake_publish(url, event, timeout=15, auth_secret=None):
+            captured['event'] = event
+            return (accepted, reason)
+
+        real_publish = nakama.nostr_publish
+        nakama.nostr_publish = _fake_publish
+        try:
+            kpath = os.path.join(tmpd, 'key.txt')
+            nakama.save_key(kpath, secrets.token_bytes(32))
+            creg = os.path.join(tmpd, 'compromises')
+            os.makedirs(creg, exist_ok=True)
+            buf = io.StringIO()
+            args = _SimpleNamespace(keyfile=kpath,
+                                    relay='wss://relay.example',
+                                    board_id='nakama-x7q2',
+                                    message='hello board', auth=False,
+                                    descriptor=None,
+                                    compromise_registry=creg)
+            code = 0
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    nakama.cmd_board_send(args)
+                except SystemExit as e:
+                    code = e.code
+        finally:
+            nakama.nostr_publish = real_publish
+        return buf.getvalue(), captured.get('event'), code
+
+    with _tempfile.TemporaryDirectory() as tmpd:
+        for name, accepted, reason, exp_code in (
+                ('accepted', True, 'OK', 0),
+                ('rejected', False,
+                 'auth-required: chat posts are moderated', 1),
+                ('reason with parens', True, '承認 (auto)', 0)):
+            text, ev, code = _bs_run(tmpd, accepted, reason)
+            ok, errs, info = conform_board_send_report(text)
+            exp_verdict = '受理' if accepted else '拒否'
+            good = (ok and code == exp_code and ev is not None
+                    and ev['id'] in text
+                    and f'投稿: {exp_verdict}' in text
+                    and ev['kind'] == 9)
+            print(f'check_board_send e2e {name}: '
+                  f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+            for e in errs:
+                if ok:
+                    print(f'    - {e}')
+            if not good:
+                print(f'    - stdout was: {text!r}, exit: {code}')
+            bs_fails += 0 if good else 1
+            bs_e2e.append(name)
+
+    _bs_base = ('投稿: 受理 (OK) id=' + 'ab' * 32 + '\n')
+    _bs_rej = ('投稿: 拒否 (relay: not a member) id=' + 'cd' * 32 + '\n')
+    bs_pos = [
+        ('accepted', _bs_base),
+        ('rejected', _bs_rej),
+        ('empty reason', _bs_base.replace('(OK)', '()')),
+        ('reason with parens',
+         _bs_base.replace('(OK)', '(承認 (auto))')),
+        ('uppercase id', _bs_base.replace('ab' * 32, 'AB' * 32)),
+        ('japanese reason',
+         _bs_base.replace('(OK)', '(投稿は凍結中です)')),
+        ('no trailing newline', _bs_base.rstrip('\n')),
+        ('trailing blank lines', _bs_base + '\n\n'),
+    ]
+    bs_neg = [
+        ('empty text', ''),
+        ('two reports', _bs_base + _bs_rej),
+        ('wrong verdict vocab',
+         _bs_base.replace('受理', '承認')),
+        ('english verdict',
+         _bs_base.replace('受理', 'accepted')),
+        ('publish prefix (check_pub shape)',
+         _bs_base.replace('投稿:', 'publish:')),
+        ('board_join prefix',
+         _bs_base.replace('投稿:', '参加申請:')),
+        ('missing colon',
+         _bs_base.replace('投稿:', '投稿')),
+        ('missing space after colon',
+         _bs_base.replace('投稿: ', '投稿:')),
+        ('missing parens',
+         _bs_base.replace('(OK)', 'OK')),
+        ('short id', _bs_base.replace('ab' * 32, 'ab' * 31)),
+        ('long id', _bs_base.replace('ab' * 32, 'ab' * 33)),
+        ('non-hex id', _bs_base.replace('ab' * 32, 'zz' * 32)),
+        ('missing id part', '投稿: 受理 (OK)\n'),
+        ('leading garbage', 'log line\n' + _bs_base),
+    ]
+    for name, rep in bs_pos:
+        ok, errs, info = conform_board_send_report(rep)
+        good = ok
+        print(f'check_board_send pos {name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        bs_fails += 0 if good else 1
+    for name, rep in bs_neg:
+        ok, _errs, _info = conform_board_send_report(rep)
+        good = not ok
+        print(f'check_board_send neg {name}: {"PASS" if good else "FAIL"}')
+        if not good:
+            print(f'    - report wrongly accepted')
+        bs_fails += 0 if good else 1
+    bs_total = len(bs_e2e) + len(bs_pos) + len(bs_neg)
+    print(f'--- board-send {bs_total - bs_fails}/{bs_total} passed ---')
+    fails += bs_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -8981,7 +9203,7 @@ def selftest() -> int:
         + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total \
         + bfa_total + pub_total + gov_total + rf_total + rtf_total \
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
-        + bj_total
+        + bj_total + bs_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -9234,6 +9456,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_board_join_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_board_send':
+        if len(argv) < 3:
+            print('usage: conformance.py check_board_send '
+                  '<report.txt> [...]')
+            return 2
+        return check_board_send_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -9272,6 +9500,7 @@ def main(argv: list[str]) -> int:
           'check_verify_unbinding <report.txt> [...] | '
           'check_renew <report.txt> [...] | '
           'check_board_join <report.txt> [...] | '
+          'check_board_send <report.txt> [...] | '
           'selftest')
     return 2
 

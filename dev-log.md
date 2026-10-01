@@ -79,3 +79,7 @@
 - selftest 20/20（新規: 実 CLI の in-process E2E 5（in-process 署名の unbinding — 有効（stdout＋exit 0 完全一致）・platform/handle 一致指定の有効・handle 改ざんの無効（exit 1）・platform 不一致（stderr 警告＋無効、exit 1）・handle 不一致（stderr 警告＋無効、exit 1）、各 stdout＋exit コード完全一致確認）＋正常 craft 4（有効・無効・末尾空行・改行なし）＋却下 11: 空テキスト・2 レポート連結・3 行・無効時の運用手順行・運用手順行の切詰め・余計な接尾辞・未知の判定行・判定行の接尾辞・英語判定・先頭空行・運用手順行の先行）、selftest 総計 561/561 PASS、全 21 テストファイル回帰 PASS。
 - ロードマップ §7 に v0.54 を追加。spec §9.1.1 に verify_unbinding レポートの表示文法を固定。
 - 外部 push なし（run 開始時 remote HEAD=seen_refs=a3f14b1）。
+- 2026-10-02: v0.57 完了 — conformance チェッカー第 35 弾 `check_board_send`（ローカル出力チェッカー第 20 弾）。`nakama.py board_send` の stdout（§4.5 に表示文法を固定: ちょうど 1 行で、固定接頭辞 `投稿:`＋判定語彙 `受理`/`拒否`＋任意テキストの理由（括弧内に格納 — 理由内の括弧は最後の `) id=` までを理由として解釈、空可）＋`id=<64 hex>`（大文字可）、末尾の空行は許容）の内部整合性チェッカー。検証: 固定接頭辞・判定二語彙・id 64 hex（大文字可）。対象外を明示 — リレーの受理/拒否の真偽（主張モデル）、理由の真偽、id と公開イベントの一致（イベント署名検証はイベントチェッカーの管轄）、stderr、exit コード。§4.3（`publish:`）・§4.4（`参加申請:`）とは別文法を固定 — 相互拒否。
+- selftest 25/25（新規: 実 CLI の in-process E2E 3（`nostr_publish` を monkeypatch、空の compromise registry で §14.2 の stderr 警告を分離 — 受理（exit 0）・拒否（exit 1）・理由内括弧の受理、各 event id と kind 9 と exit コードの一致確認）＋正常 craft 8＋却下 14: 空テキスト・2 レポート連結・判定語彙外（承認）・英語判定・`publish:` 接頭辞・`参加申請:` 接頭辞・コロン欠落・コロン後空白欠落・括弧欠落・id 短・id 長・id 非 hex・id 部欠落・先頭ゴミ）、selftest 総計 636/636 PASS、全 21 テストファイル回帰 PASS。
+- ロードマップ §7 に v0.57 を追加。spec §4.5 に board_send レポートの表示文法を固定。§4.4 の末尾文を §4.5 参照に更新。
+- 外部 push なし（run 開始時 remote HEAD=seen_refs=f79ad52）。
