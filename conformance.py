@@ -122,6 +122,10 @@ signatures over the canonical board_decision_message, duplicate
 approvals collapsing, expiry reported as info not failure, and
 policy-update drafts judged against the CURRENT policy only —
 the proposed values are never used for judgment, spec §29.2).
+Passing `check_notif_ack` on your ack plaintext files proves
+notif-ack DM wire compatibility (the `[nakama] notif-ack`
+header/core/reason format, spec §28.3; authorship comes from
+the NIP-17 seal, so pair it with `check_dm` on the gift wrap).
 
 Platform-binding certificate conformance:
 
@@ -303,6 +307,27 @@ circulate wire-compatibly with the reference implementation.
 
 `python3 conformance.py selftest` also covers `check_draft`
 with reference drafts built by nakama.py's own primitives.
+
+Notif-ack conformance:
+
+    python3 conformance.py check_notif_ack <ack1.txt> [...]
+
+Verifies each file is a notification-acknowledgement DM plaintext —
+the decrypted kind-14 rumor content as written by
+`board_notif_ack` (spec §28.3): the exact header
+`[nakama] notif-ack`, a `core: <hex>` line (32 hex, or 64 hex
+normalized to its first 32), a `reason: <vocabulary>` line in
+(expiring_soon/expired/cosign_request), the `---` separator, and
+free text after it (the optional note — unvalidated). Acceptance
+mirrors the reference `parse_notif_ack` exactly. Authorship (who
+sent the ack) is NOT provable from the plaintext — it comes
+from the NIP-17 seal, so combine this with `check_dm` on the
+gift wrap to prove an ack is attributable to the claimed
+sender. Use this to prove a second implementation's ack DMs
+parse wire-compatibly with the reference implementation.
+
+`python3 conformance.py selftest` also covers `check_notif_ack`
+with reference acks built by nakama.py's own primitives.
 """
 
 import json
@@ -1771,6 +1796,90 @@ def check_draft_files(policy_path: str | None, now: int | None,
     print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
     return 0 if failures == 0 else 1
 
+def conform_notif_ack(content) -> tuple[bool, list, list]:
+    """Verify a notif-ack DM plaintext as written by `board_notif_ack`
+    (spec §28.3).
+
+    Acceptance mirrors the reference `parse_notif_ack` exactly:
+    stripped line 0 is the `[nakama] notif-ack` header, line 1 is
+    `core: <hex>` (32 hex, or 64 hex normalized to its first 32 —
+    the reference normalizes both, so the checker does too),
+    line 2 is `reason: <vocabulary>` in NOTIF_ACK_REASONS, line 3
+    is the `---` separator. Free text (the optional note) after
+    the separator is accepted without validation. Anything that
+    would not parse is wire-incompatible; malformed acks are
+    ignored by `board_notif_status` (spam resistance, §28.4).
+
+    This proves format compatibility only: the plaintext itself
+    carries no authorship — the seal (NIP-17, signed by the ack
+    sender's real key) is what binds an ack to a sender. Pair
+    with `check_dm` on the gift wrap for attributable acks.
+    Returns (ok, errs, info).
+    """
+    errs: list[str] = []
+    info: list[str] = []
+    if not isinstance(content, str):
+        return False, ['ack content is not text'], info
+    lines = [(l or '').strip() for l in content.split('\n')]
+    if len(lines) < 4:
+        return False, ['ack content has fewer than 4 lines'], info
+    if lines[0] != nakama.NOTIF_ACK_HEADER:
+        errs.append(f'header must be {nakama.NOTIF_ACK_HEADER!r}')
+    core = None
+    m = re.fullmatch(r'core:\s*(\S+)', lines[1])
+    if not m:
+        errs.append('line 2 must be "core: <hex>"')
+    else:
+        core = m.group(1)
+        norm = nakama.normalize_notif_core(core)
+        if norm is None:
+            errs.append('core must be 32 or 64 lowercase hex chars')
+            core = None
+        else:
+            core = norm
+    reason = None
+    m = re.fullmatch(r'reason:\s*(\S+)', lines[2])
+    if not m:
+        errs.append('line 3 must be "reason: <vocabulary>"')
+    else:
+        reason = m.group(1)
+        if reason not in nakama.NOTIF_ACK_REASONS:
+            errs.append('reason must be one of '
+                        f'{" / ".join(nakama.NOTIF_ACK_REASONS)}')
+            reason = None
+    if lines[3] != '---':
+        errs.append('line 4 must be the "---" separator')
+    if len(errs) == 0:
+        info.append(f'core {core[:12]}...')
+        info.append(f'reason: {reason}')
+        note = '\n'.join(lines[4:]).strip()
+        if note:
+            info.append(f'note: {len(note)} chars (free text, unvalidated)')
+    return (len(errs) == 0), errs, info
+
+
+def check_notif_ack_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                content = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_notif_ack(content)
+        if ok:
+            print(f"{p}: PASS ({'; '.join(info)})")
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 def _key() -> tuple[bytes, str]:
     s = secrets.token_bytes(32)
     return s, nakama.npub_of(s)
@@ -2798,9 +2907,124 @@ def selftest() -> int:
     print(f'--- draft {dr_total - dr_fails}/{dr_total} passed ---')
     fails += dr_fails
 
+    # Notif-ack DM plaintext conformance: reference acks built by
+    # nakama.py's notif_ack_message must verify; malformed ones
+    # must be rejected. Acceptance mirrors parse_notif_ack
+    # exactly (spec §28.3): the '[nakama] notif-ack' header,
+    # 'core: <hex>' (32 hex, or 64 hex normalized to its first
+    # 32 — the reference normalizes both), 'reason: <vocabulary>'
+    # in (expiring_soon/expired/cosign_request), the '---'
+    # separator. Free text after the separator (the optional note)
+    # is accepted without validation. Authorship is NOT provable
+    # from the plaintext — it comes from the NIP-17 seal
+    # (check_dm's territory); this checker proves format wire
+    # compatibility only.
+    ack_fails = 0
+    CORE32 = 'ab' * 16
+    ack_pos = [
+        ('valid ack (no note)',
+         nakama.notif_ack_message(CORE32, 'cosign_request')),
+        ('valid ack with multi-line note',
+         nakama.notif_ack_message(CORE32, 'expiring_soon',
+                                  note='今夜 cosign します\nsecond line')),
+        ('valid ack, 64-hex core (normalized to 32)',
+         f'[nakama] notif-ack\ncore: {"ab" * 32}\nreason: expired\n---'),
+        ('valid ack, uppercase core hex',
+         nakama.notif_ack_message(CORE32.upper(), 'cosign_request')),
+    ]
+    for name, content in ack_pos:
+        ok, errs, info = conform_notif_ack(content)
+        print(f'ack/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        ack_fails += 0 if ok else 1
+
+    ack_neg = []
+    valid_ack = nakama.notif_ack_message(CORE32, 'cosign_request')
+    ack_neg.append(('wrong header',
+                    valid_ack.replace('[nakama] notif-ack',
+                                      '[nakama] notif')))
+    _l = valid_ack.split('\n')
+    _bad = _l.copy()
+    _bad[1] = 'core: ' + 'zz' * 16
+    ack_neg.append(('core not hex', '\n'.join(_bad)))
+    _bad = _l.copy()
+    _bad[1] = 'core: ' + 'ab' * 15 + 'a'
+    ack_neg.append(('core 31 hex chars (not 32/64)', '\n'.join(_bad)))
+    _bad = _l.copy()
+    _bad[2] = 'reason: read_it'
+    ack_neg.append(('reason outside vocabulary', '\n'.join(_bad)))
+    _bad = _l.copy()
+    _bad[1] = 'Core: ' + CORE32
+    ack_neg.append(('core keyword capitalized', '\n'.join(_bad)))
+    _bad = _l.copy()
+    _bad[2] = 'reason'
+    ack_neg.append(('reason line malformed', '\n'.join(_bad)))
+    ack_neg.append(('missing separator', '\n'.join(_l[:3])))
+    ack_neg.append(('fewer than 4 lines',
+                    '[nakama] notif-ack\ncore: ' + CORE32))
+    ack_neg.append(('empty content', ''))
+
+    for name, content in ack_neg:
+        ok, errs, info = conform_notif_ack(content)
+        good = not ok
+        print(f'ack-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            ack_fails += 1
+
+    # E2E: the real CLI (board_notif_ack, publish mocked) builds
+    # an ack DM; the decrypted rumor content must pass
+    # check_notif_ack, and the seal must be the ack sender's key.
+    import tempfile
+    from types import SimpleNamespace
+    s_issuer, np_issuer = _key()
+    s_me, np_me = _key()
+    with tempfile.TemporaryDirectory() as tmpd:
+        keyfile = f'{tmpd}/key.json'
+        nakama.save_key(keyfile, s_me)
+        captured = {}
+
+        def _fake_pub(url, event, timeout=15, auth_secret=None):
+            captured['wrap'] = event
+            return True, ''
+
+        real_pub = nakama.nostr_publish
+        nakama.nostr_publish = _fake_pub
+        try:
+            args = SimpleNamespace(relay='wss://relay.test',
+                                   npub=np_issuer, keyfile=keyfile,
+                                   core=CORE32, reason='cosign_request',
+                                   note='e2e note', auth=False,
+                                   from_npub=None)
+            try:
+                nakama.cmd_board_notif_ack(args)
+            except SystemExit as e:
+                assert e.code == 0, \
+                    f'cmd_board_notif_ack exited {e.code}'
+        finally:
+            nakama.nostr_publish = real_pub
+        rumor = nakama.nip17_unwrap(captured['wrap'], s_issuer)
+        if rumor['pubkey'] != nakama.hexpub_of(s_me):
+            print('ack/e2e: FAIL (seal signer is not the ack sender)')
+            ack_fails += 1
+        else:
+            p = f'{tmpd}/ack.txt'
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write(rumor['content'])
+            rc = check_notif_ack_files([p])
+            print(f'ack/e2e real CLI ack DM: '
+                  f'{"PASS" if rc == 0 else "FAIL"}')
+            ack_fails += 0 if rc == 0 else 1
+
+    ack_total = len(ack_pos) + len(ack_neg) + 1
+    print(f'--- ack {ack_total - ack_fails}/{ack_total} passed ---')
+    fails += ack_fails
+
     grand = total + dm_total + board_total + dec_total + bond_total \
         + binding_total + live_total + cp_total + rt_total + rv_total \
-        + ub_total + pl_total + dr_total
+        + ub_total + pl_total + dr_total + ack_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -2923,6 +3147,11 @@ def main(argv: list[str]) -> int:
                   '[--now unixts] <draft.json> [...]')
             return 2
         return check_draft_files(policy_path, now, rest)
+    if len(argv) >= 2 and argv[1] == 'check_notif_ack':
+        if len(argv) < 3:
+            print('usage: conformance.py check_notif_ack <ack1.txt> [...]')
+            return 2
+        return check_notif_ack_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -2940,6 +3169,7 @@ def main(argv: list[str]) -> int:
           'check_policy <policy.json> [...] | '
           'check_draft [--policy policy.json] [--now unixts] '
           '<draft.json> [...] | '
+          'check_notif_ack <ack1.txt> [...] | '
           'selftest')
     return 2
 
