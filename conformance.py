@@ -409,6 +409,25 @@ and cosign semantics (`check_decision`'s territory).
 `python3 conformance.py selftest` also covers `check_notif_status` with
 reference reports produced in-process by nakama.py's own
 cmd_board_notif_status (offline: no --relay, no --policy).
+
+DM-fetch report conformance:
+
+    python3 conformance.py check_dm_fetch <report1.txt> [...]
+
+Each file is the saved stdout of `nakama.py dm_fetch`. Verifies the
+report is internally consistent: either the single no-new-DMs line
+(`新しい DM はありませんでした`), or one block per rumor — a header
+`--- [YYYY-MM-DD HH:MM:SS] from <16 hex>...` followed by the rumor's
+plaintext content (one or more lines; a block ends at the next header).
+The timestamp must be a valid calendar datetime and the sender prefix
+16 hex chars; every block must carry at least one content line.
+Explicitly out of scope: the timestamp's timezone/value (the reference
+CLI prints local time), message ordering, sender truncation semantics,
+and DM delivery/authorship (`check_dm`'s territory).
+
+`python3 conformance.py selftest` also covers `check_dm_fetch` with
+reference reports produced in-process by nakama.py's own cmd_dm_fetch
+(offline: dm_incoming monkeypatched, no relay contact).
 """
 
 import json
@@ -2502,6 +2521,92 @@ def check_notif_status_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_dm_fetch: dm_fetch report consistency ----------
+
+# dm_fetch's stdout is a short human-readable listing of decrypted rumors,
+# but its grammar is fixed (spec §4.1). check_dm_fetch verifies that a
+# saved report is internally consistent: either the single no-new-DMs line
+# ('新しい DM はありませんでした'), or one block per rumor — a header
+# '--- [YYYY-MM-DD HH:MM:SS] from <sender pubkey first 16 hex>...' followed
+# by the rumor's plaintext content (one or more lines; blank lines and
+# multi-line content are fine — a block ends at the next header line).
+# The timestamp must parse as a calendar datetime; the sender prefix must
+# be 16 hex chars (case-insensitive). Every block must carry at least one
+# content line: a header immediately followed by another header (or EOF)
+# is an empty-content block and is rejected. Explicitly out of scope:
+# the timestamp's timezone/value (the reference CLI prints local time —
+# the checker validates grammar, never the zone or the instant), message
+# ordering (the reference CLI sorts by gift-wrap created_at, not display
+# time), sender truncation semantics, DM delivery (spec §25.2's claim
+# model), and ack/seal authorship (check_dm's and check_notif_ack's
+# territory).
+
+_RE_DMF_EMPTY = '新しい DM はありませんでした'
+_RE_DMF_HEADER = re.compile(
+    r'^--- \[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] '
+    r'from ([0-9a-fA-F]{16})\.\.\.$')
+
+
+def conform_dm_fetch_report(text: str):
+    """Verify a saved `nakama.py dm_fetch` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) == 1 and lines[0] == _RE_DMF_EMPTY:
+        info.append('no new DMs')
+        return True, errs, info
+    if lines[0] == _RE_DMF_EMPTY:
+        return False, ['empty-report line appears together with '
+                       'message blocks'], info
+    blocks: list[list] = []
+    for j, ln in enumerate(lines):
+        m = _RE_DMF_HEADER.match(ln)
+        if m:
+            blocks.append([j + 1, m.group(1), m.group(2), []])
+            continue
+        if not blocks:
+            return False, [f'line {j + 1}: first line must be a message '
+                           'header or the no-new-DMs line'], info
+        blocks[-1][3].append(ln)
+    for lineno, ts, sender, content in blocks:
+        if not _ns_valid_ts(ts):
+            errs.append(f'line {lineno}: invalid display timestamp '
+                        f'{ts!r}')
+        if not content:
+            errs.append(f'line {lineno}: message block has no content '
+                        'lines')
+    if not errs:
+        info.append(f'{len(blocks)} dm blocks')
+    return (not errs), errs, info
+
+
+def check_dm_fetch_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_dm_fetch_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 def _key() -> tuple[bytes, str]:
     s = secrets.token_bytes(32)
     return s, nakama.npub_of(s)
@@ -4251,6 +4356,114 @@ def selftest() -> int:
     print(f'--- notif-status {ns_total - ns_fails}/{ns_total} passed ---')
     fails += ns_fails
 
+    # ---------- check_dm_fetch: dm_fetch report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_dm_fetch, with dm_incoming monkeypatched to return crafted
+    # rumors (no relay contact); hand-mutated reports that break the
+    # header/content grammar must be rejected.
+    dmf_fails = 0
+
+    def _dmf_keyfile(secret, tmpd, name):
+        kf = os.path.join(tmpd, name)
+        with open(kf, 'w') as f:
+            json.dump({'secret_hex': secret.hex()}, f)
+        os.chmod(kf, 0o600)
+        return kf
+
+    def _dmf_fetch(rumors, keyfile):
+        orig = nakama.dm_incoming
+        nakama.dm_incoming = lambda s, r, since, auth, limit=500: rumors
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                nakama.cmd_dm_fetch(SimpleNamespace(
+                    relay='wss://example.invalid', since=None, auth=False,
+                    limit=20, keyfile=keyfile))
+            return buf.getvalue()
+        finally:
+            nakama.dm_incoming = orig
+
+    dmf_e2e = []
+    with tempfile.TemporaryDirectory() as tmpd:
+        s_d, _np_d = _key()
+        dmf_kf = _dmf_keyfile(s_d, tmpd, 'd.json')
+        dmf_e2e.append(('no rumors -> empty line', _dmf_fetch([], dmf_kf)))
+
+        s_1, _np_1 = _key()
+        hx_1 = nakama.hexpub_of(s_1)
+        dmf_e2e.append(('one rumor', _dmf_fetch(
+            [{'pubkey': hx_1, 'created_at': 1759276800,
+              'content': 'hello, nakama'}], dmf_kf)))
+
+        s_2, _np_2 = _key()
+        hx_2 = nakama.hexpub_of(s_2)
+        dmf_e2e.append(('two rumors, multi-line incl. blank', _dmf_fetch(
+            [{'pubkey': hx_1, 'created_at': 1759276800,
+              'content': 'first'},
+             {'pubkey': hx_2, 'created_at': 1759363200,
+              'content': 'line one\n\nline three\n--- not a header'}],
+            dmf_kf)))
+
+    for name, rep in dmf_e2e:
+        ok, errs, info = conform_dm_fetch_report(rep)
+        print(f'dm-fetch-e2e/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        dmf_fails += 0 if ok else 1
+
+    # hand-crafted positives
+    dh1 = '--- [2026-10-01 12:00:00] from ' + 'ab' * 8 + '...'
+    dh2 = '--- [2026-10-02 01:02:03] from ' + 'CD' * 8 + '...'
+    dmf_pos = [
+        ('empty report', '新しい DM はありませんでした\n'),
+        ('one block', dh1 + '\nhello\n'),
+        ('multi-line incl. blank', dh1 + '\nline one\n\nline three\n'),
+        ('uppercase hex sender', dh2 + '\nupper hex ok\n'),
+        ('content line starting with ---', dh1 + '\n--- not a header\n'),
+    ]
+    for name, rep in dmf_pos:
+        ok, errs, info = conform_dm_fetch_report(rep)
+        print(f'dm-fetch/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        dmf_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    dmf_neg = []
+    dmf_neg.append(('empty report', ''))
+    dmf_neg.append(('empty line plus block',
+                    '新しい DM はありませんでした\n' + dh1 + '\nhello\n'))
+    dmf_neg.append(('invalid timestamp',
+                    dh1.replace('2026-10-01 12:00:00',
+                                '2026-13-40 99:99:99') + '\nhello\n'))
+    dmf_neg.append(('sender not hex',
+                    '--- [2026-10-01 12:00:00] from ' + 'zz' * 8 +
+                    '...\nhello\n'))
+    dmf_neg.append(('sender short',
+                    '--- [2026-10-01 12:00:00] from ' + 'ab' * 7 +
+                    '...\nhello\n'))
+    dmf_neg.append(('missing ellipsis',
+                    '--- [2026-10-01 12:00:00] from ' + 'ab' * 8 +
+                    '\nhello\n'))
+    dmf_neg.append(('empty content block', dh1 + '\n' + dh2 + '\nsecond\n'))
+    dmf_neg.append(('garbage first line', 'hello\n' + dh1 + '\ncontent\n'))
+    dmf_neg.append(('leading blank line', '\n' + dh1 + '\nhello\n'))
+
+    for name, rep in dmf_neg:
+        ok, errs, info = conform_dm_fetch_report(rep)
+        good = not ok
+        print(f'dm-fetch-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            dmf_fails += 1
+
+    dmf_total = len(dmf_e2e) + len(dmf_pos) + len(dmf_neg)
+    print(f'--- dm-fetch {dmf_total - dmf_fails}/{dmf_total} passed ---')
+    fails += dmf_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -4258,7 +4471,7 @@ def selftest() -> int:
     grand = total + dm_total + board_total + dec_total + bond_total \
         + binding_total + live_total + cp_total + rt_total + rv_total \
         + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total \
-        + rl_total + ns_total
+        + rl_total + ns_total + dmf_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -4419,6 +4632,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_notif_status <report.txt> [...]')
             return 2
         return check_notif_status_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_dm_fetch':
+        if len(argv) < 3:
+            print('usage: conformance.py check_dm_fetch <report.txt> [...]')
+            return 2
+        return check_dm_fetch_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -4441,6 +4659,7 @@ def main(argv: list[str]) -> int:
           'check_key_status [--exit-code N] <report.txt> [...] | '
           'check_revoke_list <report.txt> [...] | '
           'check_notif_status <report.txt> [...] | '
+          'check_dm_fetch <report.txt> [...] | '
           'selftest')
     return 2
 
