@@ -778,6 +778,38 @@ implementation's `board_policy` CLI prints a compatible report.
 nakama.py's own `cmd_board_policy` (offline: real key pair, temp
 keyfile, 3 eligible npubs — plain, and the --markdown variant).
 
+Board-policy sign report conformance:
+
+    python3 conformance.py check_board_policy_sign <report1.txt> [...]
+
+Verifies a saved `nakama.py board_policy_sign` stdout report is
+internally consistent (spec §9.4.2): exactly one line —
+`board-policy: <out> — 署名 <m>/<n>（発効条件（全員署名）を満たしています）`
+or
+`board-policy: <out> — 署名 <m>/<n>（まだ全員分が揃っていません）`
+(the report's internal arithmetic rules: m >= 1 — the reference CLI
+just appended the caller's own signature, so at least one signature is
+present — and n >= 1 — the reference CLI refuses an empty eligible
+list at creation; m <= n is NOT asserted, since an out-of-eligible
+signer would fail the n-of-n cert while still being counted).
+Trailing blank lines tolerated; a leading blank line is rejected.
+Explicitly out of scope: signature truth (the policy file's territory —
+`check_policy` / `verify_board_policy`), whether the signer is in
+eligible, the out file's existence/content, stderr (duplicate-sign
+notices, tampering warnings), and the exit code (invisible in saved
+stdout text). The `board_policy` creation report (§9.4.1) and the
+`verify_board_policy` verdict lines (§9.4.3) are different grammars —
+the three checkers reject each other's reports. Use this to prove a
+second implementation's `board_policy_sign` CLI prints a compatible
+report.
+
+`python3 conformance.py selftest` also covers
+`check_board_policy_sign` with reports produced in-process by
+nakama.py's own `cmd_board_policy` + `cmd_board_policy_sign`
+(offline: 3 real key pairs, temp keyfiles — a 2/3 partial report, a
+3/3 effective report, and a duplicate-sign report with exact
+stdout+exit matches).
+
 Board-read report conformance:
 
     python3 conformance.py check_board_read <report1.txt> [...]
@@ -4065,6 +4097,93 @@ def check_board_policy_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_board_policy_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_board_policy_sign: board_policy_sign report consistency ----------
+
+# A saved `nakama.py board_policy_sign` stdout report. Its grammar is fixed
+# (spec §9.4.2). check_board_policy_sign verifies that the report is
+# internally consistent. Exactly one line:
+#   board-policy: <out> — 署名 <m>/<n>（発効条件（全員署名）を満たしています）
+# or
+#   board-policy: <out> — 署名 <m>/<n>（まだ全員分が揃っていません）
+# The report's internal arithmetic rules: m >= 1 (the reference CLI just
+# appended the caller's own signature, so at least one signature is
+# present — even on a duplicate-sign run the caller was already a signer),
+# n >= 1 (the reference CLI refuses an empty eligible list at creation).
+# (m <= n is NOT asserted: a signer outside eligible fails the n-of-n
+# cert while still being counted, so the reference can print e.g. 4/3.)
+# Trailing blank lines tolerated; a leading blank line is rejected.
+# Explicitly out of scope: signature truth (the policy file's territory:
+# `check_policy` / `verify_board_policy`), whether the signer is in
+# eligible, the out file's existence/content, stderr (duplicate-sign
+# notices, tampering warnings), and the exit code (invisible in saved
+# stdout text). The `board_policy` creation report (§9.4.1) and the
+# `verify_board_policy` verdict lines (§9.4.3) are different grammars —
+# the three checkers reject each other's reports. Use this to prove a
+# second implementation's `board_policy_sign` CLI prints a compatible
+# report.
+
+_RE_BPS_LINE = re.compile(
+    r'^board-policy: (.+) — 署名 (\d+)/(\d+)'
+    r'（(発効条件（全員署名）を満たしています|'
+    r'まだ全員分が揃っていません)）$')
+
+
+def conform_board_policy_sign_report(text: str):
+    """Verify a saved `nakama.py board_policy_sign` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    if len(lines) != 1:
+        return False, [f'report must be exactly one line, '
+                       f'found {len(lines)}'], info
+    m = _RE_BPS_LINE.match(lines[0])
+    if not m:
+        return False, ['line 1: not a board_policy_sign report line '
+                       '(`board-policy: <out> — 署名 <m>/<n>'
+                       '（発効条件（全員署名）を満たしています）` or '
+                       '`board-policy: <out> — 署名 <m>/<n>'
+                       '（まだ全員分が揃っていません）`)'], info
+    out, ms, ns = m.group(1), int(m.group(2)), int(m.group(3))
+    if out.strip() != out:
+        return False, ['line 1: <out> has leading/trailing whitespace'], info
+    if not (ms >= 1 and ns >= 1):
+        return False, [f'line 1: inconsistent signature counts '
+                       f'({ms}/{ns} — m >= 1 and n >= 1 required)'], info
+    state = ('effective'
+             if m.group(4).startswith('発効条件') else 'pending')
+    info.append(f'sign report: out={out} signatures={ms}/{ns} ({state})')
+    return (not errs), errs, info
+
+
+def check_board_policy_sign_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_board_policy_sign_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -7927,6 +8046,154 @@ def selftest() -> int:
           f'passed ---')
     fails += bpl_fails
 
+    # ---------- check_board_policy_sign: board_policy_sign report consistency
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_board_policy + cmd_board_policy_sign (offline: 3 real key pairs,
+    # temp keyfiles, one policy signed up to 3/3, then a duplicate sign —
+    # exact stdout+exit matches); hand-mutated reports that break the
+    # one-line grammar (or the m >= 1 / n >= 1 arithmetic rules) must be
+    # rejected, as must the sibling board-policy reports (creation,
+    # verify_board_policy).
+    bps_fails = 0
+    _bps_secs = [_key()[0] for _ in range(3)]
+    _bps_npbs = [nakama.npub_of(s) for s in _bps_secs]
+    _bps_effective = '（発効条件（全員署名）を満たしています）'
+    _bps_pending = '（まだ全員分が揃っていません）'
+
+    def _bps_setup(tmpd):
+        kfs = []
+        for i, s in enumerate(_bps_secs):
+            kf = os.path.join(tmpd, f'key{i}.json')
+            with open(kf, 'w') as f:
+                json.dump({'secret_hex': s.hex()}, f)
+            kfs.append(kf)
+        pol = os.path.join(tmpd, 'bps-policy.json')
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            nakama.cmd_board_policy(SimpleNamespace(
+                board_id='nakama-bps', relay='wss://example.invalid',
+                threshold=2, eligible=_bps_npbs, out=pol,
+                keyfile=kfs[0], markdown=False))
+        return pol, kfs
+
+    def _bps_sign(pol, kf):
+        buf = io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                nakama.cmd_board_policy_sign(SimpleNamespace(
+                    policy=pol, out=None, keyfile=kf))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        return buf.getvalue(), code
+
+    _bps_e2e = []
+    with tempfile.TemporaryDirectory() as _bps_td:
+        _bps_pol, _bps_kfs = _bps_setup(_bps_td)
+        _rep, _code = _bps_sign(_bps_pol, _bps_kfs[1])
+        _bps_e2e.append(('partial 2/3', _rep, _code, 0,
+                         f'board-policy: {_bps_pol} — 署名 2/3'
+                         f'{_bps_pending}\n'))
+        _rep, _code = _bps_sign(_bps_pol, _bps_kfs[2])
+        _bps_e2e.append(('complete 3/3', _rep, _code, 0,
+                         f'board-policy: {_bps_pol} — 署名 3/3'
+                         f'{_bps_effective}\n'))
+        _rep, _code = _bps_sign(_bps_pol, _bps_kfs[1])  # duplicate sign
+        _bps_e2e.append(('duplicate sign keeps 3/3', _rep, _code, 0,
+                         f'board-policy: {_bps_pol} — 署名 3/3'
+                         f'{_bps_effective}\n'))
+    for name, rep, code, want_code, want_rep in _bps_e2e:
+        exact = (rep == want_rep) and (code == want_code)
+        ok, errs, info = conform_board_policy_sign_report(rep)
+        good = exact and ok
+        print(f'board-policy-sign-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        if not good:
+            if not exact:
+                print(f'    - stdout/exit mismatch: {rep!r} code={code}')
+            for e in errs:
+                print(f'    - {e}')
+            bps_fails += 1
+
+    # hand-crafted positives
+    bps_pos = [
+        ('partial 2/3',
+         f'board-policy: pol.json — 署名 2/3{_bps_pending}\n'),
+        ('complete 3/3',
+         f'board-policy: pol.json — 署名 3/3{_bps_effective}\n'),
+        ('no trailing newline',
+         f'board-policy: pol.json — 署名 2/3{_bps_pending}'),
+        ('trailing blanks',
+         f'board-policy: pol.json — 署名 3/3{_bps_effective}\n\n\n'),
+        ('spaced out path',
+         f'board-policy: my dir/pol.json — 署名 1/3{_bps_pending}\n'),
+        ('large counts',
+         f'board-policy: pol.json — 署名 100/100{_bps_effective}\n'),
+    ]
+    for name, rep in bps_pos:
+        ok, errs, info = conform_board_policy_sign_report(rep)
+        print(f'board-policy-sign/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        bps_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    _bps_creation = ('board-policy 案: x.json — あなたの署名 1/3'
+                     '（初回は全員 3/3 の署名が必要）\n'
+                     '運用: このファイルを eligible 全員に回覧し、'
+                     '`board_policy_sign` で署名を集めてください。\n')
+    bps_neg = []
+    bps_neg.append(('empty report', ''))
+    bps_neg.append(('garbage line', 'hello\n'))
+    bps_neg.append(('two reports concatenated',
+                    f'board-policy: a.json — 署名 2/3{_bps_pending}\n'
+                    f'board-policy: b.json — 署名 3/3{_bps_effective}\n'))
+    bps_neg.append(('zero signatures (self-contradiction)',
+                    f'board-policy: x.json — 署名 0/3{_bps_pending}\n'))
+    bps_neg.append(('zero eligible',
+                    f'board-policy: x.json — 署名 1/0{_bps_pending}\n'))
+    bps_neg.append(('counts non-numeric',
+                    f'board-policy: x.json — 署名 a/3{_bps_pending}\n'))
+    bps_neg.append(('out empty',
+                    f'board-policy: — 署名 2/3{_bps_pending}\n'))
+    bps_neg.append(('out trailing space',
+                    f'board-policy: x.json  — 署名 2/3{_bps_pending}\n'))
+    bps_neg.append(('suffix typo',
+                    'board-policy: x.json — 署名 2/3'
+                    '（発効条件を満たしています）\n'))
+    bps_neg.append(('english suffix',
+                    'board-policy: x.json — 署名 2/3 (effective)\n'))
+    bps_neg.append(('dash instead of em-dash',
+                    f'board-policy: x.json - 署名 2/3{_bps_pending}\n'))
+    bps_neg.append(('署名 kanji missing',
+                    f'board-policy: x.json — 2/3{_bps_pending}\n'))
+    bps_neg.append(('prefix noun differs',
+                    f'board-decision: x.json — 署名 2/3{_bps_pending}\n'))
+    bps_neg.append(('board_policy creation report (different grammar)',
+                    _bps_creation))
+    bps_neg.append(('verify_board_policy valid (different grammar)',
+                    'board-policy は有効です: eligible 3 名全員の署名を確認'
+                    '（threshold 2）\n'))
+    bps_neg.append(('verify_board_policy invalid (different grammar)',
+                    'board-policy は無効です: 全員の有効署名が揃っていないか、'
+                    '形式が不正です\n'))
+    bps_neg.append(('leading blank line',
+                    f'\nboard-policy: x.json — 署名 2/3{_bps_pending}\n'))
+    for name, rep in bps_neg:
+        ok, _errs, _info = conform_board_policy_sign_report(rep)
+        good = not ok
+        print(f'board-policy-sign-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            bps_fails += 1
+
+    bps_total = len(_bps_e2e) + len(bps_pos) + len(bps_neg)
+    print(f'--- board-policy-sign {bps_total - bps_fails}/{bps_total} '
+          f'passed ---')
+    fails += bps_fails
+
     # ---------- check_board_read: board_read report consistency ----------
     # Reference reports are produced in-process with nakama.py's own
     # cmd_board_read, with nostr_request monkeypatched to return crafted
@@ -11233,7 +11500,8 @@ def selftest() -> int:
         + bfa_total + pub_total + gov_total + rf_total + rtf_total \
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
         + bj_total + bs_total + bc_total + vbd_total + bvr_total \
-        + bdc_total + bcs_total + dmr_total + vrt_total + bpl_total
+        + bdc_total + bcs_total + dmr_total + vrt_total + bpl_total \
+        + bps_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -11539,6 +11807,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_board_policy_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_board_policy_sign':
+        if len(argv) < 3:
+            print('usage: conformance.py check_board_policy_sign '
+                  '<report.txt> [...]')
+            return 2
+        return check_board_policy_sign_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -11586,6 +11860,7 @@ def main(argv: list[str]) -> int:
           'check_dm_recv <report.txt> [...] | '
           'check_verify_rotation <report.txt> [...] | '
           'check_board_policy <report.txt> [...] | '
+          'check_board_policy_sign <report.txt> [...] | '
           'selftest')
     return 2
 
