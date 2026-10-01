@@ -576,6 +576,33 @@ contact).
 reference reports produced in-process by nakama.py's own
 cmd_board_governance (offline: nostr_request monkeypatched, no relay
 contact; management events signed in-process with nakama.sign_event).
+
+Revoke-fetch report conformance:
+
+    python3 conformance.py check_revoke_fetch <report.txt> [...]
+
+Each file is the saved stdout of `nakama.py revoke_fetch`. Verifies the
+report is internally consistent: zero or more `取り込み:` lines —
+`取り込み: revocation を registry に記録しました (bond <16 hex>...,
+revoker <16 chars>...)` — followed by the footer `<E> 件のイベントを
+取得: <S> 件を取り込み、<K> 件をスキップ`, which must be the final
+line. The bond prefix must be 16 hex chars (case-insensitive), the
+revoker prefix 16 non-space chars (the reference CLI prints an npub
+truncation); the number of `取り込み:` lines must equal S, and E must
+equal S + K. Explicitly out of scope: the counts' truth (the relay's
+event set is the relay's claim — the checker only validates the
+display's internal arithmetic), why each event was skipped (invalid
+Nostr signature, non-JSON content, bond_hash mismatch, duplicate, or
+invalid revocation signature — the import path's territory),
+bond_hash/revoker truth (`check_revocation`'s territory), event
+signature validity (`verify_revocation_event`'s territory), ordering,
+and stderr.
+
+`python3 conformance.py selftest` also covers `check_revoke_fetch` with
+reference reports produced in-process by nakama.py's own
+cmd_revoke_fetch (offline: nostr_request monkeypatched, no relay
+contact; revocation events signed in-process with
+nakama.revocation_nostr_event).
 """
 
 import json
@@ -3603,6 +3630,91 @@ def check_governance_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_governance_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_revoke_fetch: revoke_fetch report consistency ----------
+
+# `nakama.py revoke_fetch <bond_hash>` prints one `取り込み:` line per
+# revocation it imports into the local registry, then a footer with the
+# fetched/stored/skipped counts. The grammar is fixed (spec §12.4).
+# check_revoke_fetch verifies that a saved report is internally
+# consistent:
+#   取り込み: revocation を registry に記録しました (bond <16hex>..., revoker <16chars>...)
+#   <E> 件のイベントを取得: <S> 件を取り込み、<K> 件をスキップ
+# The bond prefix must be 16 hex chars (case-insensitive — second
+# implementers may print uppercase); the revoker prefix is 16
+# non-space chars (the reference CLI prints an npub truncation, which
+# is bech32, not hex — so hex is deliberately not required). The number
+# of `取り込み:` lines must equal S, E must equal S + K, and the footer
+# must be the last line. Explicitly out of scope: the counts' truth
+# (the relay's event set is the relay's claim — display consistency
+# only), why each event was skipped (invalid Nostr signature, non-JSON
+# content, bond_hash mismatch, duplicate, or invalid revocation
+# signature — the import path's territory), bond_hash/revoker truth
+# (check_revocation's territory), event signature validity
+# (verify_revocation_event's territory), ordering, and stderr notes.
+
+_RE_RF_TAKE = re.compile(
+    r'^取り込み: revocation を registry に記録しました '
+    r'\(bond ([0-9a-fA-F]{16})\.\.\., revoker (\S{16})\.\.\.\)$')
+_RE_RF_FOOT = re.compile(
+    r'^(\d+) 件のイベントを取得: (\d+) 件を取り込み、(\d+) 件をスキップ$')
+
+
+def conform_revoke_fetch_report(text: str):
+    """Verify a saved `nakama.py revoke_fetch` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    m = _RE_RF_FOOT.match(lines[-1])
+    if not m:
+        return False, ['last line: not a revoke_fetch footer line '
+                       '(`<E> 件のイベントを取得: <S> 件を取り込み、'
+                       '<K> 件をスキップ`)'], info
+    e, s, k = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    takes = lines[:-1]
+    for j, ln in enumerate(takes):
+        if not _RE_RF_TAKE.match(ln):
+            errs.append(f'line {j + 1}: does not match the 取り込み line '
+                        'grammar (`取り込み: revocation を registry に'
+                        '記録しました (bond <16 hex>..., revoker '
+                        '<16 chars>...)`)')
+    if len(takes) != s:
+        errs.append(f'footer says {s} stored but {len(takes)} 取り込み '
+                    'lines listed')
+    if e != s + k:
+        errs.append(f'footer counts do not add up: {e} fetched != '
+                    f'{s} stored + {k} skipped')
+    if not errs:
+        info.append(f'{e} fetched, {s} stored, {k} skipped')
+    return (not errs), errs, info
+
+
+def check_revoke_fetch_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_revoke_fetch_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -6699,6 +6811,145 @@ def selftest() -> int:
     print(f'--- governance {gov_total - gov_fails}/{gov_total} passed ---')
     fails += gov_fails
 
+    # ---------- check_revoke_fetch: revoke_fetch report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_revoke_fetch, with nostr_request monkeypatched to return
+    # in-process-signed revocation events (no relay contact); hand-mutated
+    # reports that break the fixed display grammar (spec §12.4) or the
+    # take-line/footer count consistency must be rejected.
+    rf_fails = 0
+    _rf_now = int(time.time())
+
+    def _rf_keyfile(secret, tmpd, name):
+        kf = os.path.join(tmpd, name)
+        with open(kf, 'w') as f:
+            json.dump({'secret_hex': secret.hex()}, f)
+        os.chmod(kf, 0o600)
+        return kf
+
+    def _rf_rev(secret, bond_hash, created_at, reason=''):
+        npub = nakama.npub_of(secret)
+        rev = {'protocol': 'nakama', 'version': 1, 'type': 'revocation',
+               'bond_hash': bond_hash, 'revoker': npub,
+               'created_at': created_at,
+               'sig': nakama.sign_schnorr(
+                   secret, nakama.revocation_message(
+                       bond_hash, npub, created_at, reason)).hex()}
+        if reason:
+            rev['reason'] = reason
+        return nakama.revocation_nostr_event(rev, secret)
+
+    def _rf_run(tmpd, bond_hash, keyfile, events):
+        orig = nakama.nostr_request
+        nakama.nostr_request = lambda *a, **k: events
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                nakama.cmd_revoke_fetch(SimpleNamespace(
+                    relay='wss://example.invalid', bond_hash=bond_hash,
+                    limit=20, auth=False,
+                    registry=os.path.join(tmpd, 'revocations'),
+                    keyfile=keyfile))
+            return buf.getvalue()
+        finally:
+            nakama.nostr_request = orig
+
+    _rf_bh = 'ab' * 32
+    rf_e2e = []
+    with tempfile.TemporaryDirectory() as tmpd:
+        _rsA, _npA = _key()
+        _kf = _rf_keyfile(_rsA, tmpd, 'a.json')
+        _ev1 = _rf_rev(_rsA, _rf_bh, _rf_now)
+        _ev_dup = json.loads(json.dumps(_ev1))  # same bond -> duplicate
+        _ev_badsig = json.loads(json.dumps(_ev1))
+        _ev_badsig['sig'] = '00' * 64
+        _ev_other = _rf_rev(_rsA, 'cd' * 32, _rf_now)  # bond mismatch
+        _rf_take = (f'取り込み: revocation を registry に記録しました '
+                    f'(bond {_rf_bh[:16]}..., revoker {_npA[:16]}...)\n')
+        for name, events, exp in (
+                ('1 stored + 3 skipped (bad sig, bond mismatch, duplicate)',
+                 [_ev1, _ev_dup, _ev_badsig, _ev_other],
+                 _rf_take
+                 + '4 件のイベントを取得: 1 件を取り込み、3 件をスキップ\n'),
+                ('empty events', [],
+                 '0 件のイベントを取得: 0 件を取り込み、0 件をスキップ\n')):
+            text = _rf_run(tmpd, _rf_bh, _kf, events)
+            ok, errs, info = conform_revoke_fetch_report(text)
+            good = ok and text == exp
+            print(f'check_revoke_fetch e2e {name}: '
+                  f'{"PASS" if good else "FAIL"}')
+            for e in errs:
+                print(f'    - {e}')
+            if not good and not errs:
+                print(f'    - stdout mismatch: {text!r} '
+                      f'(expected {exp!r})')
+            rf_fails += 0 if good else 1
+            rf_e2e.append(name)
+
+    _rf_bh1, _rf_bh2 = 'ab' * 8, 'cd' * 8
+    _, _rf_np1 = _key()
+    _, _rf_np2 = _key()
+    _rf_foot1 = '1 件のイベントを取得: 1 件を取り込み、0 件をスキップ'
+    rf_pos = [
+        ('empty events',
+         '0 件のイベントを取得: 0 件を取り込み、0 件をスキップ\n'),
+        ('one take',
+         f'取り込み: revocation を registry に記録しました '
+         f'(bond {_rf_bh1}..., revoker {_rf_np1[:16]}...)\n{_rf_foot1}\n'),
+        ('uppercase bond hex',
+         f'取り込み: revocation を registry に記録しました '
+         f'(bond {(_rf_bh1).upper()}..., revoker {_rf_np1[:16]}...)\n'
+         f'{_rf_foot1}\n'),
+        ('two takes consistent',
+         f'取り込み: revocation を registry に記録しました '
+         f'(bond {_rf_bh1}..., revoker {_rf_np1[:16]}...)\n'
+         f'取り込み: revocation を registry に記録しました '
+         f'(bond {_rf_bh2}..., revoker {_rf_np2[:16]}...)\n'
+         '3 件のイベントを取得: 2 件を取り込み、1 件をスキップ\n'),
+    ]
+    for name, rep in rf_pos:
+        ok, errs, info = conform_revoke_fetch_report(rep)
+        print(f'check_revoke_fetch pos {name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        rf_fails += 0 if ok else 1
+
+    _rf_one = (f'取り込み: revocation を registry に記録しました '
+               f'(bond {_rf_bh1}..., revoker {_rf_np1[:16]}...)\n')
+    rf_neg = [
+        ('empty text', ''),
+        ('broken footer', _rf_one + 'garbage line\n'),
+        ('stray line before footer', 'note line\n' + _rf_one + _rf_foot1 + '\n'),
+        ('take count != stored',
+         _rf_one + _rf_one + _rf_foot1 + '\n'),
+        ('counts do not add up',
+         _rf_one + '2 件のイベントを取得: 1 件を取り込み、0 件をスキップ\n'),
+        ('bond prefix not hex',
+         _rf_one.replace(_rf_bh1, 'zz' * 8, 1) + _rf_foot1 + '\n'),
+        ('bond prefix short',
+         _rf_one.replace(_rf_bh1, 'ab' * 7 + 'a', 1) + _rf_foot1 + '\n'),
+        ('revoker prefix short',
+         _rf_one.replace(_rf_np1[:16], _rf_np1[:15], 1) + _rf_foot1 + '\n'),
+        ('footer not last', _rf_foot1 + '\ntrailing garbage\n'),
+        ('missing footer', _rf_one),
+        ('missing ellipsis on bond',
+         _rf_one.replace(f'{_rf_bh1}...', _rf_bh1, 1) + _rf_foot1 + '\n'),
+        ('blank line inside body',
+         _rf_one + '\n' + _rf_foot1 + '\n'),
+    ]
+    for name, rep in rf_neg:
+        ok, _errs, _info = conform_revoke_fetch_report(rep)
+        good = not ok
+        print(f'check_revoke_fetch neg {name}: '
+              f'{"PASS" if good else "FAIL"}')
+        rf_fails += 0 if good else 1
+
+    rf_total = len(rf_e2e) + len(rf_pos) + len(rf_neg)
+    print(f'--- revoke-fetch {rf_total - rf_fails}/{rf_total} passed ---')
+    fails += rf_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -6707,7 +6958,7 @@ def selftest() -> int:
         + binding_total + live_total + cp_total + rt_total + rv_total \
         + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total \
         + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total \
-        + bfa_total + pub_total + gov_total
+        + bfa_total + pub_total + gov_total + rf_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -6906,6 +7157,12 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_governance <report.txt> [...]')
             return 2
         return check_governance_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_revoke_fetch':
+        if len(argv) < 3:
+            print('usage: conformance.py check_revoke_fetch '
+                  '<report.txt> [...]')
+            return 2
+        return check_revoke_fetch_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -6935,6 +7192,7 @@ def main(argv: list[str]) -> int:
           'check_board_fetch_all <report.txt> [...] | '
           'check_pub <report.txt> [...] | '
           'check_governance <report.txt> [...] | '
+          'check_revoke_fetch <report.txt> [...] | '
           'selftest')
     return 2
 
