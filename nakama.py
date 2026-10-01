@@ -1612,26 +1612,36 @@ def cmd_dm_pub(args):
     sys.exit(0 if accepted else 1)
 
 
+def dm_incoming(secret: bytes, relay: str, since: int | None, auth: bool,
+                limit: int = 500) -> list:
+    """自分宛の gift wrap (kind 1059, #p 自分) を購読し、復号できた rumor を created_at 昇順で返す。
+    cmd_dm_fetch と board_notif_status (spec §28.4) が共有する fetch+unwrap ロジック。
+    復号できない wrap は無視する。ネットワーク失敗は nostr_request の例外をそのまま伝える。"""
+    my_hexpub = hexpub_of(secret)
+    filt = {'kinds': [1059], '#p': [my_hexpub], 'limit': limit}
+    if since:
+        filt['since'] = since
+    sub_id = secrets.token_hex(8)
+    events = nostr_request(relay, ['REQ', sub_id, filt],
+                           auth_secret=secret if auth else None)
+    rumors = []
+    for ev in sorted(events, key=lambda e: e.get('created_at', 0)):
+        try:
+            rumors.append(nip17_unwrap(ev, secret))
+        except (ValueError, AssertionError, KeyError):
+            continue  # 自分向けに復号できない gift wrap は無視
+    return rumors
+
+
 def cmd_dm_fetch(args):
     """自分宛の gift wrap (kind 1059, #p 自分) を購読し、復号して rumor を表示。"""
     secret = load_key(args.keyfile)
-    my_hexpub = hexpub_of(secret)
-    filt = {'kinds': [1059], '#p': [my_hexpub], 'limit': args.limit}
-    if args.since:
-        filt['since'] = args.since
-    sub_id = secrets.token_hex(8)
-    events = nostr_request(args.relay, ['REQ', sub_id, filt], auth_secret=secret if args.auth else None)
-    shown = 0
-    for ev in sorted(events, key=lambda e: e.get('created_at', 0)):
-        try:
-            rumor = nip17_unwrap(ev, secret)
-        except (ValueError, AssertionError, KeyError):
-            continue  # 自分向けに復号できない gift wrap は無視
-        shown += 1
+    rumors = dm_incoming(secret, args.relay, args.since, args.auth, limit=args.limit)
+    for rumor in rumors:
         ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(rumor.get('created_at', 0)))
         print(f"--- [{ts}] from {rumor['pubkey'][:16]}...")
         print(rumor['content'])
-    if not shown:
+    if not rumors:
         print('新しい DM はありませんでした')
 
 
