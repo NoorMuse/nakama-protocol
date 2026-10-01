@@ -382,6 +382,31 @@ nakama.py's own `cmd_board_verify` (offline: board descriptor fixture
 built in-process with a real Schnorr signature, plus a tampered-sig
 one).
 
+Board-decide report conformance:
+
+    python3 conformance.py check_board_decide <report1.txt> [...]
+
+Verifies a saved `nakama.py board_decide` stdout report is internally
+consistent (spec §9.7): exactly 2 lines — the creation line
+`board-decision 案: <out> — 決定 "<decision>"、あなたの承認署名 1 つ`
+(out a non-empty file name, decision in the BOARD_DECISION_TYPES
+vocabulary, the literal 1 own approval signature) followed by the
+fixed operational note verbatim. Trailing blank lines tolerated.
+Unlike `check_verify_board_decision` there is no n/t arithmetic to
+verify — the approval count is a fixed literal. Explicitly out of
+scope: the payload's validity (`validate_decision_payload`'s
+territory), the approval signature's validity
+(`verify_board_decision`'s territory), the out file's existence and
+content (`check_decision`'s territory), stderr, and the exit code. The
+verify_board_decision report grammar is rejected both ways. Use this to
+prove a second implementation's `board_decide` CLI prints a compatible
+report.
+
+`python3 conformance.py selftest` also covers
+`check_board_decide` with reports produced in-process by
+nakama.py's own `cmd_board_decide` (offline: real Schnorr-signed
+draft decisions written to a temp keyfile).
+
 Compromise declaration conformance:
 
     python3 conformance.py check_compromise <decl1.json> [...]
@@ -5093,6 +5118,87 @@ def check_board_verify_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_board_verify_report(text)
+        if ok:
+            print(f'{p}: PASS ({ "; ".join(info) })')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_board_decide: board_decide report consistency ----------
+
+# board_decide's stdout is a two-line report confirming the created draft
+# decision, and its grammar is fixed (spec §9.7):
+#
+#   line 1: board-decision 案: <out> — 決定 "<decision>"、あなたの承認署名 1 つ
+#   line 2: 運用: このファイルを回覧し、`board_cosign` で承認署名を
+#           threshold 分まで集めてください。
+#
+# check_board_decide verifies that a saved report is internally
+# consistent. Checks: exactly 2 lines (trailing blank lines tolerated);
+# line 1 names a non-empty out file, quotes a decision name belonging to
+# the BOARD_DECISION_TYPES vocabulary (the reference argparse
+# --decision choices — a creation report can only echo what the command
+# accepted), and states exactly the literal 1 own approval signature
+# (the reference implementation always self-signs once at creation);
+# line 2 must be the fixed operational note verbatim. Unlike
+# check_verify_board_decision the report carries no n/t arithmetic —
+# the approval count is a fixed literal, so there is no internal
+# arithmetic to verify. Out of scope: the payload's validity
+# (validate_decision_payload's territory), the approval signature's
+# validity (verify_board_decision's territory), the out file's existence
+# and content (check_decision's territory), stderr, and the exit code.
+# The verify_board_decision report (`board-decision は有効です: ...`,
+# §9.6) is a separate grammar and is rejected both ways. Use this to
+# prove a second implementation's board_decide CLI prints a compatible
+# report.
+
+_RE_BD_LINE1 = re.compile(
+    r'^board-decision 案: (.+?) — 決定 "([^"]+)"、あなたの承認署名 1 つ$')
+_BD_LINE2 = ('運用: このファイルを回覧し、`board_cosign` で承認署名を '
+             'threshold 分まで集めてください。')
+
+
+def conform_board_decide_report(text: str):
+    """Verify a saved `nakama.py board_decide` stdout report is
+    internally consistent. Returns (ok, errors, info)."""
+    info = []
+    lines = [l for l in text.split('\n') if l.strip() != '']
+    if len(lines) != 2:
+        return False, [f'expected exactly 2 report lines, found {len(lines)}'], \
+            info
+    m = _RE_BD_LINE1.match(lines[0])
+    if not m:
+        return False, ['line 1 does not match the board_decide report form'], \
+            info
+    out, decision = m.group(1), m.group(2)
+    if not out.strip():
+        return False, ['out file name is empty'], info
+    if decision not in nakama.BOARD_DECISION_TYPES:
+        return False, [f'decision name {decision!r} is not in the '
+                       'BOARD_DECISION_TYPES vocabulary'], info
+    if lines[1] != _BD_LINE2:
+        return False, ['line 2 is not the fixed operational note'], info
+    info.append(f'decision={decision}')
+    info.append(f'out={out}')
+    return True, [], info
+
+
+def check_board_decide_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_board_decide_report(text)
         if ok:
             print(f'{p}: PASS ({ "; ".join(info) })')
         else:
@@ -9995,6 +10101,138 @@ def selftest() -> int:
           f'passed ---')
     fails += bvr_fails
 
+    # ---------- check_board_decide: board_decide report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_board_decide (offline: a temp keyfile written with a real
+    # keypair, Schnorr-signed draft decisions for each decision type);
+    # hand-mutated reports that break the two-line grammar must be
+    # rejected.
+    bdc_fails = 0
+    _bdc_now = int(time.time())
+    _bdc_s, _bdc_npub = _key()
+    _bdc_s2, _bdc_npub2 = _key()
+
+    def _bdc_run(decision, payload, out_name):
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmpd:
+            kf = os.path.join(tmpd, 'key.json')
+            nakama.save_key(kf, _bdc_s)
+            out = os.path.join(tmpd, out_name)
+            ns = SimpleNamespace(
+                keyfile=kf, board_id='bdc-board',
+                relay='wss://relay.example', decision=decision,
+                payload=json.dumps(payload), out=out,
+                expires_in=None, expires_at=None, old_moderators=None)
+            code = 0
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    nakama.cmd_board_decide(ns)
+                except SystemExit as e:
+                    code = e.code if isinstance(e.code, int) else 0
+            ok_file = os.path.exists(out)
+        return buf.getvalue(), code, out, ok_file
+
+    _bdc_e2e_raw = [
+        ('admit', {'candidate': _bdc_npub}, 'dec-admit.json'),
+        ('policy-update', {'threshold': 2,
+                          'eligible': [_bdc_npub, _bdc_npub2]},
+         'dec-policy.json'),
+    ]
+    bdc_e2e = []
+    for _dname, _payload, _oname in _bdc_e2e_raw:
+        _rep, _code, _outp, _okf = _bdc_run(_dname, _payload, _oname)
+        _want = (f'board-decision 案: {_outp} — 決定 "{_dname}"、'
+                 f'あなたの承認署名 1 つ\n{_BD_LINE2}\n')
+        bdc_e2e.append((_dname, _rep, _code, 0, _want, _okf))
+    for name, rep, code, want_code, want_rep, ok_file in bdc_e2e:
+        exact = (rep == want_rep) and (code == want_code) and ok_file
+        ok, errs, info = conform_board_decide_report(rep)
+        good = exact and ok
+        print(f'board-decide-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({ "; ".join(info) })')
+        if not good:
+            if not exact:
+                print(f'    - stdout/exit/file mismatch: {rep!r} '
+                      f'code={code} file={ok_file}')
+            for e in errs:
+                print(f'    - {e}')
+            bdc_fails += 1
+
+    bdc_pos = [
+        ('admit', 'board-decision 案: dec.json — 決定 "admit"、'
+                  'あなたの承認署名 1 つ\n' + _BD_LINE2 + '\n'),
+        ('handover', 'board-decision 案: dec.json — 決定 "handover"、'
+                     'あなたの承認署名 1 つ\n' + _BD_LINE2 + '\n'),
+        ('out with spaces', 'board-decision 案: /tmp/my dir/dec draft.json '
+                            '— 決定 "close"、あなたの承認署名 1 つ\n'
+                            + _BD_LINE2 + '\n'),
+        ('no trailing newline', 'board-decision 案: dec.json — 決定 '
+                                '"remove"、あなたの承認署名 1 つ\n'
+                                + _BD_LINE2),
+        ('trailing blanks', 'board-decision 案: dec.json — 決定 "admit"、'
+                            'あなたの承認署名 1 つ\n' + _BD_LINE2
+                            + '\n\n  \n'),
+    ]
+    bdc_neg = [
+        ('empty text', ''),
+        ('one line only', 'board-decision 案: dec.json — 決定 "admit"、'
+                          'あなたの承認署名 1 つ\n'),
+        ('two reports', 'board-decision 案: dec.json — 決定 "admit"、'
+                        'あなたの承認署名 1 つ\n' + _BD_LINE2 + '\n'
+                        'board-decision 案: dec.json — 決定 "admit"、'
+                        'あなたの承認署名 1 つ\n' + _BD_LINE2 + '\n'),
+        ('unknown decision vocabulary', 'board-decision 案: dec.json — 決定 '
+                                        '"elect"、あなたの承認署名 1 つ\n'
+                                        + _BD_LINE2 + '\n'),
+        ('empty decision name', 'board-decision 案: dec.json — 決定 '
+                                '"あなたの承認署名 1 つ\n'
+                                + _BD_LINE2 + '\n'),
+        ('decision name with quote', 'board-decision 案: dec.json — 決定 '
+                                     '"ad"mit"、あなたの承認署名 1 つ\n'
+                                     + _BD_LINE2 + '\n'),
+        ('count 2 instead of 1', 'board-decision 案: dec.json — 決定 '
+                                 '"admit"、あなたの承認署名 2 つ\n'
+                                 + _BD_LINE2 + '\n'),
+        ('empty out file name', 'board-decision 案:  — 決定 "admit"、'
+                                'あなたの承認署名 1 つ\n'
+                                + _BD_LINE2 + '\n'),
+        ('missing operational line', 'board-decision 案: dec.json — 決定 '
+                                     '"admit"、あなたの承認署名 1 つ\n'
+                                     '報告の記録は省略\n'),
+        ('operational line truncated', 'board-decision 案: dec.json — 決定 '
+                                       '"admit"、あなたの承認署名 1 つ\n'
+                                       '運用: このファイルを回覧し\n'),
+        ('leading garbage', '前置き\nboard-decision 案: dec.json — 決定 '
+                            '"admit"、あなたの承認署名 1 つ\n'
+                            + _BD_LINE2 + '\n'),
+        ('trailing garbage', 'board-decision 案: dec.json — 決定 "admit"、'
+                             'あなたの承認署名 1 つ\n' + _BD_LINE2
+                             + '\nおまけ\n'),
+        ('verify_board_decision report line',
+         'board-decision は有効です: 承認署名 1/2（決定 "admit"）\n'),
+    ]
+    for name, rep in bdc_pos:
+        ok, errs, info = conform_board_decide_report(rep)
+        good = ok
+        print(f'check_board_decide pos {name}: '
+              f'{"PASS" if good else "FAIL"} ({ "; ".join(info) })')
+        for e in errs:
+            print(f'    - {e}')
+        bdc_fails += 0 if good else 1
+    for name, rep in bdc_neg:
+        ok, _errs, _info = conform_board_decide_report(rep)
+        good = not ok
+        print(f'check_board_decide neg {name}: '
+              f'{"PASS" if good else "FAIL"}')
+        if not good:
+            print(f'    - report wrongly accepted')
+        bdc_fails += 0 if good else 1
+    bdc_total = len(bdc_e2e) + len(bdc_pos) + len(bdc_neg)
+    print(f'--- board-decide {bdc_total - bdc_fails}/{bdc_total} '
+          f'passed ---')
+    fails += bdc_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -10005,7 +10243,8 @@ def selftest() -> int:
         + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total \
         + bfa_total + pub_total + gov_total + rf_total + rtf_total \
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
-        + bj_total + bs_total + bc_total + vbd_total + bvr_total
+        + bj_total + bs_total + bc_total + vbd_total + bvr_total \
+        + bdc_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -10282,6 +10521,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_board_verify_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_board_decide':
+        if len(argv) < 3:
+            print('usage: conformance.py check_board_decide '
+                  '<report.txt> [...]')
+            return 2
+        return check_board_decide_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -10324,6 +10569,7 @@ def main(argv: list[str]) -> int:
           'check_board_create <report.txt> [...] | '
           'check_verify_board_decision <report.txt> [...] | '
           'check_board_verify <report.txt> [...] | '
+          'check_board_decide <report.txt> [...] | '
           'selftest')
     return 2
 
