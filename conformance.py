@@ -3896,6 +3896,106 @@ def check_rotate_fetch_files(paths: list[str]) -> int:
     print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
     return 0 if failures == 0 else 1
 
+# ---------- check_compromise_fetch: compromise_fetch report consistency ----------
+
+# `nakama.py compromise_fetch <relay> <npub>` prints one `取り込み:` line
+# per compromise declaration it imports into the local registry, one
+# `更新:` line per withdrawn-flag update, then a footer with the
+# fetched/stored/updated/skipped counts. The grammar is fixed
+# (spec §13.8). check_compromise_fetch verifies that a saved report is
+# internally consistent:
+#   取り込み: 侵害宣言を registry に記録しました (subject <16hex>..., declarant <16chars>...)
+#   更新: 侵害宣言の撤回・復活を反映しました (declarant <16chars>...)
+#   <E> 件のイベントを取得: <S> 件を取り込み、<U> 件を更新、<K> 件をスキップ
+# The subject prefix is the x-only pubkey truncation, so 16 hex chars
+# (case-insensitive — second implementers may print uppercase); the
+# declarant prefix is 16 non-space chars (the reference CLI prints an
+# npub truncation, which is bech32, not hex — so hex is deliberately not
+# required). The number of `取り込み:` lines must equal S, the number of
+# `更新:` lines must equal U, E must equal S + U + K, and the footer
+# must be the last line. Explicitly out of scope: the counts' truth
+# (the relay's event set is the relay's claim — display consistency
+# only), why each event was skipped (invalid Nostr signature, d-tag
+# prefix mismatch, non-JSON content, subject mismatch, duplicate, or
+# invalid declaration signature — the import path's territory),
+# subject/declarant truth (check_compromise's territory), event
+# signature validity (verify_compromise_event's territory), ordering,
+# and stderr notes.
+
+_CF_TAKE = re.compile(
+    r'^取り込み: 侵害宣言を registry に記録しました '
+    r'\(subject ([0-9a-fA-F]{16})\.\.\., declarant (\S{16})\.\.\.\)$')
+_CF_UPDATE = re.compile(
+    r'^更新: 侵害宣言の撤回・復活を反映しました '
+    r'\(declarant (\S{16})\.\.\.\)$')
+_CF_FOOT = re.compile(
+    r'^(\d+) 件のイベントを取得: (\d+) 件を取り込み、(\d+) 件を更新、'
+    r'(\d+) 件をスキップ$')
+
+
+def conform_compromise_fetch_report(text: str):
+    """Verify a saved `nakama.py compromise_fetch` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    m = _CF_FOOT.match(lines[-1])
+    if not m:
+        return False, ['last line: not a compromise_fetch footer line '
+                       '(`<E> 件のイベントを取得: <S> 件を取り込み、'
+                       '<U> 件を更新、<K> 件をスキップ`)'], info
+    e, s, u, k = (int(m.group(i)) for i in range(1, 5))
+    body = lines[:-1]
+    takes = updates = 0
+    for j, ln in enumerate(body):
+        if _CF_TAKE.match(ln):
+            takes += 1
+        elif _CF_UPDATE.match(ln):
+            updates += 1
+        else:
+            errs.append(f'line {j + 1}: does not match the 取り込み/更新 '
+                        'line grammar (`取り込み: 侵害宣言を registry に'
+                        '記録しました (subject <16 hex>..., declarant '
+                        '<16 chars>...)` or `更新: 侵害宣言の撤回・復活を'
+                        '反映しました (declarant <16 chars>...)`)')
+    if takes != s:
+        errs.append(f'footer says {s} stored but {takes} 取り込み '
+                    'lines listed')
+    if updates != u:
+        errs.append(f'footer says {u} updated but {updates} 更新 '
+                    'lines listed')
+    if e != s + u + k:
+        errs.append(f'footer counts do not add up: {e} fetched != '
+                    f'{s} stored + {u} updated + {k} skipped')
+    if not errs:
+        info.append(f'{e} fetched, {s} stored, {u} updated, {k} skipped')
+    return (not errs), errs, info
+
+
+def check_compromise_fetch_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_compromise_fetch_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
 
 def _key() -> tuple[bytes, str]:
     s = secrets.token_bytes(32)
@@ -7326,6 +7426,175 @@ def selftest() -> int:
     print(f'--- rotate-fetch {rtf_total - rtf_fails}/{rtf_total} passed ---')
     fails += rtf_fails
 
+    # ---------- check_compromise_fetch: compromise_fetch report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_compromise_fetch, with nostr_request monkeypatched to return
+    # in-process-signed compromise declarations (no relay contact);
+    # hand-mutated reports that break the fixed display grammar
+    # (spec §13.8) or the take/update/footer count consistency must be
+    # rejected.
+    cf_fails = 0
+    _cf_now = int(time.time())
+
+    def _cf_keyfile(secret, tmpd, name):
+        kf = os.path.join(tmpd, name)
+        with open(kf, 'w') as f:
+            json.dump({'secret_hex': secret.hex()}, f)
+        os.chmod(kf, 0o600)
+        return kf
+
+    def _cf_decl(secret, subject_npub, created_at, withdrawn=False):
+        decl = nakama.build_compromise_declaration(
+            secret, subject_npub, created_at, withdrawn)
+        return nakama.compromise_nostr_event(decl, secret)
+
+    def _cf_run(tmpd, slug, subject_npub, keyfile, events):
+        orig = nakama.nostr_request
+        nakama.nostr_request = lambda *a, **k: events
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                nakama.cmd_compromise_fetch(SimpleNamespace(
+                    relay='wss://example.invalid', npub=subject_npub,
+                    limit=20, auth=False,
+                    registry=os.path.join(tmpd, 'compromises-' + slug),
+                    keyfile=keyfile))
+            return buf.getvalue()
+        finally:
+            nakama.nostr_request = orig
+
+    cf_e2e = []
+    with tempfile.TemporaryDirectory() as tmpd:
+        _csA, _npA = _key()
+        _csB, _npB = _key()
+        _csS, _npS = _key()
+        _csO, _npO = _key()
+        _kf = _cf_keyfile(_csA, tmpd, 'a.json')
+        _ev_ok = _cf_decl(_csA, _npS, _cf_now)
+        _ev_dup = json.loads(json.dumps(_ev_ok))  # same declarant+created_at
+        _ev_badsig = json.loads(json.dumps(_ev_ok))
+        _ev_badsig['sig'] = '00' * 64
+        _ev_withdrawn = _cf_decl(_csA, _npS, _cf_now, withdrawn=True)
+        _ev_subj_mismatch = _cf_decl(_csB, _npO, _cf_now)
+        _ev_subj_mismatch['tags'] = [
+            ['d', f'{nakama.npub_to_hex(_npS)}:{nakama.npub_to_hex(_npB)}']]
+        _hexS = nakama.npub_to_hex(_npS)
+        _cf_takeA = (f'取り込み: 侵害宣言を registry に記録しました '
+                     f'(subject {_hexS[:16]}..., declarant {_npA[:16]}...)\n')
+        _cf_updA = (f'更新: 侵害宣言の撤回・復活を反映しました '
+                    f'(declarant {_npA[:16]}...)\n')
+        _cf_takeB = (f'取り込み: 侵害宣言を registry に記録しました '
+                     f'(subject {_hexS[:16]}..., declarant {_npB[:16]}...)\n')
+        for name, events, exp in (
+                ('1 stored + 1 updated + 3 skipped '
+                 '(bad sig, subject mismatch, duplicate)',
+                 [_ev_ok, _ev_dup, _ev_badsig, _ev_subj_mismatch,
+                  _ev_withdrawn],
+                 _cf_takeA + _cf_updA
+                 + '5 件のイベントを取得: 1 件を取り込み、1 件を更新、'
+                   '3 件をスキップ\n'),
+                ('1 stored, no updates',
+                 [_ev_ok],
+                 _cf_takeA
+                 + '1 件のイベントを取得: 1 件を取り込み、0 件を更新、'
+                   '0 件をスキップ\n'),
+                ('two declarants stored',
+                 [_ev_ok, _cf_decl(_csB, _npS, _cf_now + 1)],
+                 _cf_takeA + _cf_takeB
+                 + '2 件のイベントを取得: 2 件を取り込み、0 件を更新、'
+                   '0 件をスキップ\n'),
+                ('empty events', [],
+                 '0 件のイベントを取得: 0 件を取り込み、0 件を更新、'
+                 '0 件をスキップ\n')):
+            text = _cf_run(tmpd, f'e2e{len(cf_e2e)}', _npS, _kf, events)
+            ok, errs, info = conform_compromise_fetch_report(text)
+            good = ok and text == exp
+            print(f'check_compromise_fetch e2e {name}: '
+                  f'{"PASS" if good else "FAIL"}')
+            for e in errs:
+                print(f'    - {e}')
+            if not good and not errs:
+                print(f'    - stdout mismatch: {text!r} '
+                      f'(expected {exp!r})')
+            cf_fails += 0 if good else 1
+            cf_e2e.append(name)
+
+    _cf_sub1 = 'ab' * 8
+    _cf_np1 = 'npub1' + 'a' * 58
+    _cf_np2 = 'npub1' + 'b' * 58
+    _cf_foot0 = ('0 件のイベントを取得: 0 件を取り込み、0 件を更新、'
+                 '0 件をスキップ')
+    _cf_take1 = (f'取り込み: 侵害宣言を registry に記録しました '
+                 f'(subject {_cf_sub1}..., declarant {_cf_np1[:16]}...)\n')
+    _cf_upd1 = (f'更新: 侵害宣言の撤回・復活を反映しました '
+                f'(declarant {_cf_np1[:16]}...)\n')
+    _cf_foot1 = ('1 件のイベントを取得: 1 件を取り込み、0 件を更新、'
+                 '0 件をスキップ')
+    _cf_foot_tu = ('2 件のイベントを取得: 1 件を取り込み、1 件を更新、'
+                   '0 件をスキップ')
+    cf_pos = [
+        ('empty events',
+         f'{_cf_foot0}\n'),
+        ('one take',
+         f'{_cf_take1}{_cf_foot1}\n'),
+        ('uppercase subject hex',
+         f'{_cf_take1.replace(_cf_sub1, _cf_sub1.upper(), 1)}'
+         f'{_cf_foot1}\n'),
+        ('take + update',
+         f'{_cf_take1}{_cf_upd1}{_cf_foot_tu}\n'),
+        ('two takes consistent',
+         f'{_cf_take1}'
+         f'取り込み: 侵害宣言を registry に記録しました '
+         f'(subject {"cd" * 8}..., declarant {_cf_np2[:16]}...)\n'
+         f'3 件のイベントを取得: 2 件を取り込み、0 件を更新、'
+         f'1 件をスキップ\n'),
+    ]
+    cf_neg = [
+        ('empty text', ''),
+        ('broken footer', _cf_take1 + 'garbage line\n'),
+        ('stray line before footer',
+         'note line\n' + _cf_take1 + _cf_foot1 + '\n'),
+        ('take count != stored',
+         _cf_take1 + _cf_take1 + _cf_foot1 + '\n'),
+        ('update count != updated',
+         _cf_take1 + _cf_upd1 + _cf_foot1 + '\n'),
+        ('counts do not add up',
+         _cf_take1 + '2 件のイベントを取得: 1 件を取り込み、0 件を更新、'
+         '0 件をスキップ\n'),
+        ('subject prefix not hex',
+         _cf_take1.replace(_cf_sub1, 'zz' * 8, 1) + _cf_foot1 + '\n'),
+        ('subject prefix short',
+         _cf_take1.replace(_cf_sub1, 'ab' * 7 + 'a', 1) + _cf_foot1 + '\n'),
+        ('declarant prefix short',
+         _cf_take1.replace(_cf_np1[:16], _cf_np1[:15], 1) + _cf_foot1 + '\n'),
+        ('footer not last', _cf_foot1 + '\ntrailing garbage\n'),
+        ('missing footer', _cf_take1),
+        ('missing ellipsis on subject',
+         _cf_take1.replace(f'{_cf_sub1}...', _cf_sub1, 1) + _cf_foot1 + '\n'),
+        ('blank line inside body',
+         _cf_take1 + '\n' + _cf_foot1 + '\n'),
+    ]
+    for name, rep in cf_pos:
+        ok, errs, info = conform_compromise_fetch_report(rep)
+        good = ok
+        print(f'check_compromise_fetch pos {name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        cf_fails += 0 if good else 1
+    for name, rep in cf_neg:
+        ok, _errs, _info = conform_compromise_fetch_report(rep)
+        good = not ok
+        print(f'check_compromise_fetch neg {name}: '
+              f'{"PASS" if good else "FAIL"}')
+        if not good:
+            print(f'    - report wrongly accepted')
+        cf_fails += 0 if good else 1
+    cf_total = len(cf_e2e) + len(cf_pos) + len(cf_neg)
+    print(f'--- compromise-fetch {cf_total - cf_fails}/{cf_total} passed ---')
+    fails += cf_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -7545,6 +7814,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_rotate_fetch_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_compromise_fetch':
+        if len(argv) < 3:
+            print('usage: conformance.py check_compromise_fetch '
+                  '<report.txt> [...]')
+            return 2
+        return check_compromise_fetch_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -7576,6 +7851,7 @@ def main(argv: list[str]) -> int:
           'check_governance <report.txt> [...] | '
           'check_revoke_fetch <report.txt> [...] | '
           'check_rotate_fetch <report.txt> [...] | '
+          'check_compromise_fetch <report.txt> [...] | '
           'selftest')
     return 2
 

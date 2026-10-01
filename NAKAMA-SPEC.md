@@ -294,6 +294,7 @@ Nostr への publish 系コマンド（`rotate_pub` §17・`revoke_pub` §12・`
 
 - **v0.41**（完了）: conformance チェッカー第 19 弾 `check_dm_fetch`（ローカル出力チェッカー第 4 弾）。`conformance.py` に dm_fetch レポート（§4.1）の一貫性チェッカーを追加: `check_dm_fetch <report1.txt> [...]`（`nakama.py dm_fetch` の stdout 保存テキストの検証: 単一行 `新しい DM はありませんでした` または rumor ごとのブロック — `--- [YYYY-MM-DD HH:MM:SS] from <16 hex>...` のヘッダ行＋本文（1 行以上、複数行・空行可、ブロックは次のヘッダ行で終わる）、日時は暦として有効なもの・送信者 prefix は 16 hex（大文字可）、空コンテンツのブロックは却下。§4.1 に `dm_fetch` の表示文法を固定（時刻は受信者のローカル時刻 — 値・タイムゾーン・順序は checker の対象外）。対象外を明示 — 時刻の値・タイムゾーン（参照実装は localtime 表示）、並び順（参照実装は gift-wrap created_at 順）、送信者 prefix の切詰め意味、DM の到達（§25.2 の主張モデル）、封印の出所（check_dm の管轄）。selftest 17/17（新規: 実 CLI の in-process E2E 3（dm_incoming を monkeypatch、空→空行・1 rumor・2 rumor＋複数行/空行/`--- not a header` 行）＋正常 craft 5（空レポート・1 ブロック・複数行空行あり・大文字 hex・`--- ` で始まる本文行）＋却下 9: 空テキスト・空行＋ブロック混在・無効日時・送信者非 hex・送信者短・`...` 欠落・空コンテンツブロック・先頭ゴミ・先頭空行）、selftest 総計 246/246 PASS、全 21 テストファイル回帰 PASS。
 - **v0.39**（完了）: conformance チェッカー第 17 弾 `check_revoke_list`（ローカル出力チェッカー第 2 弾）。`conformance.py` に revoke_list レポート（§12.4d）の一貫性チェッカーを追加: `check_revoke_list <report1.txt> [...]`（`nakama.py revoke_list` の stdout 保存テキストの検証: 空 registry の単一行または `解消済み bond: N 件` ヘッダ（N ≥ 1）と正確に N 行の行数一致、各行の bond prefix は 16 hex 文字・revoker npub prefix は 16 文字・日付有効、末尾の `理由: ...` は表示専用で無検証。対象外を明示 — 記載 revocation の実在は registry の主張、署名の有効性は check_revocation の管轄）。selftest 17/17（新規: 実 CLI の in-process E2E 4（registry 欠落→空行・reason なし 1 件・reason 付き含む 2 件・有効記録なし registry→空行）＋正常 craft 2（空レポート・reason 付き 2 行）＋却下 11: ヘッダ破損・空レポート・空行＋行・行数不一致・0 行ヘッダ・bond prefix 非 hex・bond prefix 短・revoker prefix 短・無効日付・末尾ゴミ・省略記号欠落）、selftest 総計 210/210 PASS、全 21 テストファイル回帰 PASS。
+- **v0.50**（完了）: conformance チェッカー第 28 弾 `check_compromise_fetch`（ローカル出力チェッカー第 13 弾）。`conformance.py` に compromise_fetch レポート（§13.8）の一貫性チェッカーを追加: `check_compromise_fetch <report1.txt> [...]`（`nakama.py compromise_fetch` の stdout 保存テキストの検証: `取り込み: 侵害宣言を registry に記録しました (subject <16 hex>..., declarant <16 chars>...)` 行＋`更新: 侵害宣言の撤回・復活を反映しました (declarant <16 chars>...)` 行＋フッター `<E> 件のイベントを取得: <S> 件を取り込み、<U> 件を更新、<K> 件をスキップ`。空レポートは単一行フッター）。検証項目: subject prefix は 16 hex（大文字可、参照実装は x-only pubkey 切詰め）・declarant prefix は 16 非空白文字（参照実装は npub 切詰め＝bech32 のため hex 検証なし、§12.4 の revoker と同じ扱い）・`取り込み:` 行数 == S・`更新:` 行数 == U・E == S + U + K・フッターは最終行。対象外を明示 — 件数の真偽（リレーの主張）、スキップ理由の真偽（import パスの管轄）、subject / declarant の真偽（`check_compromise` の管轄）、イベントの署名の有効性（`verify_compromise_event` の管轄）、順序、stderr。§13.8 に compromise_fetch レポートの表示文法を固定。selftest 22/22（新規: 実 CLI の in-process E2E 4（nostr_request を monkeypatch、in-process 署名の侵害宣言イベント — 1 取り込み＋1 更新（withdrawn 再発行）＋Nostr 署名無効・subject 不一致・重複の 3 スキップで `5 件のイベントを取得: 1 件を取り込み、1 件を更新、3 件をスキップ`、1 取り込みのみ、2 宣言者、空イベント、各 stdout 完全一致確認）＋正常 craft 5（空レポート・1 取り込み・大文字 subject hex・取り込み＋更新・2 取り込み）＋却下 13: 空テキスト・フッター破損・先頭ゴミ・取り込み件数不一致・更新件数不一致・件数不一致・subject 非 hex・subject 短・declarant 短・フッター非末尾・フッター欠落・省略記号欠落・本文内空行）、selftest 総計 473/473 PASS、全 21 テストファイル回帰 PASS。
 
 
 ---
@@ -837,6 +838,21 @@ bond スコープの revocation（§5、v0.7）は「この bond を解消する
   7. withdraw: `withdrawn=true` 再発行 → import で上書き、`key_status` が撤回済みを表示
   8. Nostr 構築（オフライン）: kind=30108、`d` タグ = subject_hex:declarant_hex、id／sig 有効
   9. 後方互換: evidence なし旧形式 → 検証 OK
+
+### 13.8 compromise_fetch レポートの表示文法の固定（v0.50 — `check_compromise_fetch` の検証対象）
+
+`compromise_fetch <relay> <npub> [--limit N] [--auth]`（`cmd_compromise_fetch`）の stdout は次の順序に固定:
+
+1. 取り込みごとの行（取り込みが 0 件の場合はこの行は出ない。参照実装は kind 30108 の購読イベントを created_at 昇順で走査し、有効な宣言を 1 件ずつ registry に取り込むたびに出力 — declarant + created_at が既存記録と一致する重複はスキップされ行は出ない）:
+   - `取り込み: 侵害宣言を registry に記録しました (subject <subject の x-only pubkey 先頭 16 hex>..., declarant <declarant npub の先頭 16 文字>...)`
+   - subject prefix は 16 hex（参照実装は `npub_to_hex` の切詰め。第二実装は大文字も可 — checker は大小文字を受理）
+   - declarant は npub（bech32）の切詰め — hex ではないため checker は 16 文字の非空白を要求する（hex 検証はしない、§12.4 の revoker と同じ扱い）
+2. 更新ごとの行（更新が 0 件の場合はこの行は出ない。参照実装は declarant + created_at が既存記録と一致し withdrawn フラグだけが違う宣言（撤回・復活）で registry を上書き更新するたびに出力）:
+   - `更新: 侵害宣言の撤回・復活を反映しました (declarant <declarant npub の先頭 16 文字>...)`
+   - declarant の扱いは 1 と同じ（16 文字の非空白、hex 検証なし）
+3. フッター `<E> 件のイベントを取得: <S> 件を取り込み、<U> 件を更新、<K> 件をスキップ`（E == S + U + K — S は registry に記録された件数、U は withdrawn 更新件数、K は Nostr 署名無効・d タグ prefix 不一致・JSON 破損・subject 不一致・重複・宣言署名無効でスキップされた件数）
+
+checker（`check_compromise_fetch`）は文法と内部演算（`取り込み:` 行数 == S、`更新:` 行数 == U、E == S + U + K、フッターが最終行）のみ検証し、件数の真偽（リレーのイベント集合はリレーの主張 — 表示上の整合性のみ）・スキップ理由の真偽（import パスの管轄）・subject / declarant の真偽（`check_compromise` の管轄）・イベントの署名の有効性（`verify_compromise_event` の管轄）・順序・stderr は検証しない。
 
 ---
 
