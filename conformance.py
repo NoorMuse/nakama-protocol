@@ -692,6 +692,40 @@ and DM delivery/authorship (`check_dm`'s territory).
 reference reports produced in-process by nakama.py's own cmd_dm_fetch
 (offline: dm_incoming monkeypatched, no relay contact).
 
+DM-receive report conformance:
+
+    python3 conformance.py check_dm_recv <report1.txt> [...]
+
+Verifies a saved `nakama.py dm_recv` stdout report is internally
+consistent (spec §4.1.1): either a success report — a sender line
+`from <16 hex>...:` followed by the decrypted rumor's plaintext
+content (one or more lines; the reference CLI calls `print` twice,
+so an empty-content rumor yields the sender line plus one blank
+line — accepted with an "empty content" note) — or a decrypt-failure
+report — exactly one line `DM の復号に失敗しました: <reason>`
+(reason is non-empty free text, exit 1). Checks: the 16-hex sender
+prefix (case-insensitive), the failure line's single-line shape and
+non-empty reason; the failure shape is only valid as the whole
+report (a failure line with extra lines, or a sender line followed
+by a failure line as line 1, is rejected). A content line that
+happens to coincide with the failure line's text is still accepted
+as content — content is free text (the reference CLI prints a rumor
+verbatim), so banning it would reject genuine output.
+Trailing blank lines tolerated. Explicitly out of scope: the rumor
+content's truth and the sender pubkey's truth (the gift wrap's
+territory — `check_dm`), the failure reason's truth (the decrypt
+exception's claim), stderr, and the exit code (invisible in saved
+stdout text). The dm_fetch `--- [datetime] from <16 hex>...` block
+shape (§4.1) is a separate grammar — the two checkers reject each
+other's reports. Use this to prove a second implementation's
+`dm_recv` CLI prints a compatible report.
+
+`python3 conformance.py selftest` also covers
+`check_dm_recv` with reports produced in-process by
+nakama.py's own `cmd_dm_recv` (offline: real key pairs, in-process
+NIP-44 seal/gift-wrap, temp keyfile + temp giftwrap file — valid,
+multi-line, and tampered-signature failure cases).
+
 Board-read report conformance:
 
     python3 conformance.py check_board_read <report1.txt> [...]
@@ -3708,6 +3742,83 @@ def check_dm_fetch_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_dm_fetch_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_dm_recv: dm_recv report consistency ----------
+
+# A saved `nakama.py dm_recv` stdout report. Its grammar is fixed
+# (spec §4.1.1). check_dm_recv verifies that the report is internally
+# consistent. Two mutually exclusive shapes:
+#   success:  from <16 hex>...:            (sender line, line 1)
+#             <rumor content line 1>
+#             [<content line 2> ...]        (multi-line / blank lines ok;
+#              an empty-content rumor prints the sender line plus one
+#              blank line — accepted, noted as 'empty content')
+#   failure:  DM の復号に失敗しました: <reason>   (exactly one line;
+#              reason is the decrypt exception's message, non-empty)
+# The sender prefix is 16 hex chars (case-insensitive) — the rumor
+# pubkey's truncation. Explicitly out of scope: the rumor content's
+# truth and the sender pubkey's truth (the gift wrap's territory:
+# check_dm), the failure reason's truth (the decrypt exception's
+# claim), stderr, and the exit code (invisible in saved stdout text).
+# The dm_fetch block header `--- [datetime] from <16 hex>...` (§4.1)
+# is a different grammar and is rejected (the two checkers reject
+# each other's reports).
+
+_RE_DR_HEADER = re.compile(r'^from ([0-9a-fA-F]{16})\.\.\.:$')
+_RE_DR_FAIL = re.compile(r'^DM の復号に失敗しました: (.+)$')
+
+
+def conform_dm_recv_report(text: str):
+    """Verify a saved `nakama.py dm_recv` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if _RE_DR_FAIL.match(lines[0]):
+        if len(lines) != 1:
+            return False, ['decrypt-failure report must be a single '
+                           f'line, found {len(lines)} lines'], info
+        info.append('decrypt failure')
+        return True, errs, info
+    m = _RE_DR_HEADER.match(lines[0])
+    if not m:
+        return False, ['line 1: not a dm_recv sender line '
+                       '(`from <16 hex>...:`) and not a decrypt-failure '
+                       'line'], info
+    sender = m.group(1)
+    if len(lines) == 1:
+        info.append(f'empty content (sender {sender}…)')
+    else:
+        info.append(f'sender {sender}…, '
+                    f'{len(lines) - 1} content line(s)')
+    return (not errs), errs, info
+
+
+def check_dm_recv_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_dm_recv_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -7169,6 +7280,127 @@ def selftest() -> int:
     print(f'--- dm-fetch {dmf_total - dmf_fails}/{dmf_total} passed ---')
     fails += dmf_fails
 
+    # ---------- check_dm_recv: dm_recv report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_dm_recv (offline: real key pairs, in-process NIP-44
+    # seal/gift-wrap written to a temp file, receiver keyfile on disk —
+    # no relay contact); hand-mutated reports that break the sender-line
+    # or decrypt-failure-line grammar must be rejected.
+    dmr_fails = 0
+    _dmr_s_a, _dmr_npub_a = _key()  # sender
+    _dmr_s_b, _dmr_npub_b = _key()  # receiver
+    _dmr_recv_hex = nakama.hexpub_of(_dmr_s_b)
+    _dmr_send_hex = nakama.hexpub_of(_dmr_s_a)
+
+    def _dmr_recv(tmpd, content, tamper=False):
+        kf = os.path.join(tmpd, 'recv-key.json')
+        nakama.save_key(kf, _dmr_s_b)
+        seal = nakama.nip17_build_seal(_dmr_s_a, _dmr_recv_hex, content)
+        wrap = nakama.nip17_build_gift_wrap(seal, _dmr_recv_hex)
+        if tamper:
+            wrap = json.loads(json.dumps(wrap))
+            wrap['sig'] = '00' * 64
+        gw = os.path.join(tmpd, 'giftwrap.json')
+        with open(gw, 'w') as f:
+            json.dump(wrap, f)
+        buf = io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                nakama.cmd_dm_recv(SimpleNamespace(giftwrap=gw,
+                                                    keyfile=kf))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        return buf.getvalue(), code
+
+    with tempfile.TemporaryDirectory() as _dmr_tmpd:
+        _dmr_e2e = []
+        _rep, _code = _dmr_recv(_dmr_tmpd, 'hello, nakama')
+        _dmr_e2e.append(('one-line content', _rep, _code, 0,
+                         f'from {_dmr_send_hex[:16]}...:\n'
+                         'hello, nakama\n'))
+        _rep, _code = _dmr_recv(_dmr_tmpd,
+                                'line one\n\nline three\n--- not a header')
+        _dmr_e2e.append(('multi-line incl. blank', _rep, _code, 0,
+                         f'from {_dmr_send_hex[:16]}...:\n'
+                         'line one\n\nline three\n--- not a header\n'))
+        _rep, _code = _dmr_recv(_dmr_tmpd, 'tampered', tamper=True)
+        _dmr_e2e.append(('decrypt failure', _rep, _code, 1,
+                         'DM の復号に失敗しました: '
+                         'gift wrap の署名が無効です\n'))
+    for name, rep, code, want_code, want_rep in _dmr_e2e:
+        exact = (rep == want_rep) and (code == want_code)
+        ok, errs, info = conform_dm_recv_report(rep)
+        good = exact and ok
+        print(f'dm-recv-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({ "; ".join(info) })')
+        if not good:
+            if not exact:
+                print(f'    - stdout/exit mismatch: {rep!r} code={code}')
+            for e in errs:
+                print(f'    - {e}')
+            dmr_fails += 1
+
+    # hand-crafted positives
+    dh_dr = 'from ' + 'ab' * 8 + '...:'
+    dh_dr_up = 'from ' + 'CD' * 8 + '...:'
+    dmr_pos = [
+        ('one-line content', dh_dr + '\nhello\n'),
+        ('multi-line incl. blank', dh_dr + '\nline one\n\nline three\n'),
+        ('uppercase hex sender', dh_dr_up + '\nupper hex ok\n'),
+        ('failure line', 'DM の復号に失敗しました: '
+                         'gift wrap の署名が無効です\n'),
+        ('no trailing newline', dh_dr + '\nhello'),
+        ('trailing blanks', dh_dr + '\nhello\n\n  \n'),
+        ('empty content', dh_dr + '\n\n'),
+        ('sender line + failure-line-like content', dh_dr + '\n'
+         'DM の復号に失敗しました: boom\n'),
+    ]
+    for name, rep in dmr_pos:
+        ok, errs, info = conform_dm_recv_report(rep)
+        print(f'dm-recv/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        dmr_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    dmr_neg = []
+    dmr_neg.append(('empty report', ''))
+    dmr_neg.append(('garbage first line', 'hello\n' + dh_dr + '\ncontent\n'))
+    dmr_neg.append(('sender not hex',
+                    'from ' + 'zz' * 8 + '...:\nhello\n'))
+    dmr_neg.append(('sender short',
+                    'from ' + 'ab' * 7 + '...:\nhello\n'))
+    dmr_neg.append(('missing ellipsis', 'from ' + 'ab' * 8 + ':\nhello\n'))
+    dmr_neg.append(('missing colon', 'from ' + 'ab' * 8 + '...\nhello\n'))
+    dmr_neg.append(('failure line with empty reason',
+                    'DM の復号に失敗しました: \n'))
+    dmr_neg.append(('failure line plus extra line',
+                    'DM の復号に失敗しました: boom\nmore\n'))
+    dmr_neg.append(('failure line followed by sender line',
+                    'DM の復号に失敗しました: boom\n' + dh_dr + '\n'))
+    dmr_neg.append(('two failure lines',
+                    'DM の復号に失敗しました: a\n'
+                    'DM の復号に失敗しました: b\n'))
+    dmr_neg.append(('dm_fetch header line',
+                    '--- [2026-10-01 12:00:00] from ' + 'ab' * 8 +
+                    '...\nhello\n'))
+    dmr_neg.append(('leading blank line', '\n' + dh_dr + '\nhello\n'))
+
+    for name, rep in dmr_neg:
+        ok, errs, info = conform_dm_recv_report(rep)
+        good = not ok
+        print(f'dm-recv-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            dmr_fails += 1
+
+    dmr_total = len(_dmr_e2e) + len(dmr_pos) + len(dmr_neg)
+    print(f'--- dm-recv {dmr_total - dmr_fails}/{dmr_total} passed ---')
+    fails += dmr_fails
+
     # ---------- check_board_read: board_read report consistency ----------
     # Reference reports are produced in-process with nakama.py's own
     # cmd_board_read, with nostr_request monkeypatched to return crafted
@@ -10475,7 +10707,7 @@ def selftest() -> int:
         + bfa_total + pub_total + gov_total + rf_total + rtf_total \
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
         + bj_total + bs_total + bc_total + vbd_total + bvr_total \
-        + bdc_total + bcs_total
+        + bdc_total + bcs_total + dmr_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -10764,6 +10996,11 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_board_cosign_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_dm_recv':
+        if len(argv) < 3:
+            print('usage: conformance.py check_dm_recv <report.txt> [...]')
+            return 2
+        return check_dm_recv_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -10808,6 +11045,7 @@ def main(argv: list[str]) -> int:
           'check_board_verify <report.txt> [...] | '
           'check_board_decide <report.txt> [...] | '
           'check_board_cosign <report.txt> [...] | '
+          'check_dm_recv <report.txt> [...] | '
           'selftest')
     return 2
 
