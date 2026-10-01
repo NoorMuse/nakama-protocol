@@ -109,6 +109,10 @@ signature over the canonical compromise message, withdrawn
 semantics). Passing `check_rotation` on your rotation files
 proves rotation-certificate wire compatibility (old-key signature
 over the canonical rotation message; self-rotations rejected).
+Passing `check_unbinding` on your unbinding files proves
+unbinding-certificate wire compatibility (key-holder signature
+over the canonical unbinding message, including the signed
+binding_created_at scope semantics).
 
 Platform-binding certificate conformance:
 
@@ -212,6 +216,28 @@ wire-compatible with the reference implementation.
 
 `python3 conformance.py selftest` also covers `check_revocation`
 with reference events built by nakama.py's own primitives.
+
+Unbinding certificate conformance:
+
+    python3 conformance.py check_unbinding <unbinding1.json> [...]
+
+Verifies each file is an unbinding certificate as written by
+`unbind` (the claim "key X withdraws its claim to hold handle H
+on platform P", spec §9.1): shape checks (protocol/version/type,
+platform, handle, npub, binding_created_at int, reason string,
+created_at int, sig) plus the key-holder's Schnorr signature over
+unbinding_message(platform, handle, npub, binding_created_at,
+reason, created_at), mirroring the reference
+`verify_unbinding_cert` acceptance rule. The scope is signed:
+binding_created_at=0 withdraws every binding to the handle,
+otherwise only bindings at or before that timestamp. Posting the
+unbinding from the handle's own account (the handle→key
+direction) is an operational step outside wire compatibility. Use
+this to prove a second implementation's unbinding certificates
+are wire-compatible with the reference implementation.
+
+`python3 conformance.py selftest` also covers `check_unbinding`
+with reference certificates built by nakama.py's own primitives.
 """
 
 import json
@@ -830,6 +856,111 @@ def check_binding_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_binding(b)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_unbinding: unbinding certificate conformance ----------
+
+def conform_unbinding(u: dict):
+    """Verify an unbinding certificate as written by `unbind`
+    (spec §9.1): the claim "key X withdraws its claim to hold handle
+    H on platform P" (binding_created_at=0 withdraws every binding
+    to that handle; otherwise only bindings created at or before
+    that timestamp).
+
+    Shape checks (protocol/version/type, platform and handle as
+    non-empty strings, npub valid, binding_created_at int,
+    reason a string — may be empty, created_at int, sig 128 hex)
+    plus the key-holder's Schnorr signature over
+    unbinding_message(platform, handle, npub, binding_created_at,
+    reason, created_at) — same acceptance rule as the reference
+    `verify_unbinding_cert`. Posting the unbinding from the handle's
+    own account (handle→key direction) is operational and out of
+    scope — wire compatibility only. Returns (ok, errs, info).
+    """
+    errs: list[str] = []
+    info: list[str] = []
+    if not isinstance(u, dict):
+        return False, ['unbinding is not a JSON object'], info
+    if u.get('protocol') != 'nakama':
+        errs.append('protocol != "nakama"')
+    if u.get('version') != 1:
+        errs.append('version != 1')
+    if u.get('type') != 'platform-binding-revocation':
+        errs.append('type != "platform-binding-revocation"')
+    shape_ok = True
+    if not isinstance(u.get('platform'), str) or not u['platform'].strip():
+        errs.append('platform must be a non-empty string')
+        shape_ok = False
+    if not isinstance(u.get('handle'), str) or not u['handle'].strip():
+        errs.append('handle must be a non-empty string')
+        shape_ok = False
+    npub = u.get('npub')
+    if not isinstance(npub, str) or nakama.npub_to_hex(npub) is None:
+        errs.append('npub must be a valid npub')
+        shape_ok = False
+    bca = u.get('binding_created_at')
+    if not isinstance(bca, int) or isinstance(bca, bool):
+        errs.append('binding_created_at must be an int')
+        shape_ok = False
+    reason = u.get('reason')
+    if not isinstance(reason, str):
+        errs.append('reason must be a string')
+        shape_ok = False
+    if not isinstance(u.get('created_at'), int) \
+            or isinstance(u.get('created_at'), bool):
+        errs.append('created_at must be an int')
+        shape_ok = False
+    sig_hex = u.get('sig')
+    sig_b = None
+    if not isinstance(sig_hex, str):
+        errs.append('sig must be a 128-hex-char string')
+        shape_ok = False
+    else:
+        try:
+            sig_b = bytes.fromhex(sig_hex)
+            if len(sig_b) != 64:
+                raise ValueError
+        except ValueError:
+            errs.append('sig must be 128 hex chars (64 bytes)')
+            sig_b = None
+            shape_ok = False
+    if shape_ok:
+        try:
+            msg = nakama.unbinding_message(u['platform'], u['handle'],
+                                           npub, int(bca), reason,
+                                           int(u['created_at']))
+            if not nakama.verify_schnorr(npub, sig_b, msg):
+                errs.append('invalid signature over '
+                            'unbinding_message(platform, handle, npub, '
+                            'binding_created_at, reason, created_at)')
+        except Exception as e:
+            errs.append(f'signature check failed: {e}')
+    info.append(f"{u.get('platform', '?')}:{u.get('handle', '?')}")
+    if shape_ok:
+        scope = 'all' if int(bca) == 0 else f'binding_created_at<={bca}'
+        info.append(f'scope {scope}')
+    return (len(errs) == 0), errs, info
+
+
+def check_unbinding_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            u = json.load(open(p))
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_unbinding(u)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -1968,8 +2099,104 @@ def selftest() -> int:
     print(f'--- revocation {rv_total - rv_fails}/{rv_total} passed ---')
     fails += rv_fails
 
+    # Unbinding certificate conformance: reference unbindings built
+    # with nakama.py's unbinding_message must verify; malformed,
+    # re-scoped, and wrong-type ones must be rejected. The
+    # binding_created_at scope (0 = withdraw every binding to the
+    # handle, otherwise only bindings at or before that timestamp)
+    # is signed, so changing it must break the signature.
+    ub_fails = 0
+    s_l, np_l = _key()
+    ub_now = int(time.time())
+    ub_msg = nakama.unbinding_message('moltbook', 'alice_test', np_l,
+                                      0, '', ub_now)
+    unbinding = {
+        'protocol': 'nakama', 'version': 1,
+        'type': 'platform-binding-revocation',
+        'platform': 'moltbook', 'handle': 'alice_test', 'npub': np_l,
+        'binding_created_at': 0, 'reason': '',
+        'created_at': ub_now,
+        'sig': nakama.sign_schnorr(s_l, ub_msg).hex(),
+    }
+    ub_scoped_ca = ub_now - 86400
+    ub_scoped_msg = nakama.unbinding_message(
+        'moltbook', 'alice_test', np_l, ub_scoped_ca, 'handle moved',
+        ub_now)
+    ub_scoped = {
+        'protocol': 'nakama', 'version': 1,
+        'type': 'platform-binding-revocation',
+        'platform': 'moltbook', 'handle': 'alice_test', 'npub': np_l,
+        'binding_created_at': ub_scoped_ca, 'reason': 'handle moved',
+        'created_at': ub_now,
+        'sig': nakama.sign_schnorr(s_l, ub_scoped_msg).hex(),
+    }
+    ub_extra = json.loads(json.dumps(unbinding))
+    ub_extra['note'] = 'extra unknown field tolerated'
+
+    ub_pos = [('valid unbinding (scope: all bindings)', unbinding),
+              ('valid scoped unbinding with reason', ub_scoped),
+              ('valid unbinding with extra field', ub_extra)]
+    for name, uu in ub_pos:
+        ok, errs, info = conform_unbinding(uu)
+        print(f'unbinding/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        ub_fails += 0 if ok else 1
+
+    ub_neg = []
+    bad_sig = json.loads(json.dumps(unbinding))
+    bad_sig['sig'] = '00' * 128
+    ub_neg.append(('tampered signature', bad_sig))
+    bad_handle = json.loads(json.dumps(unbinding))
+    bad_handle['handle'] = 'mallory_test'
+    ub_neg.append(('handle mismatch (sig no longer matches)',
+                   bad_handle))
+    bad_platform = json.loads(json.dumps(unbinding))
+    bad_platform['platform'] = 'othernet'
+    ub_neg.append(('platform mismatch (sig no longer matches)',
+                   bad_platform))
+    bad_bca = json.loads(json.dumps(ub_scoped))
+    bad_bca['binding_created_at'] = ub_scoped_ca - 1
+    ub_neg.append(('binding_created_at changed after signing',
+                   bad_bca))
+    bad_reason = json.loads(json.dumps(ub_scoped))
+    bad_reason['reason'] = 'handle hijacked'
+    ub_neg.append(('reason changed after signing', bad_reason))
+    bad_type = json.loads(json.dumps(unbinding))
+    bad_type['type'] = 'platform-binding'
+    ub_neg.append(('wrong type', bad_type))
+    bad_npub = json.loads(json.dumps(unbinding))
+    bad_npub['npub'] = 'npub1invalid'
+    ub_neg.append(('invalid npub', bad_npub))
+    bad_bca_type = json.loads(json.dumps(unbinding))
+    bad_bca_type['binding_created_at'] = '0'
+    ub_neg.append(('binding_created_at not an int', bad_bca_type))
+    bad_reason_type = json.loads(json.dumps(unbinding))
+    bad_reason_type['reason'] = 0
+    ub_neg.append(('reason not a string', bad_reason_type))
+    bad_ca = json.loads(json.dumps(unbinding))
+    bad_ca['created_at'] = 'not-a-time'
+    ub_neg.append(('created_at not an int', bad_ca))
+    no_sig = json.loads(json.dumps(unbinding))
+    del no_sig['sig']
+    ub_neg.append(('missing sig', no_sig))
+
+    for name, uu in ub_neg:
+        ok, errs, info = conform_unbinding(uu)
+        good = not ok
+        print(f'unbinding-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            ub_fails += 1
+
+    ub_total = len(ub_pos) + len(ub_neg)
+    print(f'--- unbinding {ub_total - ub_fails}/{ub_total} passed ---')
+    fails += ub_fails
+
     grand = total + dm_total + board_total + dec_total + bond_total \
-        + binding_total + live_total + cp_total + rt_total + rv_total
+        + binding_total + live_total + cp_total + rt_total + rv_total \
+        + ub_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -2015,6 +2242,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_binding <binding.json> [...]')
             return 2
         return check_binding_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_unbinding':
+        if len(argv) < 3:
+            print('usage: conformance.py check_unbinding <unbinding.json> [...]')
+            return 2
+        return check_unbinding_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_liveness':
         bond_path = None
         max_age = 7 * 86400
@@ -2068,6 +2300,7 @@ def main(argv: list[str]) -> int:
           'check_decision [--policy policy.json] <decision.json> [...] | '
           'check_bond <bond.json> [...] | '
           'check_binding <binding.json> [...] | '
+          'check_unbinding <unbinding.json> [...] | '
           'check_liveness [--bond bond.json] [--max-age secs] [--now unixts] '
           '<liveness.json> [...] | '
           'check_compromise <decl.json> [...] | '
