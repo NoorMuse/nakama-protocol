@@ -273,6 +273,65 @@ def main():
         n.nostr_request, n.nostr_publish = real_req, real_pub
     ok('8: 不一致の --from → 拒否（exit 1、送信せず）。一致なら送信')
 
+    # 9. 送信記録に gift_wrap_id / rumor_id が保存される（spec §28.2）
+    d9 = draft_within()
+    ev9 = pub_draft_event(d9, issuer[0])
+    n.nostr_request = lambda url, req, **k: [ev9]
+    wraps9 = []
+    n.nostr_publish = lambda relay, ev, **k: (wraps9.append(ev), (True, 'ok'))[1]
+    real_build_seal = n.nip17_build_seal
+    seals9 = []
+
+    def spy_seal(secret, recipient_hexpub, plaintext, **kw):
+        seal = real_build_seal(secret, recipient_hexpub, plaintext, **kw)
+        seals9.append(seal)
+        return seal
+
+    n.nip17_build_seal = spy_seal
+    try:
+        nd = os.path.join(tmpd, 'n9')
+        ns = notify_ns(kf, nd)
+        code, _, _ = run_cmd(n.cmd_board_draft_notify, ns)
+        assert code == 0 and len(wraps9) == 1 and len(seals9) == 1
+        core9 = n.decision_core_hash(d9)
+        rec9 = n.draft_notif_read_record(nd, core9, 'expiring_soon')
+        assert rec9 is not None, '記録が読み込める'
+        assert rec9['gift_wrap_id'] == wraps9[0]['id'], 'kind 1059 の id'
+        assert rec9['rumor_id'] == seals9[0]['id'], 'seal（kind 14）の id'
+        assert rec9['core_hash'] == core9 and rec9['recipient_hex'] == issuer[2]
+        # 存在しない記録 → None、壊れた JSON → None
+        assert n.draft_notif_read_record(nd, 'f' * 64, 'expiring_soon') is None
+        bad = os.path.join(nd, f'{"0" * 64}:expiring_soon.json')
+        with open(bad, 'w') as f:
+            f.write('not json')
+        assert n.draft_notif_read_record(nd, '0' * 64, 'expiring_soon') is None
+    finally:
+        n.nostr_request, n.nostr_publish = real_req, real_pub
+        n.nip17_build_seal = real_build_seal
+    ok('9: 送信記録に gift_wrap_id / rumor_id を保存、読み込みは後方互換の Reader')
+
+    # 10. 旧形式の記録（gift_wrap_id / rumor_id なし）は空文字として読む（後方互換）
+    try:
+        nd = os.path.join(tmpd, 'n10')
+        os.makedirs(nd, exist_ok=True)
+        core10 = 'a' * 64
+        old_rec = {'core_hash': core10, 'reason': 'expiring_soon',
+                   'recipient_hex': issuer[2], 'sender_npub': sender[1],
+                   'sent_at': now}
+        with open(os.path.join(nd, f'{core10}:expiring_soon.json'), 'w') as f:
+            json.dump(old_rec, f)
+        rec10 = n.draft_notif_read_record(nd, core10, 'expiring_soon')
+        assert rec10 is not None, '旧形式も読み込む'
+        assert rec10['gift_wrap_id'] == '' and rec10['rumor_id'] == '', \
+            '欠落フィールドは空文字'
+        assert n.draft_notif_already_sent(nd, core10, 'expiring_soon', now,
+                                          86400), '旧形式の記録でも二重送信防止'
+        assert not n.draft_notif_already_sent(nd, core10, 'expired', now,
+                                              86400), 'reason が違えば対象外'
+    finally:
+        pass
+    ok('10: 旧形式記録の後方互換（gift_wrap_id / rumor_id は空文字、重送防止は継続）')
+
     print(f'\n{len(passed)} tests passed.')
 
 

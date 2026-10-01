@@ -2985,33 +2985,52 @@ def draft_notif_record_path(notif_dir, core, reason, recipient_hex=None):
     return os.path.join(notif_dir, f'{name}.json')
 
 
-def draft_notif_already_sent(notif_dir, core, reason, now, within,
-                             recipient_hex=None):
-    """同一草案・同一 reason（--cosigners 時は同一宛先も）の送信記録が
-    --within 以内にあれば True（I/O のみ）。
-    記録なし・壊れた記録・記録が古ければ False（＝送ってよい）。"""
+def draft_notif_read_record(notif_dir, core, reason, recipient_hex=None):
+    """送信記録を読み込む（spec §28.2）。
+
+    旧形式の記録（gift_wrap_id / rumor_id なし）も読み飛ばさず読み込み、
+    欠けているフィールドは空文字として扱う（後方互換）。ファイルなし・
+    壊れた JSON のときは None。"""
     try:
         with open(draft_notif_record_path(notif_dir, core, reason,
                                           recipient_hex)) as f:
             rec = json.load(f)
     except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    rec.setdefault('gift_wrap_id', '')
+    rec.setdefault('rumor_id', '')
+    return rec
+
+
+def draft_notif_already_sent(notif_dir, core, reason, now, within,
+                             recipient_hex=None):
+    """同一草案・同一 reason（--cosigners 時は同一宛先も）の送信記録が
+    --within 以内にあれば True（I/O のみ）。
+    記録なし・壊れた記録・記録が古ければ False（＝送ってよい）。"""
+    rec = draft_notif_read_record(notif_dir, core, reason, recipient_hex)
+    if rec is None:
         return False
     sent_at = rec.get('sent_at')
     return isinstance(sent_at, int) and (now - sent_at) < within
 
 
 def draft_notif_record(notif_dir, core, reason, recipient_hex, sender_npub, now,
-                       recipient_file=False):
+                       recipient_file=False, gift_wrap_id='', rumor_id=''):
     """送信記録を保存（送信時刻・宛先・送信者の npub）。通知は主張であり到達の
     証明ではない — 受け手は board_draft_fetch で自分で確認する（§25.2）。
-    recipient_file=True のときは宛先ごとに別記録（§27.1 の --cosigners 用）。"""
+    recipient_file=True のときは宛先ごとに別記録（§27.1 の --cosigners 用）。
+    gift_wrap_id（kind 1059 の id）・rumor_id（seal = kind 14 の id）は
+    §28.2 の追加 — board_notif_status の突き合わせ用。--dry-run 時は記録しない。"""
     os.makedirs(notif_dir, exist_ok=True)
     path = draft_notif_record_path(notif_dir, core, reason,
                                    recipient_hex if recipient_file else None)
     with open(path, 'w') as f:
         json.dump({'core_hash': core, 'reason': reason,
                    'recipient_hex': recipient_hex,
-                   'sender_npub': sender_npub, 'sent_at': now},
+                   'sender_npub': sender_npub, 'sent_at': now,
+                   'gift_wrap_id': gift_wrap_id, 'rumor_id': rumor_id},
                   f, indent=2, ensure_ascii=False)
 
 
@@ -3114,7 +3133,8 @@ def cmd_board_draft_notify(args):
             print(f'publish 拒否 ({tag}): {r}', file=sys.stderr)
             failed += 1
             continue
-        draft_notif_record(notif_dir, core, reason, publisher_hex, sender_npub, now)
+        draft_notif_record(notif_dir, core, reason, publisher_hex, sender_npub, now,
+                           gift_wrap_id=wrap['id'], rumor_id=seal['id'])
         print(f'[sent] {tag} → {publisher_hex[:16]}... (id={wrap["id"]})')
     # --- v0.24: 承認者への草案通知 (spec §27: --cosigners) ---
     for core, d, recipient_hex, reason in cosigner_targets:
@@ -3144,7 +3164,8 @@ def cmd_board_draft_notify(args):
             failed += 1
             continue
         draft_notif_record(notif_dir, core, reason, recipient_hex,
-                           sender_npub, now, recipient_file=True)
+                           sender_npub, now, recipient_file=True,
+                           gift_wrap_id=wrap['id'], rumor_id=seal['id'])
         print(f'[sent] cosigner {tag} → {recipient_hex[:16]}... (id={wrap["id"]})')
     if failed:
         sys.exit(1)
