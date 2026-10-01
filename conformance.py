@@ -4845,6 +4845,76 @@ def check_accept_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_challenge: challenge report consistency ----------
+
+# `nakama.py challenge [<npub>] [--to <npub>]` prints a one-line report to
+# stdout whose grammar is fixed (spec §3.1): the 32-byte random nonce as
+# 64 lowercase hex chars (`secrets.token_hex(32)`):
+#   <64 lowercase hex>
+# check_challenge verifies that a saved report is internally consistent:
+# exactly one line, exactly 64 lowercase hex chars. Trailing blank lines
+# are tolerated; a leading blank line is rejected. There is no internal
+# arithmetic to check — a nonce has no derivable fields.
+# Note: `respond`'s report is grammatically identical — a single line of
+# 64 lowercase hex (the Schnorr signature over the nonce). The two reports
+# cannot be distinguished by grammar alone, so check_challenge does NOT
+# reject respond reports (unlike e.g. the propose/accept pair, which do
+# reject each other). `check`'s reports (`本人です 🤝` / `検証失敗`) are a
+# different grammar and are naturally rejected.
+# Explicitly out of scope: the nonce's freshness and randomness (a
+# cryptographic claim — the checker sees only the saved text), whether
+# the line came from `challenge` or `respond`, the `--to` compromise
+# warnings (§14.2 — stderr), and the exit code (invisible in saved stdout
+# text). Use this to prove a second implementation's `challenge` CLI
+# prints a compatible nonce report.
+
+_RE_CHAL = re.compile(r'^[0-9a-f]{64}$')
+
+
+def conform_challenge_report(text: str):
+    """Verify a saved `nakama.py challenge` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    if len(lines) != 1:
+        return False, [f'report must be a single nonce line, '
+                       f'found {len(lines)} lines'], info
+    if not _RE_CHAL.match(lines[0]):
+        return False, ['line 1: not a 64-char lowercase hex nonce '
+                       '(`secrets.token_hex(32)`)'], info
+    info.append(f'nonce {lines[0][:16]}…')
+    return True, errs, info
+
+
+def check_challenge_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_challenge_report(text)
+        if ok:
+            print(f'{p}: PASS ("{"; ".join(info)}")')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- check_pub: publish-result line consistency ----------
 
 # Every Nostr publish command (rotate_pub, revoke_pub, compromise_pub,
@@ -9685,6 +9755,95 @@ def selftest() -> int:
     print(f'--- accept {ac_total - ac_fails}/{ac_total} passed ---')
     fails += ac_fails
 
+    # ---------- check_challenge: challenge report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_challenge (no relay contact — it only draws 32 random bytes);
+    # hand-mutated reports that break the single-line 64-hex grammar must
+    # be rejected.
+    ch_fails = 0
+
+    def _ch_run(tmpd, to=None):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            nakama.cmd_challenge(SimpleNamespace(
+                to=to, compromise_registry=tmpd))
+        return buf.getvalue()
+
+    _ch_e2e = []
+    with tempfile.TemporaryDirectory() as _ch_td:
+        _rep = _ch_run(_ch_td)
+        _ch_e2e.append(('plain', _rep))
+        # --to with an empty compromise registry: §14.2's stderr warnings
+        # are separated off, the stdout report shape is unchanged.
+        _npub = nakama.hex_to_npub('ab' * 32)
+        _rep = _ch_run(_ch_td, to=_npub)
+        _ch_e2e.append(('--to, no warnings', _rep))
+    for _name, _rep in _ch_e2e:
+        _exact = re.fullmatch(r'[0-9a-f]{64}\n', _rep) is not None
+        _ok, _errs, _info = conform_challenge_report(_rep)
+        _good = _exact and _ok
+        print(f'challenge-e2e/{_name}: '
+              f'{"PASS" if _good else "FAIL"} ("{"; ".join(_info)}")')
+        if not _good:
+            if not _exact:
+                print(f'    - stdout shape mismatch: {_rep!r}')
+            for _e in _errs:
+                print(f'    - {_e}')
+            ch_fails += 1
+
+    # hand-crafted positives
+    _cnonce = 'ab' * 32  # 64 lowercase hex
+    ch_pos = [
+        ('minimal', f'{_cnonce}\n'),
+        ('no trailing newline', _cnonce),
+        ('trailing blanks', f'{_cnonce}\n\n\n'),
+        ('all zeros', '00' * 32 + '\n'),
+        ('all f', 'ff' * 32 + '\n'),
+        # a respond report is grammatically identical (64 hex signature) —
+        # check_challenge cannot and must not reject it
+        ('respond-shaped report (indistinguishable)',
+         'cd' * 32 + '\n'),
+    ]
+    for _name, _rep in ch_pos:
+        _ok, _errs, _info = conform_challenge_report(_rep)
+        print(f'challenge-pos/{_name}: '
+              f'{"PASS" if _ok else "FAIL"} ("{"; ".join(_info)}")')
+        if not _ok:
+            for _e in _errs:
+                print(f'    - {_e}')
+            ch_fails += 1
+
+    # hand-crafted negatives (must be rejected)
+    ch_neg = [
+        ('empty', ''),
+        ('garbage', 'hello\n'),
+        ('too short (63)', 'ab' * 31 + 'a' + '\n'),
+        ('too long (65)', 'ab' * 32 + 'a' + '\n'),
+        ('uppercase hex', 'AB' * 32 + '\n'),
+        ('mixed case', 'aB' * 32 + '\n'),
+        ('non-hex char', 'ab' * 31 + 'zz' + '\n'),
+        ('inner whitespace', 'ab' * 16 + ' ' + 'ab' * 16 + '\n'),
+        ('0x prefix', '0x' + 'ab' * 32 + '\n'),
+        ('two reports concatenated', f'{_cnonce}\n{_cnonce}\n'),
+        ('leading blank', f'\n{_cnonce}\n'),
+        ('trailing junk line', f'{_cnonce}\nextra\n'),
+        # check's reports are a different grammar — rejected
+        ('check success report', '本人です 🤝\n'),
+        ('check failure report', '検証失敗\n'),
+    ]
+    for _name, _rep in ch_neg:
+        _ok, _errs, _info = conform_challenge_report(_rep)
+        _good = not _ok
+        print(f'challenge-neg/{_name}: '
+              f'{"PASS (rejected)" if _good else "FAIL (accepted!)"}')
+        if not _good:
+            ch_fails += 1
+
+    ch_total = len(_ch_e2e) + len(ch_pos) + len(ch_neg)
+    print(f'--- challenge {ch_total - ch_fails}/{ch_total} passed ---')
+    fails += ch_fails
+
     # ---------- check_board_read: board_read report consistency ----------
     # Reference reports are produced in-process with nakama.py's own
     # cmd_board_read, with nostr_request monkeypatched to return crafted
@@ -12992,7 +13151,8 @@ def selftest() -> int:
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
         + bj_total + bs_total + bc_total + vbd_total + bvr_total \
         + bdc_total + bcs_total + dmr_total + vrt_total + bpl_total \
-        + bps_total + vbp_total + vrf_total + pr_total + ac_total
+        + bps_total + vbp_total + vrf_total + pr_total + ac_total \
+        + ch_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -13325,6 +13485,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_accept <report.txt> [...]')
             return 2
         return check_accept_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_challenge':
+        if len(argv) < 3:
+            print('usage: conformance.py check_challenge <report.txt> [...]')
+            return 2
+        return check_challenge_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
