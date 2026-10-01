@@ -21,8 +21,23 @@ wrong kind, wrong d-tag) that must be rejected.
 
 Exit code: 0 when every event passes, 1 otherwise.
 
+NIP-17 DM conformance:
+
+    python3 conformance.py check_dm <recipient_secret_hex> <wrap1.json> [...]
+
+Verifies each file is a valid NIP-17 gift wrap addressed to the recipient:
+kind 1059, valid NIP-01 signature, NIP-44 v2 decryption of the wrap with
+the recipient key, a validly-signed kind-14 seal inside, and a kind-14
+rumor whose author matches the seal and whose `p` tag names the recipient.
+Use a throwaway recipient keypair; the secret is only used locally.
+
+`python3 conformance.py selftest` also covers `check_dm` with reference
+wraps built by nakama.py.
+
 For the second implementer: passing `check` on your own events is the
-criterion-1 evidence the NIP-F5 draft PR needs.
+criterion-1 evidence the NIP-F5 draft PR needs, and passing `check_dm`
+on wraps addressed to a nakama-built keypair proves NIP-17 wire
+compatibility with the reference implementation.
 """
 
 import json
@@ -174,6 +189,54 @@ def check_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_dm: NIP-17 gift-wrap conformance ----------
+
+def conform_dm(wrap: dict, recipient_secret: bytes) -> tuple[bool, list[str]]:
+    """The three-phase NIP-17 check for one gift wrap."""
+    errs: list[str] = []
+    if wrap.get('kind') != 1059:
+        return False, [f"expected kind 1059, got {wrap.get('kind')}"]
+    try:
+        rumor = nakama.nip17_unwrap(wrap, recipient_secret)
+    except Exception as e:
+        return False, [f'unwrap failed: {e}']
+    # reached only when: wrap sig ok, wrap decrypts, seal is kind 14 with a
+    # valid signature, rumor decrypts as kind 14 from the seal author and
+    # names the recipient in a `p` tag.
+    sender_npub = nakama.npub_of(bytes.fromhex(rumor['pubkey']))
+    return True, [f'rumor from {sender_npub[:16]}… '
+                   f'at {rumor["created_at"]}: {rumor["content"][:48]!r}']
+
+
+def check_dm_files(secret_hex: str, paths: list[str]) -> int:
+    try:
+        secret = bytes.fromhex(secret_hex)
+    except ValueError:
+        print('FAIL (recipient secret must be 64 hex chars)')
+        return 1
+    if len(secret) != 32:
+        print('FAIL (recipient secret must be 64 hex chars)')
+        return 1
+    failures = 0
+    for p in paths:
+        try:
+            wrap = json.load(open(p))
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, info = conform_dm(wrap, secret)
+        if ok:
+            print(f'{p}: PASS ({info[0]})')
+        else:
+            print(f'{p}: FAIL')
+            for e in info:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- selftest: reference events built by nakama.py ----------
 
 def _key() -> tuple[bytes, str]:
@@ -241,6 +304,49 @@ def selftest() -> int:
 
     total = len(events) + len(neg)
     print(f'--- {total - fails}/{total} passed ---')
+
+    # NIP-17 DM conformance: wraps built by nakama.py must verify, and
+    # tampered wraps must be rejected.
+    dm_fails = 0
+    s_sender, _ = _key()
+    s_recv, _ = _key()
+    recv_hexpub = nakama.hexpub_of(s_recv)
+    seal = nakama.nip17_build_seal(s_sender, recv_hexpub,
+                                   'conformance dm selftest')
+    wrap = nakama.nip17_build_gift_wrap(seal, recv_hexpub)
+
+    ok, info = conform_dm(wrap, s_recv)
+    print(f'dm/valid wrap: {"PASS" if ok else "FAIL"}'
+          f'{" (" + info[0] + ")" if ok else ""}')
+    for e in info:
+        if not ok:
+            print(f'    - {e}')
+    dm_fails += 0 if ok else 1
+
+    dm_neg = []
+    bad_sig = json.loads(json.dumps(wrap))
+    bad_sig['sig'] = '00' * 64
+    dm_neg.append(('tampered wrap signature', bad_sig))
+    bad_kind = json.loads(json.dumps(wrap))
+    bad_kind['kind'] = 1
+    dm_neg.append(('non-1059 kind', bad_kind))
+    bad_ct = json.loads(json.dumps(wrap))
+    bad_ct['content'] = bad_ct['content'][:-4] + 'AAAA'
+    dm_neg.append(('tampered ciphertext', bad_ct))
+
+    for name, w in dm_neg:
+        ok, errs = conform_dm(w, s_recv)
+        good = not ok
+        print(f'dm-negative/{name}: {"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            dm_fails += 1
+
+    dm_total = 1 + len(dm_neg)
+    print(f'--- dm {dm_total - dm_fails}/{dm_total} passed ---')
+    fails += dm_fails
+
+    grand = total + dm_total
+    print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
 
@@ -250,9 +356,16 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check <event.json> [...]')
             return 2
         return check_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_dm':
+        if len(argv) < 4:
+            print('usage: conformance.py check_dm <recipient_secret_hex> '
+                  '<wrap.json> [...]')
+            return 2
+        return check_dm_files(argv[2], argv[3:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
-    print('usage: conformance.py check <event.json> [...] | selftest')
+    print('usage: conformance.py check <event.json> [...] | '
+          'check_dm <recipient_secret_hex> <wrap.json> [...] | selftest')
     return 2
 
 
