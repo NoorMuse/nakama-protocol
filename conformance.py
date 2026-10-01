@@ -360,6 +360,28 @@ CLI prints a compatible report.
 nakama.py's own `cmd_verify_board_decision` (offline: policy and
 decision fixtures built in-process with real Schnorr signatures).
 
+Board-verify report conformance:
+
+    python3 conformance.py check_board_verify <report1.txt> [...]
+
+Verifies a saved `nakama.py board_verify` stdout report is internally
+consistent (spec §4.7): exactly one line — the valid form
+`board descriptor は有効です` or the invalid form
+`board descriptor は無効です`. Checks: the single line and the fixed
+two-word verdict vocabulary (unlike `check_verify_board_decision` there
+is no n/t arithmetic and no decision name in the report — nothing else
+to check). Trailing blank lines tolerated. Explicitly out of scope: the
+verdict's truth (`board_verify`'s territory), the descriptor's content
+and signature (`check_board`'s territory), stderr's compromise
+advisories, and the exit code. Use this to prove a second
+implementation's `board_verify` CLI prints a compatible report.
+
+`python3 conformance.py selftest` also covers
+`check_board_verify` with reports produced in-process by
+nakama.py's own `cmd_board_verify` (offline: board descriptor fixture
+built in-process with a real Schnorr signature, plus a tampered-sig
+one).
+
 Compromise declaration conformance:
 
     python3 conformance.py check_compromise <decl1.json> [...]
@@ -5007,6 +5029,70 @@ def check_verify_board_decision_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_verify_board_decision_report(text)
+        if ok:
+            print(f'{p}: PASS ({ "; ".join(info) })')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_board_verify: board_verify report consistency ----------
+
+# board_verify's stdout is a single line stating the descriptor-signature
+# verdict, and its grammar is fixed (spec §4.7). check_board_verify
+# verifies that a saved report is internally consistent:
+#
+#   valid:   board descriptor は有効です
+#   invalid: board descriptor は無効です
+#
+# Checks: exactly one line and the fixed two-word verdict vocabulary
+# 有効です/無効です. Unlike check_verify_board_decision, the report
+# carries no n/t counts and no decision name, so there is no internal
+# arithmetic to verify. Trailing blank lines tolerated. Out of scope:
+# the verdict's truth (board_verify's territory), the descriptor's
+# content and signature (check_board's territory), stderr's compromise
+# advisories (§16), and the exit code (invisible in saved stdout). Use
+# this to prove a second implementation's board_verify CLI prints a
+# compatible report.
+
+_RE_BV_VALID = re.compile(r'^board descriptor は有効です$')
+_RE_BV_INVALID = re.compile(r'^board descriptor は無効です$')
+
+
+def conform_board_verify_report(text: str):
+    """Verify a saved `nakama.py board_verify` stdout report is
+    internally consistent. Returns (ok, errors, info)."""
+    info = []
+    lines = [l for l in text.split('\n') if l.strip() != '']
+    if len(lines) != 1:
+        return False, [f'expected exactly 1 report line, found {len(lines)}'], \
+            info
+    line = lines[0]
+    if _RE_BV_VALID.match(line):
+        info.append('verdict=valid')
+        return True, [], info
+    if _RE_BV_INVALID.match(line):
+        info.append('verdict=invalid')
+        return True, [], info
+    return False, ['line matches neither the valid nor the invalid '
+                   'board_verify report form'], info
+
+
+def check_board_verify_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_board_verify_report(text)
         if ok:
             print(f'{p}: PASS ({ "; ".join(info) })')
         else:
@@ -9800,6 +9886,115 @@ def selftest() -> int:
           f'passed ---')
     fails += vbd_fails
 
+    # ---------- check_board_verify: board_verify report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_board_verify (offline: a board descriptor fixture built
+    # in-process with a real Schnorr signature, plus a tampered-sig one);
+    # hand-mutated reports that break the single-line grammar must be
+    # rejected.
+    bvr_fails = 0
+
+    def _bv_descriptor(sig_secret, now, board_id, tamper=False):
+        s, npub = sig_secret
+        mods = [npub]
+        msg = nakama.board_descriptor_message(board_id, 'wss://relay.damus.io',
+                                             mods, now)
+        sig = nakama.sign_schnorr(s, msg).hex()
+        if tamper:
+            sig = '00' * 128
+        return {'protocol': 'nakama', 'version': 1, 'type': 'board',
+                'board_id': board_id, 'relay': 'wss://relay.damus.io',
+                'moderators': mods, 'admission': 'open',
+                'created_at': now, 'sig': sig}
+
+    def _bv_run(desc):
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmpd:
+            desc_path = os.path.join(tmpd, 'descriptor.json')
+            with open(desc_path, 'w') as f:
+                json.dump(desc, f)
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    nakama.cmd_board_verify(
+                        SimpleNamespace(descriptor=desc_path,
+                                        compromise_registry=tmpd))
+                except SystemExit as e:
+                    code = e.code
+        return buf.getvalue(), code
+
+    _bv_now = int(time.time())
+    _bv_id = 'nakama-' + secrets.token_hex(3)
+    _bv_desc_ok = _bv_descriptor(_key(), _bv_now, _bv_id)
+    _bv_desc_bad = _bv_descriptor(_key(), _bv_now, _bv_id, tamper=True)
+
+    _bv_rep_ok, _bv_code_ok = _bv_run(_bv_desc_ok)
+    _bv_rep_bad, _bv_code_bad = _bv_run(_bv_desc_bad)
+
+    bvr_e2e = [
+        ('valid descriptor', _bv_rep_ok, _bv_code_ok, 0,
+         'board descriptor は有効です\n'),
+        ('tampered signature', _bv_rep_bad, _bv_code_bad, 1,
+         'board descriptor は無効です\n'),
+    ]
+    for name, rep, code, want_code, want_rep in bvr_e2e:
+        exact = (rep == want_rep) and (code == want_code)
+        ok, errs, info = conform_board_verify_report(rep)
+        good = exact and ok
+        print(f'board-verify-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({ "; ".join(info) })')
+        if not good:
+            if not exact:
+                print(f'    - stdout/exit mismatch: {rep!r} code={code}')
+            for e in errs:
+                print(f'    - {e}')
+            bvr_fails += 1
+
+    bvr_pos = [
+        ('valid', 'board descriptor は有効です\n'),
+        ('valid no trailing newline', 'board descriptor は有効です'),
+        ('valid trailing blanks', 'board descriptor は有効です\n\n  \n'),
+        ('invalid', 'board descriptor は無効です\n'),
+        ('invalid no trailing newline', 'board descriptor は無効です'),
+        ('invalid trailing blanks', 'board descriptor は無効です\n\n'),
+    ]
+    bvr_neg = [
+        ('empty text', ''),
+        ('two reports', 'board descriptor は有効です\n'
+                        'board descriptor は無効です\n'),
+        ('wrong verdict vocab',
+         'board descriptor は成立です\n'),
+        ('english verdict', 'board descriptor is valid\n'),
+        ('verdict word truncated', 'board descriptor は有効で\n'),
+        ('leading garbage', '前置き\nboard descriptor は有効です\n'),
+        ('trailing garbage', 'board descriptor は有効です\nおまけ\n'),
+        ('missing command noun', 'は有効です\n'),
+        ('wrong command noun', 'board-decision は有効です\n'),
+        ('verdict swapped vocabulary', 'board descriptor は無効です!\n'),
+        ('extra inner space', 'board descriptor  は有効です\n'),
+        ('missing の particle', 'board descriptor は有効 です\n'),
+    ]
+    for name, rep in bvr_pos:
+        ok, errs, info = conform_board_verify_report(rep)
+        good = ok
+        print(f'check_board_verify pos {name}: '
+              f'{"PASS" if good else "FAIL"} ({ "; ".join(info) })')
+        for e in errs:
+            print(f'    - {e}')
+        bvr_fails += 0 if good else 1
+    for name, rep in bvr_neg:
+        ok, _errs, _info = conform_board_verify_report(rep)
+        good = not ok
+        print(f'check_board_verify neg {name}: '
+              f'{"PASS" if good else "FAIL"}')
+        if not good:
+            print(f'    - report wrongly accepted')
+        bvr_fails += 0 if good else 1
+    bvr_total = len(bvr_e2e) + len(bvr_pos) + len(bvr_neg)
+    print(f'--- board-verify {bvr_total - bvr_fails}/{bvr_total} '
+          f'passed ---')
+    fails += bvr_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -9810,7 +10005,7 @@ def selftest() -> int:
         + rl_total + ns_total + dmf_total + brd_total + bdf_total + ddf_total \
         + bfa_total + pub_total + gov_total + rf_total + rtf_total \
         + cf_total + lv_total + lr_total + vb_total + vu_total + rn_total \
-        + bj_total + bs_total + bc_total + vbd_total
+        + bj_total + bs_total + bc_total + vbd_total + bvr_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -10081,6 +10276,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_verify_board_decision_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_board_verify':
+        if len(argv) < 3:
+            print('usage: conformance.py check_board_verify '
+                  '<report.txt> [...]')
+            return 2
+        return check_board_verify_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -10122,6 +10323,7 @@ def main(argv: list[str]) -> int:
           'check_board_send <report.txt> [...] | '
           'check_board_create <report.txt> [...] | '
           'check_verify_board_decision <report.txt> [...] | '
+          'check_board_verify <report.txt> [...] | '
           'selftest')
     return 2
 
