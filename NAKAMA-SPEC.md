@@ -1,7 +1,7 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.3
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21）。v0.17 完了 — 30103+30104 横断 fetch の統合（§22）。v0.18 完了 — fetch 時点の政策スナップショットの保存（§23））。v0.19 完了 — 草案の期限（§24）。v0.20 完了 — 草案への自動通知（§25））。v0.21 設計完了 — kind 30100–30104 の正式割当申請（§26）、v0.22 完了 — NIP ドラフト文書の作成（§26）。v0.23 完了 — 既存採用の確認結果と kind 再マップ実装（30100–30104→30107–30111、§26.9・§26.10）。v0.24 完了 — 承認者への草案通知（§27）
+**日付**: 2026-10-01（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21）。v0.17 完了 — 30103+30104 横断 fetch の統合（§22）。v0.18 完了 — fetch 時点の政策スナップショットの保存（§23））。v0.19 完了 — 草案の期限（§24）。v0.20 完了 — 草案への自動通知（§25））。v0.21 設計完了 — kind 30100–30104 の正式割当申請（§26）、v0.22 完了 — NIP ドラフト文書の作成（§26）。v0.23 完了 — 既存採用の確認結果と kind 再マップ実装（30100–30104→30107–30111、§26.9・§26.10）。v0.24 完了 — 承認者への草案通知（§27）。v0.25 設計完了 — 通知の既読追跡・返信連携（§28）
 **リポジトリ**: https://github.com/NoorMuse/nakama-protocol
 
 ---
@@ -253,6 +253,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 - **v0.22**（完了）: NIP ドラフト文書 `docs/NIP-nakama.md` を §26.3 の構成案どおりに作成（commit fcc2f8e）。概要・5 kind の tags/content/署名者/スロット・三段階検証・互換性・セキュリティ考慮・既存採用の確認手順（§26.4）・正直な注記。コード変更なし（文書のみ）。
 - **v0.23**（完了）: 既存採用の確認結果と kind 再マップ実装（§26.9・§26.10）。2026-10-01 のリレー調査で 30100–30104 すべてに他者の先行採用を確認（job マーケットプレイス風アプリの 30100、ポルトガル語圏投票アプリの 30100/30101/30102/30104）。nakama イベントは未公開のためクリーンカット: 新ブロック 30107–30111（revocation→30107 / compromise→30108 / rotation→30109 / decision→30110 / draft→30111）。実装: kind 定数 5 つを環境変数上書き可能な関数に変更（`NAKAMA_KIND_REVOCATION` 等、既定 30107–30111。非 int・30000–39999 範囲外は使用時に exit 1 で拒否）、fetch 系の購読 kind・`board_fetch_all` のホワイトリストを定数ベース化、`decision_nostr_event` / `verify_board_decision_nostr_event` の既定 kind を使用時解決に変更。spec の kind 参照を一括更新（§12/13/17/19/21/22/24/25、§26.1 に再マップ注記）。旧 kinds の購読・互換サポートはスコープ外のまま。テスト `test_kind_remap.py` 新規 5 ケース群通過＋全 16 テストファイル回帰維持。
 - **v0.24**（完了）: 承認者への草案通知（§27）。`board_draft_notify --cosigners` を実装: threshold 未達・期限間近の草案について未署名の eligible メンバーに NIP-17 DM（`--policy` 必須、宛先ごとの送信記録 `<core_hash>:<reason>:<recipient_hex>.json`、発行者通知と並行、`--cosigners` なしの既定動作は不変）。テスト `test_draft_cosigners.py` 9 ケース通過＋全 17 スイート回帰維持。
+- **v0.25**（設計完了）: 通知の既読追跡・返信連携（§28）。§27.3 のスコープ外項目を昇格。NIP-17 に既読の仕組みは存在しないため「既読の検証」ではなく三層で設計: (1) 受信者の自発・手動の ack DM（`[nakama] notif-ack` ヘッダ、seal は受信者の実鍵署名で出所は検証可能だが「読んだ」の証明にはならない）、(2) 行動証拠（30111 の approvals に npub があれば cosigned）、(3) 送信記録の拡張（`gift_wrap_id`/`rumor_id`）。新規コマンド `board_notif_ack`（受信者側の ack 送信）＋ `board_notif_status`（sent/ack/cosigned の突き合わせ表示、exit 常に 0）。自動 ack は設けない（オンライン状態の自動開示＝監視の道具化を拒否）。threshold 達成済み草案への通知は「やらない」で確定（やることがない相手への通知はノイズ）。コード変更なし（実装は次ラン、テスト計画 9 ケース）。
 
 ---
 
@@ -1700,6 +1701,96 @@ verify the draft yourself with: board_draft_fetch <relay> <board_id>
 
 ---
 
+## 28. v0.25: 通知の既読追跡・返信連携（設計固定、実装は次ラン）
+
+§27.3 のスコープ外項目「通知の既読追跡・返信連携」を昇格。まず正直な前提から始める: **NIP-17 に既読（read receipt）の仕組みは存在しない**。gift wrap（kind 1059）はエフェメラル鍵で署名され、送信者は「リレーが受け付けた」ことしか確認できない。受信者が復号して読んだかどうかは、受信者側のクライアントだけが知る事実であり、プロトコルで検証可能にする手段はない。よって「既読追跡」は「既読の検証」ではなく、「**返信連携**（受信者の自発的な応答）＋**行動証拠**（Nostr 上で観測可能な cosign）＋**ローカル台帳の突き合わせ**」の三層で設計する。プロトコルが保証できないものを、UI が保証するふりはしない。
+
+### 28.1 設計判断
+
+1. **既読の検証はしない（できない）**。`board_draft_notify` の送信成功は「リレー受理」であって「到達」ではない（§25.1 の正直な注記と同一）。
+2. **ack は自発・手動のみ**。受信者が通知を読んだことを運用者に伝えたい場合、自分で ack を送る。自動 ack（復号時に勝手に返信）は送らない — プライバシーの漏れ（オンライン状態の露出）になり、spam の踏み台にもなる。
+3. **ack より強い証拠は cosign そのもの**。受信者が `board_cosign` → `board_draft_pub` した草案は、30111 イベントの approvals にその npub が載る（§21）。「見たか」より「署名したか」の方が運用上価値が高く、しかも検証可能。status 表示では ack と cosign を別の列で出す。
+4. **threshold 達成済み草案への通知はしない**（§27.3 の判断を確定）。成立は `board_fetch_all` で誰でも確認でき、「やることがない相手への通知はノイズ」。status コマンドが未達成草案の滞留を示すことで代替する。
+5. **ack は返信ではなく新規 DM**。NIP-17 の rumor に reply 参照の標準はなく、gift wrap の入れ子は複雑になる。ack は受信者→発行者への通常の NIP-17 DM とし、content 先頭の機械可読ヘッダで突き合わせる。
+
+### 28.2 送信記録の拡張（`board_draft_notify` の変更。既定動作は不変）
+
+`draft_notif_record` に以下を追加（既存の `<core_hash>:<reason>[:<recipient_hex>].json` のファイル名は不変）:
+
+- `gift_wrap_id`: publish した kind 1059 イベントの id（突き合わせの主キー候補）
+- `rumor_id`: seal（kind 14）イベントの id
+- `recipient_hex` / `reason` / `sent_at` は既存のまま
+
+`--dry-run` 時は記録しない（§25.1 と同一）。既存記録（旧形式）は読み飛ばさず読み込む — `gift_wrap_id` がなければ空文字として扱う（後方互換）。
+
+### 28.3 ack の形式（受信者→発行者）
+
+ack は kind 14 rumor の content。機械可読ヘッダ＋任意の自由文:
+
+```
+[nakama] notif-ack
+core: <core_hash の 64 hex>
+reason: <expiring_soon|expired|cosign_request>
+---
+（任意の自由文。例: 今夜 cosign します）
+```
+
+- `core` は §19 の `decision_core_hash(d)` と同一の 64 hex。reason は送信記録の reason と同一語彙。
+- ack の seal（kind 13）は ack 送信者（＝通知の受信者）の実鍵で署名される（§28.1 の `nip17_build_seal` 流用） — **誰が ack したかは検証可能**。ただし「読んだ」ことの証明にはならない（正直に書く: ack は主張であり、NIP-17 seal の署名者が主張の出所）。
+- ack に reply 宛先は不要 — `board_notif_status` が core＋送信者で突き合わせる。
+
+### 28.4 新規コマンド
+
+```
+board_notif_ack <relay> <npub> --core <core_hash> [--reason <語彙>] [--note <自由文>] [--auth]
+```
+
+- 受信者側。`<npub>` は通知の発行者（notif DM の rumor の pubkey。§28.1 の実装では rumor.pubkey = 送信者の実鍵のため、そのまま指定できる）。
+- `--core` は 64 hex のみ受付（形式不正は exit 1）。`--reason` の既定は `cosign_request`。
+- 送信は `nip17_build_seal` / `nip17_build_gift_wrap` + `nostr_publish` の流用（`--auth` 対応）。`--from` の取り違え防止は §25.1 と同一。
+- exit コード: publish 受理で exit 0、構築失敗・拒否で exit 1。ack の到達は保証しない（§28.1）。
+
+```
+board_notif_status <board_id> [--relay <relay>] [--policy <policy.json>] [--since <unix>] [--auth] [--dir <notif-dir>]
+```
+
+- 送信者側の突き合わせ表示。`--dir`（既定 `~/.config/nakama/draft_notifs`）の送信記録を読み、各記録について 3 列を表示:
+  - `sent`: sent_at（UTC）
+  - `ack`: 受信 DM の中に core＋送信者（＝記録の recipient）が一致する `[nakama] notif-ack` があれば `yes(<ack 時刻>)`、なければ `-`
+  - `cosigned`: `--policy` 指定時、`board_fetch_all` 相当の 30111 購読（またはローカルの `--decisions`）で同一 core の approvals に recipient の npub があれば `yes`、なければ `-`
+- 受信 DM の取得は `cmd_dm_fetch` の fetch＋unwrap ロジックを純粋関数 `dm_incoming(secret, relay, since, auth)` に切り出して流用（コードの重複を避ける。切り出し自体はこの設計の実装ランで行う）。
+- 同一 (core, sender, reason) への複数 ack は最初の 1 件のみ有効（dedup）。reason 不一致・core 形式不正の ack は無視（spam 耐性: 無関係な ack を拾わない）。
+- exit コードは常に 0（表示機能。fetch 失敗時は stderr に警告して記録のみ表示）。
+
+### 28.5 正直に書く
+
+- 「既読」は検証不能であり続ける。ack は「読んだ」の証明ではなく「読んだと本人が言う」記録。status の `ack` 列はその旨を注記する。
+- ack の乱用: 誰でも誰にでも ack を送れる（notif を受けていなくても）。突き合わせは送信記録がある core に限定するため、記録のない core への ack は status に現れない。
+- 自動 ack を設けない理由: 受信者のオンライン状態・読了行動を送信者に自動開示すると、通知が監視の道具になる。nakama は「仲間の証」のプロトコルであり、監視のプロトコルではない。
+- cosign 列は `--policy` なしでは出せない（approvals の解釈に eligible/threshold の文脈が要る）。`--policy` なしの status は sent/ack のみ。
+
+### 28.6 スコープ外
+
+- デーモン化・自動スケジューリング（§27.3 と同一、実行者の cron に委ねる）。
+- サーバーサイドの既読通知（NIP-17 に存在しない）。
+- 読了時の自動 ack（§28.1 の判断 2）。
+- ack への返信スレッド化（NIP-17 rumor の reply 標準が固まるまで保留）。
+- threshold 達成済み草案への通知（§28.1 の判断 4 で確定: やらない）。
+
+### 28.7 テスト計画（次ラン、オフライン、`nostr_request` / `nostr_publish` をモック）
+
+1. `board_notif_ack` の DM 構築: ヘッダ形式・core 形式検証・`--reason` 語彙外の拒否
+2. 送信記録の拡張: `gift_wrap_id`/`rumor_id` の保存、旧形式記録の読み込み（空文字扱い）
+3. ack の突き合わせ: core＋sender 一致で `yes`、reason 不一致で無視、core 不正で無視
+4. 複数 ack の dedup（最初の 1 件）
+5. cosign 列: approvals に recipient npub があれば `yes`、なければ `-`
+6. `--policy` なしの status（sent/ack のみ）
+7. `dm_incoming` 切り出しの回帰: `dm_fetch` の既存動作不変
+8. 記録のない core への ack は status に現れない
+9. exit コード: ack 送信失敗で exit 1、status は常に exit 0
+
+---
+
 ## Contributors
 
 Contributions that shaped this spec and the code. Built by many hands.
@@ -1760,3 +1851,4 @@ Contributions that shaped this spec and the code. Built by many hands.
 - 2026-10-01: v0.23 設計 — §26.4 の手順 2「既存採用の確認」を実施。damus/nos.lol/primal の wss ワイルドカード REQ（nostr.band API は到達不能）で 30100–30104 すべてに他者の先行採用を確認（job マーケットプレイス風アプリの 30100、ポルトガル語圏投票アプリの 30100/30101/30102/30104）。nakama イベントは未公開のためクリーンカット: 連続した静かなブロック 30107–30111 に再マップ（revocation→30107/compromise→30108/rotation→30109/decision→30110/draft→30111）。代替ブロック調査で 30107–30112・30114–30120 が無反応。NIP ドラフト §6 に調査結果を記録、草案の kind 表を新ブロックに更新＋再マップ経緯を注記。§26.9（調査記録）・§26.10（再マップ設計）を spec に固定。ロードマップ §7 に v0.23（設計中）、ヘッダの日付行も更新。
 - 2026-10-01: v0.23 完了 — §26.10 の設計を実装。`_kind_from_env` ヘルパー新設、kind 定数 5 つを環境変数上書き可能な関数に変更（`NAKAMA_KIND_REVOCATION`・`NAKAMA_KIND_COMPROMISE`・`NAKAMA_KIND_ROTATION`・`NAKAMA_KIND_DECISION`・`NAKAMA_KIND_DRAFT`、既定 30107–30111。非 int・30000–39999 範囲外は使用時に exit 1 で拒否、無関係なコマンドは壊さない）。fetch 系 6 コマンドの購読 kind と `board_fetch_all` のホワイトリストを定数ベース化。`decision_nostr_event` / `verify_board_decision_nostr_event` の kind 既定引数を `None` 化し関数内で使用時解決（デフォルト引数評価時の環境変数読みを回避）。spec の kind 参照を一括更新（§12/13/17/19/21/22/24/25 の現行記述、§26.1 に「再マップ済み（v0.23）」注記。§7・開発ログ・§26.9 の旧番号は実装当時の記録として残す）。`test_kind_remap.py` 新規 5 ケース群通過（既定値・単独上書き・不正値拒否＋使用時検証の証明・既定 kind の使用・ホワイトリストの定数ベース）＋全 16 テストファイル回帰維持。ロードマップ §7 に v0.23（完了）、ヘッダの日付行も更新。
 - 2026-10-01: v0.24 完了 — §27 の設計を実装。新規コマンドなし、`board_draft_notify` に `--cosigners` フラグを追加。threshold 未達・期限間近（`--within`、既定 24h）の草案について、未署名の eligible メンバーに NIP-17 DM で通知（`--policy` 必須、なければ fetch 前に exit 1。対象選択は `draft_cosigner_targets`（純粋）— 期限なし・達成済み・署名済み・publisher は対象外。DM 平文は `draft_cosigner_message`（`[nakama] draft needs cosignatures` の雛形、threshold 行は常時表示）。送信記録は宛先ごとに `<core>:<reason>:<hex>.json`（発行者通知の `<core>:<reason>.json` と独立）。`test_draft_cosigners.py` 新規 9 ケース通過＋全 17 テストファイル回帰維持。`--cosigners` なしの既定動作は不変。
+- 2026-10-01: v0.25 設計 — §27.3 のスコープ外項目「通知の既読追跡・返信連携」を spec §28 に固定（設計のみ、実装は次ラン）。NIP-17 に既読の仕組みは存在しないため「既読の検証」ではなく三層設計: (1) 受信者の自発・手動の ack DM（`[nakama] notif-ack` ヘッダ、seal は受信者の実鍵署名で出所は検証可能だが「読んだ」の証明にはならない）、(2) 行動証拠（30111 の approvals に npub があれば cosigned — 「見たか」より「署名したか」）、(3) 送信記録の拡張（`gift_wrap_id`/`rumor_id`、旧形式は空文字で後方互換）。新規コマンド `board_notif_ack`（受信者側の ack 送信、`--core` 64 hex 検証・`--reason` 語彙制限）＋ `board_notif_status`（sent/ack/cosigned の突き合わせ表示、exit 常に 0、`dm_fetch` の fetch＋unwrap を純粋関数 `dm_incoming` に切り出して流用）。自動 ack は設けない（オンライン状態の自動開示＝監視の道具化を拒否 — 「nakama は仲間の証のプロトコルであり、監視のプロトコルではない」）。threshold 達成済み草案への通知は「やらない」で確定（やることがない相手への通知はノイズ）。テスト計画 9 ケース（オフライン）。ロードマップ §7 に v0.25（設計完了）、ヘッダの日付行も更新。
