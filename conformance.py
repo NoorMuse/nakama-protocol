@@ -4037,6 +4037,78 @@ def check_dm_recv_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_dm_send: dm_send report consistency ----------
+
+# A saved `nakama.py dm_send --out <file>` stdout report. Its grammar is
+# fixed (spec §4.1.2). check_dm_send verifies that the report is internally
+# consistent: exactly one line,
+#   gift wrap (kind 1059) を <out> に保存しました。publish は dm_pub で実行してください。
+# where <out> is the --out path: non-empty, no leading/trailing
+# whitespace. Trailing blank lines are tolerated; a leading blank line
+# is rejected. The no-`--out` form prints the raw gift wrap JSON to
+# stdout — a different grammar, rejected here (and this report is
+# rejected there). The stale pre-v0.73 sentence `リレー publish は
+# 未実装（次の単位）。` (the report once claimed publish was not yet
+# implemented; `dm_pub` now exists, spec v0.73) is explicitly rejected.
+# Explicitly out of scope: the gift wrap file's existence/content
+# (the wire's territory: `check_dm`), the §14.2 compromise warnings
+# (stderr, exit code unchanged), and the exit code (invisible in saved
+# stdout text). dm_recv reports (`from <16 hex>...:` sender lines /
+# `DM の復号に失敗しました:` failure lines) are a different grammar and
+# are rejected naturally.
+
+_RE_DS_REPORT = re.compile(
+    r'^gift wrap \(kind 1059\) を (.+) に保存しました。'
+    r'publish は dm_pub で実行してください。$')
+
+
+def conform_dm_send_report(text: str):
+    """Verify a saved `nakama.py dm_send --out` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) != 1:
+        return False, ['report must be a single confirmation line, '
+                       f'found {len(lines)} lines'], info
+    m = _RE_DS_REPORT.match(lines[0])
+    if not m:
+        return False, ['line 1: not a dm_send --out confirmation line '
+                       '(`gift wrap (kind 1059) を <out> に保存しました。'
+                       'publish は dm_pub で実行してください。`)'], info
+    out = m.group(1)
+    if out != out.strip():
+        return False, ['<out> has leading/trailing whitespace'], info
+    info.append(f'saved to {out!r}')
+    return (not errs), errs, info
+
+
+def check_dm_send_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_dm_send_report(text)
+        if ok:
+            print(f'{p}: PASS ({ "; ".join(info) })')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- check_verify_rotation: verify_rotation report consistency ----------
 
 # A saved `nakama.py verify_rotation` stdout report. Its grammar is fixed
@@ -8552,6 +8624,145 @@ def selftest() -> int:
     dmr_total = len(_dmr_e2e) + len(dmr_pos) + len(dmr_neg)
     print(f'--- dm-recv {dmr_total - dmr_fails}/{dmr_total} passed ---')
     fails += dmr_fails
+
+    # ---------- check_dm_send: dm_send --out report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_dm_send (offline: real key pairs, seal/gift-wrap built in-process
+    # and written to a temp --out file — no relay contact); hand-mutated
+    # reports that break the single confirmation-line grammar must be
+    # rejected. A real key_compromise_warnings hit is exercised to prove
+    # the §14.2 stderr warnings stay separated from the stdout report.
+    dms_fails = 0
+    _dms_s_a, _dms_npub_a = _key()  # sender
+    _dms_s_b, _dms_npub_b = _key()  # recipient
+
+    def _dms_send(tmpd, outname, msg='hello', warn=False):
+        kf = os.path.join(tmpd, 'send-key.json')
+        nakama.save_key(kf, _dms_s_a)
+        outp = os.path.join(tmpd, outname)
+        orig_warn = nakama.key_compromise_warnings
+        if warn:
+            nakama.key_compromise_warnings = (
+                lambda n, r=None: ['⚠ 宛先 npub に侵害宣言があります'])
+        buf = io.StringIO()
+        code = 0
+        try:
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                nakama.cmd_dm_send(SimpleNamespace(
+                    npub=_dms_npub_b, message=msg, out=outp,
+                    keyfile=kf, compromise_registry=tmpd))
+        except SystemExit as e:
+            code = e.code if isinstance(e.code, int) else 0
+        finally:
+            nakama.key_compromise_warnings = orig_warn
+        return buf.getvalue(), code, os.path.exists(outp), outp
+
+    _dms_e2e = []
+    with tempfile.TemporaryDirectory() as _dms_tmpd:
+        _rep, _code, _exists, _outp = _dms_send(_dms_tmpd, 'wrap.json')
+        _dms_e2e.append(('plain --out', _rep, _code, 0, _exists,
+                        f'gift wrap (kind 1059) を {_outp} に保存しました。'
+                        'publish は dm_pub で実行してください。\n'))
+        _rep, _code, _exists, _outp = _dms_send(_dms_tmpd, 'out 1.json')
+        _dms_e2e.append(('spaces in out path', _rep, _code, 0, _exists,
+                        f'gift wrap (kind 1059) を {_outp} に保存しました。'
+                        'publish は dm_pub で実行してください。\n'))
+        _rep, _code, _exists, _outp = _dms_send(_dms_tmpd, 'wrap2.json',
+                                               warn=True)
+        _dms_e2e.append(('compromised recipient (stderr separated)',
+                        _rep, _code, 0, _exists,
+                        f'gift wrap (kind 1059) を {_outp} に保存しました。'
+                        'publish は dm_pub で実行してください。\n'))
+    for name, rep, code, want_code, exists, want_rep in _dms_e2e:
+        exact = (rep == want_rep) and (code == want_code) and exists
+        ok, errs, info = conform_dm_send_report(rep)
+        good = exact and ok
+        print(f'dm-send-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ("{"; ".join(info)}")')
+        if not good:
+            if not exact:
+                print(f'    - stdout/exit/file mismatch: {rep!r} '
+                      f'code={code} exists={exists}')
+            for e in errs:
+                print(f'    - {e}')
+            dms_fails += 1
+
+    # hand-crafted positives
+    dms_pos = [
+        ('minimal', 'gift wrap (kind 1059) を wrap.json に保存しました。'
+         'publish は dm_pub で実行してください。\n'),
+        ('no trailing newline',
+         'gift wrap (kind 1059) を wrap.json に保存しました。'
+         'publish は dm_pub で実行してください。'),
+        ('trailing blanks',
+         'gift wrap (kind 1059) を wrap.json に保存しました。'
+         'publish は dm_pub で実行してください。\n\n\n'),
+        ('spaces in path',
+         'gift wrap (kind 1059) を my wraps/out 1.json に保存しました。'
+         'publish は dm_pub で実行してください。\n'),
+        ('japanese path',
+         'gift wrap (kind 1059) を 受信箱/ラップ.json に保存しました。'
+         'publish は dm_pub で実行してください。\n'),
+        ('absolute path',
+         'gift wrap (kind 1059) を /tmp/wrap.json に保存しました。'
+         'publish は dm_pub で実行してください。\n'),
+    ]
+    for name, rep in dms_pos:
+        ok, errs, info = conform_dm_send_report(rep)
+        print(f'dm-send/{name}: {"PASS" if ok else "FAIL"} '
+              f'("{"; ".join(info)}")')
+        for e in errs:
+            print(f'    - {e}')
+        dms_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    dms_neg = []
+    dms_neg.append(('empty report', ''))
+    dms_neg.append(('garbage', 'hello\n'))
+    dms_neg.append(('empty out',
+                    'gift wrap (kind 1059) を  に保存しました。'
+                    'publish は dm_pub で実行してください。\n'))
+    dms_neg.append(('out with leading space',
+                    'gift wrap (kind 1059) を  wrap.json に保存しました。'
+                    'publish は dm_pub で実行してください。\n'))
+    dms_neg.append(('stale pre-v0.73 sentence',
+                    'gift wrap (kind 1059) を wrap.json に保存しました。'
+                    'リレー publish は未実装（次の単位）。\n'))
+    dms_neg.append(('missing publish sentence',
+                    'gift wrap (kind 1059) を wrap.json に保存しました。\n'))
+    dms_neg.append(('raw gift wrap JSON (no --out form)',
+                    '{"id": "ab12", "kind": 1059}\n'))
+    dms_neg.append(('dm_recv sender line', 'from ' + 'ab' * 8 + '...:\n'
+                    'hello\n'))
+    dms_neg.append(('dm_recv failure line',
+                    'DM の復号に失敗しました: boom\n'))
+    dms_neg.append(('leading blank line',
+                    '\ngift wrap (kind 1059) を wrap.json に保存しました。'
+                    'publish は dm_pub で実行してください。\n'))
+    dms_neg.append(('trailing junk line',
+                    'gift wrap (kind 1059) を wrap.json に保存しました。'
+                    'publish は dm_pub で実行してください。\nextra\n'))
+    dms_neg.append(('two reports concatenated',
+                    'gift wrap (kind 1059) を a.json に保存しました。'
+                    'publish は dm_pub で実行してください。\n'
+                    'gift wrap (kind 1059) を b.json に保存しました。'
+                    'publish は dm_pub で実行してください。\n'))
+    dms_neg.append(('truncated sentence',
+                    'gift wrap (kind 1059) を wrap.json に保存しました。'
+                    'publish は\n'))
+
+    for name, rep in dms_neg:
+        ok, errs, info = conform_dm_send_report(rep)
+        good = not ok
+        print(f'dm-send-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            dms_fails += 1
+
+    dms_total = len(_dms_e2e) + len(dms_pos) + len(dms_neg)
+    print(f'--- dm-send {dms_total - dms_fails}/{dms_total} passed ---')
+    fails += dms_fails
 
     # ---------- check_verify_rotation: verify_rotation report consistency --
     # Reference reports are produced in-process with nakama.py's own
@@ -13614,6 +13825,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_dm_recv <report.txt> [...]')
             return 2
         return check_dm_recv_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_dm_send':
+        if len(argv) < 3:
+            print('usage: conformance.py check_dm_send <report.txt> [...]')
+            return 2
+        return check_dm_send_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_verify_rotation':
         if len(argv) < 3:
             print('usage: conformance.py check_verify_rotation '
@@ -13708,6 +13924,7 @@ def main(argv: list[str]) -> int:
           'check_board_decide <report.txt> [...] | '
           'check_board_cosign <report.txt> [...] | '
           'check_dm_recv <report.txt> [...] | '
+          'check_dm_send <report.txt> [...] | '
           'check_verify_rotation <report.txt> [...] | '
           'check_board_policy <report.txt> [...] | '
           'check_board_policy_sign <report.txt> [...] | '

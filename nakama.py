@@ -1666,7 +1666,7 @@ def cmd_dm_send(args):
     if args.out:
         with open(args.out, 'w') as f:
             json.dump(wrap, f, indent=2)
-        print(f'gift wrap (kind 1059) を {args.out} に保存しました。リレー publish は未実装（次の単位）。')
+        print(f'gift wrap (kind 1059) を {args.out} に保存しました。publish は dm_pub で実行してください。')
     else:
         print(json.dumps(wrap))
 
