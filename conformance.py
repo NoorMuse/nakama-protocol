@@ -387,6 +387,28 @@ that is the registry's claim — and their signature validity
 `python3 conformance.py selftest` also covers `check_revoke_list` with
 reference reports produced in-process by nakama.py's own cmd_revoke /
 cmd_revoke_list.
+
+Notif-status report conformance:
+
+    python3 conformance.py check_notif_status <report1.txt> [...]
+
+Each file is the saved stdout of `nakama.py board_notif_status`. Verifies
+the report is internally consistent: either the single empty-dir line
+(`送信記録はありませんでした`), or one row per send record —
+`[reason] <core32> to=<npub|?> sent=<UTC|?> ack=yes(<UTC>)|-` with an
+optional ` cosigned=yes|-` column (only when --policy succeeded) —
+followed by the ack-disclaimer footer, which must be the final line and
+must not appear on the empty report. Each row's reason must be in the
+`NOTIF_ACK_REASONS` vocabulary, the core 32 hex chars, `to=` a valid
+npub or `?`, and the UTC timestamps valid; the cosigned column must be
+present on every row or on none. Explicitly out of scope: whether the
+DMs really arrived (the send record is the sender's claim only, spec
+§25.2), ack authorship (the NIP-17 seal — `check_notif_ack`'s territory),
+and cosign semantics (`check_decision`'s territory).
+
+`python3 conformance.py selftest` also covers `check_notif_status` with
+reference reports produced in-process by nakama.py's own
+cmd_board_notif_status (offline: no --relay, no --policy).
 """
 
 import json
@@ -2374,6 +2396,112 @@ def check_revoke_list_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_notif_status: board_notif_status report consistency ----------
+
+# board_notif_status's stdout is a short human-readable listing, but its
+# grammar is fixed (spec §28.4). check_notif_status verifies that a saved
+# report is internally consistent: either the single empty-dir line
+# ('送信記録はありませんでした'), or one row per send record —
+# '[reason] <core32> to=<npub|?> sent=<UTC|?> ack=yes(<UTC>)|-' with an
+# optional ' cosigned=yes|-' column (only when --policy succeeded) —
+# followed by the ack-disclaimer footer, which must be the final line and
+# must not appear on the empty report. Each row's reason must be in the
+# NOTIF_ACK_REASONS vocabulary, the core 32 hex chars, the to= field a
+# valid npub (npub_to_hex) or '?', and the UTC timestamps valid; the
+# cosigned column must be present on every row or on none. Explicitly
+# out of scope: whether the DMs really arrived (the send record is the
+# sender's claim only, spec §25.2), ack authorship (the NIP-17 seal —
+# check_notif_ack's territory), and cosign semantics (check_decision's
+# territory).
+
+_RE_NS_EMPTY = '送信記録はありませんでした'
+_RE_NS_FOOTER = ('注: ack は「読んだ」の証明ではなく、'
+                 '受信者本人の主張の記録です（§28.5）')
+_RE_NS_TS = r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC'
+_RE_NS_TS_DATE = r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}'
+_RE_NS_ROW = re.compile(
+    r'^\[([a-z_]+)\] ([0-9a-fA-F]{32}) to=(\S+) '
+    r'sent=(\?|' + _RE_NS_TS + r') '
+    r'ack=(-|yes\((' + _RE_NS_TS_DATE + r') UTC\))'
+    r'( cosigned=(yes|-))?$')
+
+
+def _ns_valid_ts(s: str) -> bool:
+    try:
+        time.strptime(s, '%Y-%m-%d %H:%M:%S')
+        return True
+    except ValueError:
+        return False
+
+
+def conform_notif_status_report(text: str):
+    """Verify a saved `nakama.py board_notif_status` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if len(lines) == 1 and lines[0] == _RE_NS_EMPTY:
+        info.append('no send records')
+        return True, errs, info
+    if lines[-1] != _RE_NS_FOOTER:
+        return False, ['final line is not the ack-disclaimer footer '
+                       '(want the §28.5 note as the last line)'], info
+    rows = lines[:-1]
+    cos_col = None
+    for j, ln in enumerate(rows):
+        m = _RE_NS_ROW.match(ln)
+        if not m:
+            errs.append(f'line {j + 1}: does not match notif_status row '
+                        'grammar')
+            continue
+        reason, core, to, sent, ack, ack_ts, _cs, cos = m.groups()
+        if reason not in nakama.NOTIF_ACK_REASONS:
+            errs.append(f'line {j + 1}: reason {reason!r} is not in the '
+                        'NOTIF_ACK_REASONS vocabulary')
+        if to != '?' and nakama.npub_to_hex(to) is None:
+            errs.append(f'line {j + 1}: to={to!r} is neither a valid '
+                        'npub nor ?')
+        if sent != '?' and not _ns_valid_ts(sent[:-4]):
+            errs.append(f'line {j + 1}: invalid sent timestamp {sent!r}')
+        if ack != '-' and not _ns_valid_ts(ack_ts):
+            errs.append(f'line {j + 1}: invalid ack timestamp {ack!r}')
+        if cos_col is None:
+            cos_col = cos is not None
+        elif (cos is not None) != cos_col:
+            errs.append(f'line {j + 1}: cosigned column present on some '
+                        'rows but not all (reference CLI prints it on '
+                        'every row or on none)')
+    if not errs:
+        info.append(f'{len(rows)} notif rows, footer ok')
+    return (not errs), errs, info
+
+
+def check_notif_status_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_notif_status_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 def _key() -> tuple[bytes, str]:
     s = secrets.token_bytes(32)
     return s, nakama.npub_of(s)
@@ -4000,6 +4128,129 @@ def selftest() -> int:
     print(f'--- revoke-list {rl_total - rl_fails}/{rl_total} passed ---')
     fails += rl_fails
 
+    # ---------- check_notif_status: board_notif_status report consistency ----------
+    # Real board_notif_status reports are produced in-process with nakama.py's
+    # own draft_notif_record + cmd_board_notif_status (offline: relay=None,
+    # policy=None — stderr warning, records-only display) and must pass;
+    # hand-mutated reports that break the grammar or the footer/column
+    # consistency must be rejected.
+    import tempfile
+    ns_fails = 0
+
+    def _ns_keyfile(secret, tmpd, name):
+        kf = os.path.join(tmpd, name)
+        with open(kf, 'w') as f:
+            json.dump({'secret_hex': secret.hex()}, f)
+        os.chmod(kf, 0o600)
+        return kf
+
+    def _ns_status(notif_dir, keyfile):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            nakama.cmd_board_notif_status(SimpleNamespace(
+                board_id='conformance-board', relay=None, since=None,
+                limit=20, auth=False, policy=None, decisions=None,
+                dir=notif_dir, keyfile=keyfile))
+        return buf.getvalue()
+
+    ns_e2e = []
+    with tempfile.TemporaryDirectory() as tmpd:
+        s_n, np_n = _key()
+        ns_kf = _ns_keyfile(s_n, tmpd, 'n.json')
+        ns_dir = os.path.join(tmpd, 'notifs')
+        ns_e2e.append(('empty dir -> empty line', _ns_status(ns_dir, ns_kf)))
+
+        s_a, _np_a = _key()
+        hx_a = nakama.hexpub_of(s_a)
+        c1, c2, c3 = 'ab' * 16, 'cd' * 16, 'ef' * 16
+        nakama.draft_notif_record(ns_dir, c1, 'cosign_request', hx_a, np_n,
+                                  now, recipient_file=True)
+        ns_e2e.append(('one record', _ns_status(ns_dir, ns_kf)))
+
+        s_b, _np_b = _key()
+        hx_b = nakama.hexpub_of(s_b)
+        nakama.draft_notif_record(ns_dir, c2, 'expiring_soon', hx_b, np_n,
+                                  now - 3600, recipient_file=True)
+        nakama.draft_notif_record(ns_dir, c3, 'expired', None, np_n,
+                                  now - 7200)
+        ns_e2e.append(('three records incl. issuer-style to=?',
+                       _ns_status(ns_dir, ns_kf)))
+
+    for name, rep in ns_e2e:
+        ok, errs, info = conform_notif_status_report(rep)
+        print(f'notif-status-e2e/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        ns_fails += 0 if ok else 1
+
+    # hand-crafted positives
+    _, np_p1 = _key()
+    _, np_p2 = _key()
+    p1, p2 = 'ab' * 16, 'cd' * 16
+    ns_pos = [
+        ('empty report', '送信記録はありませんでした\n'),
+        ('one row, sent=? ack=-',
+         f'[cosign_request] {p1} to={np_p1} sent=? ack=-\n{_RE_NS_FOOTER}\n'),
+        ('ack=yes + to=?',
+         f'[expiring_soon] {p2} to=? sent=2026-10-01 12:00:00 UTC '
+         f'ack=yes(2026-10-02 01:02:03 UTC)\n{_RE_NS_FOOTER}\n'),
+        ('two rows with cosigned column',
+         f'[cosign_request] {p1} to={np_p1} sent=2026-10-01 12:00:00 UTC '
+         f'ack=- cosigned=yes\n'
+         f'[expired] {p2} to={np_p2} sent=? ack=- cosigned=-\n'
+         f'{_RE_NS_FOOTER}\n'),
+    ]
+    for name, rep in ns_pos:
+        ok, errs, info = conform_notif_status_report(rep)
+        print(f'notif-status/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        ns_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    ns_base = (f'[cosign_request] {p1} to={np_p1} '
+               f'sent=2026-10-01 12:00:00 UTC ack=-\n{_RE_NS_FOOTER}\n')
+    ns_neg = []
+    ns_neg.append(('empty report', ''))
+    ns_neg.append(('empty line plus row',
+                   '送信記録はありませんでした\n' + ns_base))
+    ns_neg.append(('footer on empty report',
+                   f'送信記録はありませんでした\n{_RE_NS_FOOTER}\n'))
+    ns_neg.append(('missing footer', ns_base.split('\n')[0] + '\n'))
+    ns_neg.append(('reason outside vocabulary',
+                   ns_base.replace('[cosign_request]', '[read_it]', 1)))
+    ns_neg.append(('core not hex', ns_base.replace(p1, 'zz' * 16, 1)))
+    ns_neg.append(('core short', ns_base.replace(p1, 'ab' * 15, 1)))
+    ns_neg.append(('to= garbage', ns_base.replace(f'to={np_p1}', 'to=bogus',
+                                                  1)))
+    ns_neg.append(('invalid sent date',
+                   ns_base.replace('2026-10-01 12:00:00',
+                                   '2026-13-40 99:99:99', 1)))
+    ns_neg.append(('invalid ack date',
+                   ns_base.replace('ack=-',
+                                   'ack=yes(2026-13-40 12:00:00 UTC)', 1)))
+    ns_neg.append(('cosigned column mixed',
+                   f'[cosign_request] {p1} to={np_p1} '
+                   f'sent=2026-10-01 12:00:00 UTC ack=- cosigned=yes\n'
+                   f'[expired] {p2} to={np_p2} sent=? ack=-\n'
+                   f'{_RE_NS_FOOTER}\n'))
+    ns_neg.append(('trailing garbage', ns_base + 'extra line\n'))
+
+    for name, rep in ns_neg:
+        ok, errs, info = conform_notif_status_report(rep)
+        good = not ok
+        print(f'notif-status-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            ns_fails += 1
+
+    ns_total = len(ns_e2e) + len(ns_pos) + len(ns_neg)
+    print(f'--- notif-status {ns_total - ns_fails}/{ns_total} passed ---')
+    fails += ns_fails
+
     rec_total = len(rec_pos) + len(rec_neg) + 2
     print(f'--- record {rec_total - rec_fails}/{rec_total} passed ---')
     fails += rec_fails
@@ -4007,7 +4258,7 @@ def selftest() -> int:
     grand = total + dm_total + board_total + dec_total + bond_total \
         + binding_total + live_total + cp_total + rt_total + rv_total \
         + ub_total + pl_total + dr_total + ack_total + rec_total + ks_total \
-        + rl_total
+        + rl_total + ns_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -4163,6 +4414,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_revoke_list <report1.txt> [...]')
             return 2
         return check_revoke_list_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_notif_status':
+        if len(argv) < 3:
+            print('usage: conformance.py check_notif_status <report.txt> [...]')
+            return 2
+        return check_notif_status_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'selftest':
         return selftest()
     print('usage: conformance.py check <event.json> [...] | '
@@ -4184,6 +4440,7 @@ def main(argv: list[str]) -> int:
           'check_notif_record <record1.json | notif_dir> [...] | '
           'check_key_status [--exit-code N] <report.txt> [...] | '
           'check_revoke_list <report.txt> [...] | '
+          'check_notif_status <report.txt> [...] | '
           'selftest')
     return 2
 
