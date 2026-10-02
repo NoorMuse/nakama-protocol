@@ -780,6 +780,40 @@ nakama.py's own `cmd_propose` + `cmd_accept` (real bond) +
 revocation events in a temp file — valid, and a tampered-signature
 invalid case with exact stdout+exit match).
 
+Revoke-issuance report conformance:
+
+    python3 conformance.py check_revoke <report1.txt> [...]
+
+Verifies a saved `nakama.py revoke` stdout report is internally
+consistent (spec §12.6): either 2 lines (the `--no-registry` form) or
+3 lines —
+  line 1: `revocation イベント: <out> — bond <h16>... の解消を宣言しました。`
+  line 2 (only without `--no-registry`): `ローカル registry に記録しました: <rp>`
+  line 3 (always the last line): `解消イベントは公開チャネルで共有してください（仲間の公開記録に残ります）。`
+(<out> is the event file path — non-empty, no leading/trailing
+whitespace; <h16> is the first 16 hex chars of the bond_hash — the
+reference CLI truncates the lowercase hexdigest, the checker accepts
+upper case too; <rp> is the registry record path — non-empty, no
+leading/trailing whitespace; the `...` ellipsis and the `—` em dash
+are literal.) Trailing blank lines tolerated; a leading blank line is
+rejected. No arithmetic rules (the lines carry no derivable fields).
+Explicitly out of scope: the event file's existence/content (the
+revocation event's territory — `check_revocation` /
+`verify_revocation_event`), the registry record's existence/content,
+the bond_hash truth, stderr, and the exit code (invisible in saved
+stdout text). The `verify_revocation` verdict lines (§12.5) and the
+sibling reports (`revoke_import` one-liners, `revoke_pub`'s publish
+line, `revoke_fetch`'s footer, `revoke_list`) are different grammars —
+`check_revoke` rejects them. Use this to prove a second
+implementation's `revoke` CLI prints a compatible report.
+
+`python3 conformance.py selftest` also covers
+`check_revoke` with reports produced in-process by nakama.py's own
+`cmd_propose` + `cmd_accept` (real bond) + `cmd_revoke` (offline: real
+key pair + temp keyfile, real Schnorr-signed revocation event —
+the plain 3-line form, the `--no-registry` 2-line form, and a
+spaces-in-out-name variant, each with exact stdout match).
+
 Board-policy creation report conformance:
 
     python3 conformance.py check_board_policy <report1.txt> [...]
@@ -4282,6 +4316,110 @@ def check_verify_revocation_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_verify_revocation_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_revoke: revoke issuance report consistency ----------
+
+# A saved `nakama.py revoke` stdout report. Its grammar is fixed
+# (spec §12.6). check_revoke verifies that the report is internally
+# consistent:
+#   line 1: revocation イベント: <out> — bond <h16>... の解消を宣言しました。
+#   line 2 (only without --no-registry): ローカル registry に記録しました: <rp>
+#   line 3 (always the last line): 解消イベントは公開チャネルで共有してください（仲間の公開記録に残ります）。
+# So the report is either 2 lines (the --no-registry form: lines 1 and
+# 3) or 3 lines (all three). <out> is the event file path (args.out or
+# the default 'revocation.json' — non-empty, no leading/trailing
+# whitespace, like check_dm_send's <out>); <h16> is the first 16 hex
+# chars of the revocation's bond_hash (the reference CLI truncates the
+# lowercase hexdigest — the checker accepts upper case too, like
+# check_verify_revocation's bond prefix); <rp> is the registry record
+# path (non-empty, no leading/trailing whitespace). The `...` ellipsis
+# and the `—` em dash are literal. Trailing blank lines tolerated; a
+# leading blank line is rejected. No arithmetic rules (the lines carry
+# no derivable fields — only the 16-char bond prefix is printed, so the
+# registry filename cannot be derived). Explicitly out of scope: the
+# event file's existence/content (the revocation event's territory —
+# `check_revocation` / `verify_revocation_event`), the registry
+# record's existence/content, the bond_hash truth, stderr, and the exit
+# code (invisible in saved stdout text). The `verify_revocation` verdict
+# lines (§12.5) are a different grammar — the two checkers reject each
+# other's reports; so are the sibling reports: the `revoke_import`
+# one-liners (`revocation を registry に記録しました: ...` /
+# `既に registry に記録済みです: ...`), the `revoke_pub` publish line
+# (`publish: <受理|拒否> (...) id=<id>`), the `revoke_fetch` footer, and
+# the `revoke_list` report. Use this to prove a second implementation's
+# `revoke` CLI prints a compatible report.
+
+_RE_RVK_LINE1 = re.compile(
+    r'^revocation イベント: (.+) — bond ([0-9a-fA-F]{16})\.\.\. の解消を宣言しました。$')
+_RE_RVK_LINE2 = re.compile(
+    r'^ローカル registry に記録しました: (.+)$')
+_RVK_LINE3 = '解消イベントは公開チャネルで共有してください（仲間の公開記録に残ります）。'
+
+
+def conform_revoke_report(text: str):
+    """Verify a saved `nakama.py revoke` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    m = _RE_RVK_LINE1.match(lines[0])
+    if not m:
+        return False, ['line 1: not a revoke issuance line '
+                       '(`revocation イベント: <out> — bond <16hex>... '
+                       'の解消を宣言しました。`)'], info
+    out, bh16 = m.group(1), m.group(2)
+    if out.strip() != out:
+        return False, ['line 1: <out> has leading/trailing whitespace'], info
+    info.append(f'issuance report: out={out} bond {bh16}…')
+    if len(lines) not in (2, 3):
+        return False, [f'report must be 2 lines (--no-registry) or 3 lines, '
+                       f'found {len(lines)} lines'], info
+    if lines[-1] != _RVK_LINE3:
+        return False, ['last line: not the fixed share-reminder line '
+                       '(解消イベントは公開チャネルで共有してください'
+                       '（仲間の公開記録に残ります）。)'], info
+    if len(lines) == 3:
+        m2 = _RE_RVK_LINE2.match(lines[1])
+        if not m2:
+            return False, ['line 2: not the registry record line '
+                           '(`ローカル registry に記録しました: <rp>`)'], info
+        rp = m2.group(1)
+        if rp.strip() != rp:
+            return False, ['line 2: <rp> has leading/trailing '
+                           'whitespace'], info
+        info.append(f'registry record: {rp}')
+    else:
+        info.append('no registry line (--no-registry form)')
+    return (not errs), errs, info
+
+
+def check_revoke_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_revoke_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -9154,6 +9292,198 @@ def selftest() -> int:
           f'passed ---')
     fails += vrv_fails
 
+    # ---------- check_revoke: revoke issuance-report consistency
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_propose + cmd_accept (real bond) + cmd_revoke (offline: real
+    # key pair + temp keyfile, real Schnorr-signed revocation event —
+    # the plain 3-line form, the --no-registry 2-line form, a
+    # spaces-in-out-name variant, and a --reason variant, each with
+    # exact stdout match); hand-mutated reports that break the 2/3-line
+    # grammar must be rejected, as must the verify_revocation verdict
+    # lines and the sibling revoke_* reports.
+    rvk_fails = 0
+    _rvk_sa, _rvk_npa = _key()
+    _rvk_sb, _rvk_npb = _key()
+
+    def _rvk_bond(tmpd):
+        # offline: real key pairs + temp keyfiles, propose -> accept -> bond
+        kfa = os.path.join(tmpd, 'key_a.json')
+        nakama.save_key(kfa, _rvk_sa)
+        kfb = os.path.join(tmpd, 'key_b.json')
+        nakama.save_key(kfb, _rvk_sb)
+        ppath = os.path.join(tmpd, 'proposal.json')
+        bpath = os.path.join(tmpd, 'bond.json')
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            nakama.cmd_propose(SimpleNamespace(
+                npub=_rvk_npb, keyfile=kfa, out=ppath,
+                expires_days=30, no_expiry=False, markdown=False))
+            nakama.cmd_accept(SimpleNamespace(
+                proposal=ppath, from_b64=None, keyfile=kfb, out=bpath,
+                markdown=False, compromise_registry=tmpd))
+        with open(bpath) as f:
+            return json.load(f), bpath
+
+    _rvk_reminder = ('解消イベントは公開チャネルで共有してください'
+                     '（仲間の公開記録に残ります）。')
+
+    def _rvk_run(bond_d, bpath, tmpd, out_name='revocation.json',
+                 no_registry=False, reason=''):
+        kf = os.path.join(tmpd, 'key_revk.json')
+        nakama.save_key(kf, _rvk_sa)
+        op = os.path.join(tmpd, out_name)
+        reg = os.path.join(tmpd, 'revocations')
+        bh = nakama.bond_hash(bond_d)
+        rp = os.path.join(reg, bh + '.json')
+        buf = io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                nakama.cmd_revoke(SimpleNamespace(
+                    bond=bpath, keyfile=kf, reason=reason, out=op,
+                    no_registry=no_registry, registry=reg))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        return buf.getvalue(), code, op, rp, bh[:16]
+
+    _rvk_e2e = []
+    with tempfile.TemporaryDirectory() as _rvk_td:
+        _rvk_bond_d, _rvk_bpath = _rvk_bond(_rvk_td)
+        _rep, _code, _op, _rp, _bh16 = _rvk_run(_rvk_bond_d, _rvk_bpath,
+                                               _rvk_td)
+        _rvk_e2e.append(('plain 3-line', _rep, _code,
+                         f'revocation イベント: {_op} — bond {_bh16}... '
+                         f'の解消を宣言しました。\n'
+                         f'ローカル registry に記録しました: {_rp}\n'
+                         f'{_rvk_reminder}\n'))
+        _rep, _code, _op2, _rp2, _bh16 = _rvk_run(
+            _rvk_bond_d, _rvk_bpath, _rvk_td, no_registry=True)
+        _rvk_e2e.append(('--no-registry 2-line', _rep, _code,
+                         f'revocation イベント: {_op2} — bond {_bh16}... '
+                         f'の解消を宣言しました。\n'
+                         f'{_rvk_reminder}\n'))
+        _rep, _code, _op3, _rp3, _bh16 = _rvk_run(
+            _rvk_bond_d, _rvk_bpath, _rvk_td,
+            out_name='my revocation.json')
+        _rvk_e2e.append(('spaces in out name', _rep, _code,
+                         f'revocation イベント: {_op3} — bond {_bh16}... '
+                         f'の解消を宣言しました。\n'
+                         f'ローカル registry に記録しました: {_rp3}\n'
+                         f'{_rvk_reminder}\n'))
+        _rep, _code, _op4, _rp4, _bh16 = _rvk_run(
+            _rvk_bond_d, _rvk_bpath, _rvk_td, reason='別プロジェクトに移行')
+        _rvk_e2e.append(('--reason (report unchanged)', _rep, _code,
+                         f'revocation イベント: {_op4} — bond {_bh16}... '
+                         f'の解消を宣言しました。\n'
+                         f'ローカル registry に記録しました: {_rp4}\n'
+                         f'{_rvk_reminder}\n'))
+    for name, rep, code, want_rep in _rvk_e2e:
+        exact = (rep == want_rep) and (code == 0)
+        ok, errs, info = conform_revoke_report(rep)
+        good = exact and ok
+        print(f'revoke-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        if not good:
+            if not exact:
+                print(f'    - stdout/exit mismatch: {rep!r} code={code}')
+            for e in errs:
+                print(f'    - {e}')
+            rvk_fails += 1
+
+    # hand-crafted positives
+    _rvk_bh16 = '0123456789ABCDEF'  # uppercase tolerated, like v0.74
+    _rvk_l1 = (f'revocation イベント: revocation.json — bond {_rvk_bh16}... '
+               f'の解消を宣言しました。')
+    _rvk_l2 = ('ローカル registry に記録しました: '
+               '/tmp/revocations/0123456789abcdef.json')
+    rvk_pos = [
+        ('plain 3-line', f'{_rvk_l1}\n{_rvk_l2}\n{_rvk_reminder}\n'),
+        ('no-registry 2-line', f'{_rvk_l1}\n{_rvk_reminder}\n'),
+        ('no trailing newline', f'{_rvk_l1}\n{_rvk_reminder}'),
+        ('trailing blanks', f'{_rvk_l1}\n{_rvk_l2}\n{_rvk_reminder}\n\n\n'),
+    ]
+    for name, rep in rvk_pos:
+        ok, errs, info = conform_revoke_report(rep)
+        print(f'revoke/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        rvk_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    rvk_neg = []
+    rvk_neg.append(('empty report', ''))
+    rvk_neg.append(('garbage line', 'hello\n'))
+    rvk_neg.append(('line 1 only (missing reminder)',
+                    f'{_rvk_l1}\n'))
+    rvk_neg.append(('four lines (extra tail)',
+                    f'{_rvk_l1}\n{_rvk_l2}\n{_rvk_reminder}\n余計な行\n'))
+    rvk_neg.append(('swapped order (reminder first)',
+                    f'{_rvk_reminder}\n{_rvk_l1}\n{_rvk_l2}\n'))
+    rvk_neg.append(('missing ellipsis after bond prefix',
+                    'revocation イベント: revocation.json — bond '
+                    f'{_rvk_bh16} の解消を宣言しました。\n{_rvk_reminder}\n'))
+    rvk_neg.append(('colon instead of em dash',
+                    'revocation イベント: revocation.json: bond '
+                    f'{_rvk_bh16}... の解消を宣言しました。\n'
+                    f'{_rvk_reminder}\n'))
+    rvk_neg.append(('short bond prefix',
+                    'revocation イベント: revocation.json — bond '
+                    '0123456789abcde... の解消を宣言しました。\n'
+                    f'{_rvk_reminder}\n'))
+    rvk_neg.append(('non-hex bond prefix',
+                    'revocation イベント: revocation.json — bond '
+                    'zzzzzzzzzzzzzzzz... の解消を宣言しました。\n'
+                    f'{_rvk_reminder}\n'))
+    rvk_neg.append(('blank out',
+                    'revocation イベント:  — bond '
+                    f'{_rvk_bh16}... の解消を宣言しました。\n'
+                    f'{_rvk_reminder}\n'))
+    rvk_neg.append(('out with trailing whitespace',
+                    'revocation イベント: revocation.json  — bond '
+                    f'{_rvk_bh16}... の解消を宣言しました。\n'
+                    f'{_rvk_reminder}\n'))
+    rvk_neg.append(('registry line with empty rp',
+                    f'{_rvk_l1}\n'
+                    'ローカル registry に記録しました:\n'
+                    f'{_rvk_reminder}\n'))
+    rvk_neg.append(('registry line with whitespace-padded rp',
+                    f'{_rvk_l1}\n'
+                    'ローカル registry に記録しました:  /tmp/x.json \n'
+                    f'{_rvk_reminder}\n'))
+    rvk_neg.append(('reminder line with suffix',
+                    f'{_rvk_l1}\n{_rvk_reminder}ほげ\n'))
+    rvk_neg.append(('verify_revocation valid verdict',
+                    'revocation は有効です — bond 0123456789abcdef... は '
+                    'npub1abcd1234efgh... により解消されました。\n'))
+    rvk_neg.append(('verify_revocation invalid verdict',
+                    'revocation は無効です\n'))
+    rvk_neg.append(('revoke_import stored one-liner',
+                    'revocation を registry に記録しました: '
+                    '/tmp/revocations/0123456789abcdef.json\n'))
+    rvk_neg.append(('revoke_import duplicate one-liner',
+                    '既に registry に記録済みです: '
+                    '/tmp/revocations/0123456789abcdef.json\n'))
+    rvk_neg.append(('revoke_pub publish line',
+                    'publish: 受理 (ok) id=abcdef0123456789\n'))
+    rvk_neg.append(('revoke_list empty line',
+                    'revocation registry は空です\n'))
+    rvk_neg.append(('leading blank line',
+                    f'\n{_rvk_l1}\n{_rvk_reminder}\n'))
+
+    for name, rep in rvk_neg:
+        ok, errs, info = conform_revoke_report(rep)
+        good = not ok
+        print(f'revoke-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            rvk_fails += 1
+
+    rvk_total = len(_rvk_e2e) + len(rvk_pos) + len(rvk_neg)
+    print(f'--- revoke {rvk_total - rvk_fails}/{rvk_total} passed ---')
+    fails += rvk_fails
+
     # ---------- check_board_policy: board_policy creation-report consistency
     # Reference reports are produced in-process with nakama.py's own
     # cmd_board_policy (offline: real key pair, temp keyfile, 3 eligible
@@ -13800,7 +14130,7 @@ def selftest() -> int:
         + bj_total + bs_total + bc_total + vbd_total + bvr_total \
         + bdc_total + bcs_total + dmr_total + dms_total + vrt_total + bpl_total \
         + bps_total + vbp_total + vrf_total + pr_total + ac_total \
-        + ch_total + ck_total + vrv_total
+        + ch_total + ck_total + vrv_total + rvk_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -14111,6 +14441,11 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_verify_revocation_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_revoke':
+        if len(argv) < 3:
+            print('usage: conformance.py check_revoke <report.txt> [...]')
+            return 2
+        return check_revoke_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_board_policy':
         if len(argv) < 3:
             print('usage: conformance.py check_board_policy '
