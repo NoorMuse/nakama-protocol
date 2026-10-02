@@ -4523,6 +4523,114 @@ def check_revoke_import_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_compromise_import: compromise_import report consistency ----------
+
+# A saved `nakama.py compromise_import <declaration.json> [--subject <npub>]`
+# `[--registry DIR]` stdout report. Its grammar is fixed (spec §13.9).
+# check_compromise_import verifies that the report is internally
+# consistent: exactly one line, one of three fixed forms:
+#   stored:    `侵害宣言を registry に記録しました: <path>`
+#   duplicate: `既に registry に記録済みです: <path>`
+#   updated:   `registry を更新しました（撤回・復活）: <path>`
+# where <path> is the registry record path `<registry>/<subject_hex>.json`
+# (the reference CLI prints `compromise_registry_path(registry,
+# subject_hex)` verbatim). The report's one internal rule: the basename
+# is `<64 hex>.json` — subject_hex is the subject's x-only pubkey
+# (§13.2/§13.4), and the registry file layout is
+# `<registry>/<subject_hex>.json`; the registry directory part is free
+# (user-controlled --registry), so only the basename is constrained.
+# Uppercase hex is accepted, as with the §12.7 revoke_import checker.
+# <path> must be non-empty with no leading/trailing whitespace (§4.1.2's
+# <out> rule). Trailing blank lines are tolerated; a leading blank line is
+# rejected.
+# Note: the duplicate line is grammatically identical to revoke_import's
+# duplicate line (`既に registry に記録済みです: <path>` — both registry
+# record files are `<64 hex>.json` basenames), so check_compromise_import
+# does NOT reject revoke_import duplicate reports (like challenge/respond
+# and init/whoami — the two reports are indistinguishable from the saved
+# text). The `revoke_import` stored line (`revocation を registry に記録
+# しました: ...`) differs by verb and is rejected. The other sibling
+# compromise reports are different grammars and are rejected: the
+# `compromise_declare` issuance report (`侵害宣言: ...` — 2-3 lines), the
+# `compromise_withdraw` report (`侵害宣言を撤回しました: ...`),
+# `compromise_fetch`'s footer (`<N> 件のイベントを取得: ...` —
+# check_compromise_fetch's territory), and the `compromise_pub` publish
+# line (`publish: <受理|拒否> (...) id=<id>` — check_pub's territory).
+# Explicitly out of scope: whether the record file exists and what it
+# contains (the declaration's territory: `check_compromise` /
+# `verify_compromise_event`), the subject's truth, whether 'stored' vs
+# 'duplicate' vs 'updated' was the right call (import_compromise_event's
+# territory — the registry's declarant+created_at first-win rule), stderr,
+# and the exit code. Use this to prove a second implementation's
+# `compromise_import` CLI prints a compatible report.
+
+_RE_CPI_LINE = re.compile(
+    r'^(?:侵害宣言を registry に記録しました|既に registry に記録済みです|'
+    r'registry を更新しました（撤回・復活）): (.+)$')
+_RE_CPI_BASENAME = re.compile(r'^[0-9a-fA-F]{64}\.json$')
+
+
+def conform_compromise_import_report(text: str):
+    """Verify a saved `nakama.py compromise_import` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    if len(lines) != 1:
+        return False, [f'report must be exactly 1 line, '
+                       f'found {len(lines)}'], info
+    m = _RE_CPI_LINE.match(lines[0])
+    if not m:
+        return False, ['line 1: not a compromise_import report line '
+                       '(`侵害宣言を registry に記録しました: <path>` / '
+                       '`既に registry に記録済みです: <path>` / '
+                       '`registry を更新しました（撤回・復活）: <path>`)'], info
+    path = m.group(1)
+    if path.strip() != path:
+        return False, ['<path> has leading/trailing whitespace'], info
+    base = os.path.basename(path)
+    if not _RE_CPI_BASENAME.match(base):
+        return False, [f'<path> basename `{base}` is not `<64 hex>.json` '
+                       '(the registry record filename is the subject '
+                       'x-only pubkey hex)'], info
+    if lines[0].startswith('侵害宣言を'):
+        kind = 'stored'
+    elif lines[0].startswith('既に'):
+        kind = 'duplicate'
+    else:
+        kind = 'updated'
+    info.append(f'{kind}: {base[:16]}...')
+    return (not errs), errs, info
+
+
+def check_compromise_import_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_compromise_import_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- check_init: init report consistency ----------
 
 # A saved `nakama.py init [--from-hex HEX] [--force] <keyfile>` stdout
@@ -10186,6 +10294,204 @@ def selftest() -> int:
     print(f'--- revoke-import {rvi_total - rvi_fails}/{rvi_total} passed ---')
     fails += rvi_fails
 
+    # ---------- check_compromise_import: compromise_import report consistency
+    # The reference CLI prints one of three single-line reports to stdout
+    # (exit 0): `侵害宣言を registry に記録しました: <path>` (stored),
+    # `既に registry に記録済みです: <path>` (duplicate), or
+    # `registry を更新しました（撤回・復活）: <path>` (updated), where
+    # <path> is `<registry>/<subject_hex>.json`. Real-CLI in-process E2E
+    # below: in-process-signed declarations via build_compromise_declaration
+    # (the same constructor cmd_compromise_declare uses) ->
+    # cmd_compromise_import, stdout captured exactly. The 'updated' case
+    # re-imports the same declaration with withdrawn flipped (the
+    # declarant+created_at first-win rule: only the withdrawn flag change
+    # is an update).
+    cpi_fails = 0
+    import tempfile as _cpi_tf
+    import io as _cpi_io
+    import contextlib as _cpi_ctx
+    from types import SimpleNamespace as _cpi_NS
+
+    _cpi_sa, _cpi_npa = _key()
+    _cpi_sb, _cpi_npb = _key()
+    _cpi_now = int(time.time())
+    _cpi_shex = nakama.npub_to_hex(_cpi_npb)
+
+    def _cpi_import(dpath, tmpd, registry=None, subject=None):
+        buf = _cpi_io.StringIO()
+        err = _cpi_io.StringIO()
+        code = 0
+        with _cpi_ctx.redirect_stdout(buf), _cpi_ctx.redirect_stderr(err):
+            try:
+                nakama.cmd_compromise_import(_cpi_NS(
+                    declaration=dpath, subject=subject,
+                    registry=registry or os.path.join(tmpd, 'compromises')))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        return buf.getvalue(), err.getvalue(), code
+
+    _cpi_e2e = []
+    with _cpi_tf.TemporaryDirectory() as _cpi_td:
+        _cpi_d1 = nakama.build_compromise_declaration(
+            _cpi_sa, _cpi_npb, _cpi_now)
+        _cpi_dpath = os.path.join(_cpi_td, 'decl.json')
+        with open(_cpi_dpath, 'w') as f:
+            json.dump(_cpi_d1, f)
+        _cpi_reg = os.path.join(_cpi_td, 'compromises')
+        _cpi_rp = os.path.join(_cpi_reg, _cpi_shex + '.json')
+        _rep, _err, _code = _cpi_import(_cpi_dpath, _cpi_td)
+        _cpi_e2e.append(('stored (fresh registry)', _rep, _err, _code,
+                         f'侵害宣言を registry に記録しました: '
+                         f'{_cpi_rp}\n'))
+        _rep, _err, _code = _cpi_import(_cpi_dpath, _cpi_td)
+        _cpi_e2e.append(('duplicate (second import)', _rep, _err, _code,
+                         f'既に registry に記録済みです: {_cpi_rp}\n'))
+        # withdrawn re-issue, same declarant+created_at -> updated
+        _cpi_d2 = nakama.build_compromise_declaration(
+            _cpi_sa, _cpi_npb, _cpi_now, True)
+        _cpi_dpath2 = os.path.join(_cpi_td, 'decl-withdrawn.json')
+        with open(_cpi_dpath2, 'w') as f:
+            json.dump(_cpi_d2, f)
+        _rep, _err, _code = _cpi_import(_cpi_dpath2, _cpi_td)
+        _cpi_e2e.append(('updated (withdrawn re-issue)', _rep, _err, _code,
+                         f'registry を更新しました（撤回・復活）: '
+                         f'{_cpi_rp}\n'))
+        # custom --registry with a space in the dir name
+        _cpi_reg2 = os.path.join(_cpi_td, 'other registry')
+        _cpi_rp2 = os.path.join(_cpi_reg2, _cpi_shex + '.json')
+        _rep, _err, _code = _cpi_import(_cpi_dpath2, _cpi_td,
+                                        registry=_cpi_reg2)
+        _cpi_e2e.append(('stored (custom --registry with space)', _rep,
+                         _err, _code,
+                         f'侵害宣言を registry に記録しました: '
+                         f'{_cpi_rp2}\n'))
+        # tampered signature: stderr verdict + exit 1, empty stdout
+        _cpi_bad = dict(_cpi_d1)
+        _cpi_bad['sig'] = ('00' if _cpi_d1['sig'][:2] != '00' else 'ff') \
+            + _cpi_d1['sig'][2:]
+        _cpi_badpath = os.path.join(_cpi_td, 'decl-bad.json')
+        with open(_cpi_badpath, 'w') as f:
+            json.dump(_cpi_bad, f)
+        _rep, _err, _code = _cpi_import(_cpi_badpath, _cpi_td)
+        _cpi_e2e.append(('invalid sig (stderr verdict, exit 1)', _rep,
+                         _err, _code, None))
+    for name, rep, err, code, want_rep in _cpi_e2e:
+        if want_rep is None:
+            # invalid case: stdout must be empty, exit 1, stderr the
+            # refusal verdict — and the empty stdout is rejected by the
+            # checker (the invalid case has no report)
+            good = (rep == '') and (code == 1) and \
+                (err == '侵害宣言は無効です（registry には記録しません）\n') and \
+                not conform_compromise_import_report(rep)[0]
+            info = ['invalid import refused on stderr (no stdout report)']
+        else:
+            exact = (rep == want_rep) and (code == 0) and (err == '')
+            ok, errs, info = conform_compromise_import_report(rep)
+            good = exact and ok
+        print(f'compromise-import-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ("; ".join(info))')
+        if not good:
+            if want_rep is not None and rep != want_rep:
+                print(f'    - stdout/exit mismatch: {rep!r} code={code} '
+                      f'stderr={err!r}')
+            if want_rep is None:
+                print(f'    - got stdout={rep!r} code={code} stderr={err!r}')
+            for e in (errs if want_rep is not None else []):
+                print(f'    - {e}')
+            cpi_fails += 1
+
+    # hand-crafted positives
+    _cpi_hx = 'cd' * 32  # 64 lowercase hex (subject x-only pubkey)
+    _cpi_HX = 'CD' * 32  # uppercase tolerated, as with §12.7
+    _cpi_l1 = f'侵害宣言を registry に記録しました: /tmp/c/{_cpi_hx}.json'
+    _cpi_l2 = f'既に registry に記録済みです: /tmp/c/{_cpi_hx}.json'
+    _cpi_l3 = f'registry を更新しました（撤回・復活）: /tmp/c/{_cpi_hx}.json'
+    cpi_pos = [
+        ('stored', f'{_cpi_l1}\n'),
+        ('duplicate', f'{_cpi_l2}\n'),
+        ('updated', f'{_cpi_l3}\n'),
+        ('uppercase hex basename', f'侵害宣言を registry に記録しました: '
+                                  f'/tmp/c/{_cpi_HX}.json\n'),
+        ('revoke_import duplicate line (grammatically identical, accepted)',
+         f'{_cpi_l2}\n'),
+        ('no trailing newline', _cpi_l1),
+        ('trailing blanks', f'{_cpi_l1}\n\n\n'),
+        ('relative registry dir', f'侵害宣言を registry に記録しました: '
+                                  f'compromises/{_cpi_hx}.json\n'),
+        ('spaces in registry dir', f'侵害宣言を registry に記録しました: '
+                                   f'/tmp/my compromises/{_cpi_hx}.json\n'),
+    ]
+    for name, rep in cpi_pos:
+        ok, errs, info = conform_compromise_import_report(rep)
+        print(f'compromise-import/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        cpi_fails += 0 if ok else 1
+
+    # hand-crafted negatives
+    cpi_neg = []
+    cpi_neg.append(('empty report', ''))
+    cpi_neg.append(('garbage line', 'hello\n'))
+    cpi_neg.append(('two reports concatenated',
+                    f'{_cpi_l1}\n{_cpi_l2}\n'))
+    cpi_neg.append(('extra line after report',
+                    f'{_cpi_l1}\n余計な行\n'))
+    cpi_neg.append(('missing colon separator',
+                    f'侵害宣言を registry に記録しました /tmp/c/{_cpi_hx}.json\n'))
+    cpi_neg.append(('wrong verb (保存しました)',
+                    f'侵害宣言を registry に保存しました: /tmp/c/{_cpi_hx}.json\n'))
+    cpi_neg.append(('wrong duplicate verb (既に…記録しました)',
+                    f'既に registry に記録しました: /tmp/c/{_cpi_hx}.json\n'))
+    cpi_neg.append(('wrong updated verb (撤回・復活なし)',
+                    f'registry を更新しました: /tmp/c/{_cpi_hx}.json\n'))
+    cpi_neg.append(('empty path', '侵害宣言を registry に記録しました: \n'))
+    cpi_neg.append(('leading whitespace in path',
+                    f'侵害宣言を registry に記録しました:  /tmp/c/{_cpi_hx}.json\n'))
+    cpi_neg.append(('trailing whitespace in path',
+                    f'侵害宣言を registry に記録しました: /tmp/c/{_cpi_hx}.json \n'))
+    cpi_neg.append(('short subject basename',
+                    '侵害宣言を registry に記録しました: /tmp/c/cd12.json\n'))
+    cpi_neg.append(('non-hex subject basename',
+                    '侵害宣言を registry に記録しました: /tmp/c/' +
+                    'zz' * 32 + '.json\n'))
+    cpi_neg.append(('no .json extension',
+                    f'侵害宣言を registry に記録しました: /tmp/c/{_cpi_hx}\n'))
+    cpi_neg.append(('revoke_import stored line (sibling, verb differs)',
+                    f'revocation を registry に記録しました: '
+                    f'/tmp/c/{_cpi_hx}.json\n'))
+    cpi_neg.append(('compromise_declare report (sibling)',
+                    f'侵害宣言: compromise.json — npub1abc... が npub1def... '
+                    f'の鍵は危ないと宣言しました。\n'
+                    f'ローカル registry に記録しました: /tmp/c/{_cpi_hx}.json\n'
+                    f'宣言は公開チャネルで共有してください'
+                    f'（仲間の公開記録に残ります）。虚偽の宣言はあなたの署名付きで'
+                    f'残ることを忘れずに。\n'))
+    cpi_neg.append(('compromise_withdraw report (sibling)',
+                    f'侵害宣言を撤回しました: compromise_withdrawn.json'
+                    f'（registry の記録を withdrawn: true に更新）\n'
+                    f'公開済みの宣言は compromise_pub で上書きしてください'
+                    f'（kind 30108 の replaceable で撤回が効きます）。\n'))
+    cpi_neg.append(('compromise_fetch footer (sibling)',
+                    '5 件のイベントを取得: 1 件を取り込み、1 件を更新、'
+                    '3 件をスキップ\n'))
+    cpi_neg.append(('compromise_pub publish line (sibling)',
+                    'publish: 受理 (OK) id=0123456789abcdef0123456789abcdef'
+                    '0123456789abcdef0123456789abcdef\n'))
+    cpi_neg.append(('leading blank line', f'\n{_cpi_l1}\n'))
+
+    for name, rep in cpi_neg:
+        ok, errs, info = conform_compromise_import_report(rep)
+        good = not ok
+        print(f'compromise-import-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            cpi_fails += 1
+
+    cpi_total = len(_cpi_e2e) + len(cpi_pos) + len(cpi_neg)
+    print(f'--- compromise-import {cpi_total - cpi_fails}/{cpi_total} passed ---')
+    fails += cpi_fails
+
     # ---------- check_init: init report consistency
     # The reference CLI prints the new identity's npub to stdout, one
     # line, exit 0 (cmd_init with --from-hex for a deterministic key;
@@ -15601,7 +15907,7 @@ def selftest() -> int:
         + bdc_total + bcs_total + dmr_total + dms_total + vrt_total + bpl_total \
         + bps_total + vbp_total + vrf_total + pr_total + ac_total \
         + ch_total + ck_total + vrv_total + rvk_total + wrn_total \
-        + crgd_total + rvi_total + ini_total + dno_total
+        + crgd_total + rvi_total + ini_total + dno_total + cpi_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -15905,6 +16211,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_revoke_import <report.txt> [...]')
             return 2
         return check_revoke_import_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_compromise_import':
+        if len(argv) < 3:
+            print('usage: conformance.py check_compromise_import <report.txt> [...]')
+            return 2
+        return check_compromise_import_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_init':
         if len(argv) < 3:
             print('usage: conformance.py check_init <report.txt> [...]')
@@ -16018,6 +16329,7 @@ def main(argv: list[str]) -> int:
           'check_revoke_fetch <report.txt> [...] | '
           'check_rotate_fetch <report.txt> [...] | '
           'check_compromise_fetch <report.txt> [...] | '
+          'check_compromise_import <report.txt> [...] | '
           'check_liveness_verify <report.txt> [...] | '
           'check_liveness_report <report.txt> [...] | '
           'check_verify_binding <report.txt> [...] | '
