@@ -755,6 +755,42 @@ implementation's `rotate` CLI prints a compatible issuance report.
 nakama.py's own `cmd_rotate` (offline: real key pairs, temp keyfile —
 fresh rotation, space-containing --out, both stderr failure paths).
 
+Bind-issuance report conformance:
+
+    python3 conformance.py check_bind <report1.txt> [...]
+
+Verifies a saved `nakama.py bind` stdout report is internally
+consistent (spec \u00a78.9): always 2 lines — the cert line
+`binding \u8a3c\u660e\u66f8: <out> \u2014 "<handle>"@<platform> \u304c <npub16>...
+\u306e\u4fdd\u6709\u3092\u4e3b\u5f35` (<out> non-empty, no leading/trailing
+whitespace — \u00a74.1.2's <out> rule; <handle> non-empty and quote-free;
+<platform> non-empty; <npub16> the issuer npub's first 16 characters —
+bech32 text, so only "16 non-whitespace characters" is checked) and the
+fixed operational note `\u904b\u7528: \u3053\u306e binding
+\u3092\u30cf\u30f3\u30c9\u30eb\u306e\u30a2\u30ab\u30a6\u30f3\u30c8\u304b\u3089\u305d\u306e\u307e\u307e\u6295\u7a3f\u3057\u3066\u304f\u3060\u3055\u3044
+\uff08\u30cf\u30f3\u30c9\u30eb\u2192\u9375\u306e\u65b9\u5411\uff09\u3002` — the \u2014 em dash,
+the `...` ASCII dots, the \u2192 arrow, and the full-width parens are
+literal and must match byte for byte. With `--markdown`, 6 more lines
+follow: a blank line, the label `\u6295\u7a3f\u7528\u30d6\u30ed\u30c3\u30af\uff08\u30b3\u30e1\u30f3\u30c8\u6b04\u306b\u8cbc\u308b\uff09:`,
+the detection marker `<!-- nakama-binding:v1 -->`, the fence opener
+` ```nakama-binding `, one base64url line, and the fence closer ` ``` `
+(shape only — the payload's truth is the cert's territory).
+Trailing blank lines tolerated; a leading blank line is rejected.
+The failure path (unreadable keyfile) prints nothing, so an empty
+stdout report is rejected. Explicitly out of scope: the cert file's
+existence and content (`check_binding` / `verify_binding_cert`), the
+handle/platform/npub16 truth, the markdown payload's truth, stderr,
+and the exit code. The `verify_binding` verdict lines and the
+`unbind` issuance report are different grammars — the checkers reject
+each other's reports. Use this to prove a second implementation's
+`bind` CLI prints a compatible issuance report.
+
+`python3 conformance.py selftest` also covers
+`check_bind` with reports produced in-process by
+nakama.py's own `cmd_bind` (offline: real key pairs, temp keyfile —
+plain bind, --markdown, space-containing --out, and the missing-keyfile
+failure path).
+
 Rotation-verify report conformance:
 
     python3 conformance.py check_verify_rotation <report1.txt> [...]
@@ -5499,6 +5535,142 @@ def check_rotate_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_rotate_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_bind: bind issuance report consistency ----------
+
+# A saved `nakama.py bind --platform P --handle H [--out OUT] [--markdown]`
+# stdout report. Its grammar is fixed (spec \u00a78.9). check_bind verifies
+# that the report is internally consistent: always 2 lines --
+#   line 1: `binding \u8a3c\u660e\u66f8: <out> \u2014 "<handle>"@<platform> \u304c <npub16>... \u306e\u4fdd\u6709\u3092\u4e3b\u5f35`
+#   line 2: `\u904b\u7528: \u3053\u306e binding \u3092\u30cf\u30f3\u30c9\u30eb\u306e\u30a2\u30ab\u30a6\u30f3\u30c8\u304b\u3089\u305d\u306e\u307e\u307e\u6295\u7a3f\u3057\u3066\u304f\u3060\u3055\u3044\uff08\u30cf\u30f3\u30c9\u30eb\u2192\u9375\u306e\u65b9\u5411\uff09\u3002`
+# plus, with --markdown, 6 more lines --
+#   line 3: blank
+#   line 4: `\u6295\u7a3f\u7528\u30d6\u30ed\u30c3\u30af\uff08\u30b3\u30e1\u30f3\u30c8\u6b04\u306b\u8cbc\u308b\uff09:`
+#   line 5: `<!-- nakama-binding:v1 -->`
+#   line 6: ` ```nakama-binding `
+#   line 7: <base64url>
+#   line 8: ` ``` `
+# <out> is the cert JSON path verbatim (`--out`, default `binding.json`;
+# user-controlled, so it must be non-empty with no leading/trailing
+# whitespace -- \u00a74.1.2's <out> rule). <handle> is non-empty and
+# quote-free (the CLI wraps it in ASCII double quotes), <platform> is
+# non-empty with no leading/trailing whitespace, and <npub16> is the
+# first 16 characters of the issuer's npub (bech32 text, so only "16
+# non-whitespace characters" is checked -- the same treatment as
+# check_rotate's arrow line, \u00a75.5.3). The `\u2014` is an em dash
+# (U+2014) literal, the `...` is three ASCII dots, line 2's `\u2192`
+# is U+2192 and its parens are full-width (U+FF08/U+FF09) -- a second
+# implementation must match these byte for byte. The markdown block
+# (lines 5-8) is `markdown_block`'s fenced output: the detection
+# marker, the fence opener, one base64url line
+# (base64.urlsafe_b64encode keeps `=` padding), the closing fence --
+# shape only is checked, not the payload's truth (the cert's
+# territory: `check_binding` / `verify_binding_cert`). The failure
+# path (unreadable keyfile) raises before printing anything, so the
+# report exists only for the success path -- an empty stdout is
+# rejected by the checker. Sibling reports are different grammars and
+# are rejected: verify_binding's verdict lines (`binding
+# \u306f\u6709\u52b9\u3067\u3059` / `binding \u306f\u7121\u52b9\u3067\u3059`
+# -- check_verify_binding's territory) and the unbind issuance report
+# (`unbinding \u8a3c\u660e\u66f8: ...` -- check_unbind's future
+# territory); check_verify_binding in turn rejects bind's issuance
+# report (its line 1 is not a verdict line). Explicitly out of scope:
+# the cert file's existence and content, the handle/platform/npub16
+# truth, the markdown payload's truth, stderr, and the exit code. Use
+# this to prove a second implementation's `bind` CLI prints a
+# compatible issuance report.
+
+_BIND_L1 = re.compile(r'^binding \u8a3c\u660e\u66f8: (.+?) \u2014 "([^"]+)"@(.+?) \u304c (\S{16})\.\.\. \u306e\u4fdd\u6709\u3092\u4e3b\u5f35$')
+_BIND_L2 = ('\u904b\u7528: \u3053\u306e binding \u3092\u30cf\u30f3\u30c9\u30eb\u306e\u30a2\u30ab\u30a6\u30f3\u30c8\u304b\u3089'
+           '\u305d\u306e\u307e\u307e\u6295\u7a3f\u3057\u3066\u304f\u3060\u3055\u3044\uff08\u30cf\u30f3\u30c9\u30eb\u2192\u9375\u306e\u65b9\u5411\uff09\u3002')
+_BIND_MD_LABEL = '\u6295\u7a3f\u7528\u30d6\u30ed\u30c3\u30af\uff08\u30b3\u30e1\u30f3\u30c8\u6b04\u306b\u8cbc\u308b\uff09:'
+_BIND_MD_MARKER = '<!-- nakama-binding:v1 -->'
+_BIND_MD_FOPEN = '```nakama-binding'
+_BIND_MD_FCLOSE = '```'
+_BIND_MD_B64 = re.compile(r'^[A-Za-z0-9_\-=]+$')
+
+
+def conform_bind_report(text: str):
+    """Verify a saved `nakama.py bind` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    m1 = _BIND_L1.match(lines[0])
+    if not m1:
+        return False, ['line 1: not a bind cert line '
+                       '(`binding \u8a3c\u660e\u66f8: <out> \u2014 '
+                       '"<handle>"@<platform> \u304c <npub16>... '
+                       '\u306e\u4fdd\u6709\u3092\u4e3b\u5f35`)'], info
+    out, handle, platform, npub16 = m1.groups()
+    if not out or out.strip() != out:
+        return False, ['<out> is empty or has leading/trailing '
+                       'whitespace'], info
+    if not platform or platform.strip() != platform:
+        return False, ['<platform> is empty or has leading/trailing '
+                       'whitespace'], info
+    if lines[1:2] != [_BIND_L2]:
+        return False, ['line 2: not the operational note (byte-exact: '
+                       '`\u904b\u7528: \u3053\u306e binding '
+                       '\u3092\u30cf\u30f3\u30c9\u30eb\u306e\u30a2\u30ab\u30a6\u30f3\u30c8'
+                       '\u304b\u3089\u305d\u306e\u307e\u307e\u6295\u7a3f\u3057\u3066'
+                       '\u304f\u3060\u3055\u3044\uff08\u30cf\u30f3\u30c9\u30eb\u2192\u9375\u306e\u65b9\u5411\uff09\u3002`)'], info
+    if len(lines) == 2:
+        info.append(f'out={out} handle={handle} platform={platform} '
+                    f'npub16={npub16}')
+        return True, errs, info
+    if len(lines) != 8:
+        return False, [f'bind report must be 2 lines (plain) or 8 lines '
+                       f'(--markdown), found {len(lines)}'], info
+    if lines[2] != '':
+        return False, ['line 3: not blank (markdown mode needs a blank '
+                       'line after the operational note)'], info
+    if lines[3] != _BIND_MD_LABEL:
+        return False, ['line 4: not the markdown label (byte-exact: '
+                       '`\u6295\u7a3f\u7528\u30d6\u30ed\u30c3\u30af\uff08\u30b3\u30e1\u30f3\u30c8\u6b04\u306b\u8cbc\u308b\uff09:`)'], info
+    if lines[4] != _BIND_MD_MARKER:
+        return False, ['line 5: not the detection marker (byte-exact: '
+                       '`<!-- nakama-binding:v1 -->`)'], info
+    if lines[5] != _BIND_MD_FOPEN:
+        return False, ['line 6: not the fence opener (byte-exact: '
+                       '` ```nakama-binding `)'], info
+    if not _BIND_MD_B64.match(lines[6]):
+        return False, ['line 7: not a base64url line'], info
+    if lines[7] != _BIND_MD_FCLOSE:
+        return False, ['line 8: not the fence closer (byte-exact: '
+                       '` ``` `)'], info
+    info.append(f'out={out} handle={handle} platform={platform} '
+                f'npub16={npub16} markdown')
+    return True, errs, info
+
+
+def check_bind_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_bind_report(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -11542,6 +11714,277 @@ def selftest() -> int:
     print(f'--- rotate {rti_total - rti_fails}/{rti_total} passed ---')
     fails += rti_fails
 
+    # ---------- check_bind: bind issuance report consistency
+    # The reference CLI prints a 2-line issuance report to stdout
+    # (exit 0): line 1 `binding 証明書: <out> — "<handle>"@<platform>
+    # が <npub16>... の保有を主張`, line 2 the fixed operational note.
+    # With --markdown, 6 more lines follow (blank, label, detection
+    # marker, fence opener, base64url, fence closer). Real-CLI
+    # in-process E2E below: real keyfile -> cmd_bind. The failure
+    # path (unreadable keyfile) raises before printing -- its empty
+    # stdout is rejected by the checker.
+    bnd_fails = 0
+    import tempfile as _bnd_tf
+    import io as _bnd_io
+    import contextlib as _bnd_ctx
+    from types import SimpleNamespace as _bnd_NS
+    import json as _bnd_json
+
+    _bnd_s, _bnd_np = _key()
+
+    def _bnd_bind(keyfile, platform, handle, out, markdown):
+        buf = _bnd_io.StringIO()
+        err = _bnd_io.StringIO()
+        code = 0
+        with _bnd_ctx.redirect_stdout(buf), _bnd_ctx.redirect_stderr(err):
+            try:
+                nakama.cmd_bind(_bnd_NS(keyfile=keyfile, platform=platform,
+                                       handle=handle, out=out,
+                                       markdown=markdown))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+            except Exception as e:
+                code = f'exc:{type(e).__name__}'
+        return buf.getvalue(), err.getvalue(), code
+
+    def _bnd_rep(out, handle, platform, npub16):
+        return (f'binding 証明書: {out} — "{handle}"@{platform} が '
+                f'{npub16}... の保有を主張\n'
+                f'運用: この binding をハンドルのアカウントからそのまま'
+                f'投稿してください（ハンドル→鍵の方向）。\n')
+
+    def _bnd_cert_ok(path, platform, handle):
+        try:
+            b = _bnd_json.load(open(path))
+            return nakama.verify_binding_cert(b) \
+                and b['platform'] == platform and b['handle'] == handle \
+                and b['npub'] == _bnd_np
+        except Exception:
+            return False
+
+    _bnd_e2e = []  # (name, rep, err, code, kind, want)
+    with _bnd_tf.TemporaryDirectory() as _bnd_td:
+        _bnd_kf = os.path.join(_bnd_td, 'keyfile.json')
+        nakama.save_key(_bnd_kf, _bnd_s)
+        # fresh plain bind
+        _bnd_out1 = os.path.join(_bnd_td, 'binding.json')
+        _rep, _err, _code = _bnd_bind(_bnd_kf, 'moltbook', 'alex',
+                                     _bnd_out1, False)
+        _bnd_e2e.append(('plain bind (2 lines)', _rep, _err, _code, 'exact',
+                         (_bnd_rep(_bnd_out1, 'alex', 'moltbook',
+                                   _bnd_np[:16]),
+                          '', _bnd_cert_ok(_bnd_out1, 'moltbook', 'alex'))))
+        # --markdown: 8-line report (byte-exact, incl. fenced block)
+        _bnd_out2 = os.path.join(_bnd_td, 'binding-md.json')
+        _rep, _err, _code = _bnd_bind(_bnd_kf, 'moltbook', 'alex',
+                                     _bnd_out2, True)
+        _bnd_cert2 = _bnd_json.load(open(_bnd_out2))
+        _bnd_want_md = (_bnd_rep(_bnd_out2, 'alex', 'moltbook',
+                                _bnd_np[:16])
+                        + '\n投稿用ブロック（コメント欄に貼る）:\n'
+                        + nakama.markdown_block(_bnd_cert2, 'binding')
+                        + '\n')
+        _bnd_e2e.append(('--markdown (8 lines)', _rep, _err, _code, 'exact',
+                         (_bnd_want_md, '',
+                          _bnd_cert_ok(_bnd_out2, 'moltbook', 'alex'))))
+        # --out with a space in the filename
+        _bnd_out3 = os.path.join(_bnd_td, 'my binding.json')
+        _rep, _err, _code = _bnd_bind(_bnd_kf, 'nostr', 'alex_jp',
+                                     _bnd_out3, False)
+        _bnd_e2e.append(('custom --out with space', _rep, _err, _code,
+                         'exact',
+                         (_bnd_rep(_bnd_out3, 'alex_jp', 'nostr',
+                                   _bnd_np[:16]),
+                          '', _bnd_cert_ok(_bnd_out3, 'nostr', 'alex_jp'))))
+        # failure: unreadable keyfile (raises before printing)
+        _rep, _err, _code = _bnd_bind(os.path.join(_bnd_td, 'nope.json'),
+                                     'moltbook', 'alex', _bnd_out1, False)
+        _bnd_e2e.append(('missing keyfile (no stdout report)', _rep, _err,
+                         _code, 'fail', ()))
+    for name, rep, err, code, kind, want in _bnd_e2e:
+        errs = []
+        if kind == 'fail':
+            # failure path: stdout must be empty (raised before
+            # printing) -- and the empty stdout is rejected by the
+            # checker (the failure path has no report)
+            good = (rep == '') and (code != 0) and \
+                not conform_bind_report(rep)[0]
+            info = ['failure path printed nothing (no stdout report)']
+        else:
+            want_rep, want_err, cert_ok = want
+            exact = (rep == want_rep) and (code == 0) and (err == want_err)
+            ok, errs, info = conform_bind_report(rep)
+            good = exact and ok and cert_ok
+            if exact and ok and not cert_ok:
+                info = ['cert failed verify_binding_cert']
+        print(f'bind-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        if not good:
+            print(f'    - got stdout={rep!r} code={code} stderr={err!r}')
+            if kind == 'exact' and rep != want[0]:
+                print(f'    - want stdout={want[0]!r}')
+            for e in errs:
+                print(f'    - {e}')
+            bnd_fails += 1
+
+    # hand-crafted positives
+    _bnd_d1 = 'binding 証明書: binding.json — "alex"@moltbook が npub1qqqqqqqqqqq... の保有を主張'
+    _bnd_d2 = '運用: この binding をハンドルのアカウントからそのまま投稿してください（ハンドル→鍵の方向）。'
+    _bnd_b64 = 'eyJmb28iOiJiYXIifQ=='
+    _bnd_md_tail = ('\n\n投稿用ブロック（コメント欄に貼る）:\n'
+                    '<!-- nakama-binding:v1 -->\n'
+                    '```nakama-binding\n'
+                    f'{_bnd_b64}\n'
+                    '```\n')
+    bnd_pos = [
+        ('standard 2-line',
+         f'{_bnd_d1}\n{_bnd_d2}\n'),
+        ('no trailing newline',
+         f'{_bnd_d1}\n{_bnd_d2}'),
+        ('trailing blanks',
+         f'{_bnd_d1}\n{_bnd_d2}\n\n\n'),
+        ('out with space and unicode',
+         f'binding 証明書: /tmp/my binding 移行.json — "alex"@moltbook が '
+         f'npub1qqqqqqqqqqq... の保有を主張\n{_bnd_d2}\n'),
+        ('relative out path',
+         f'binding 証明書: certs/binding.json — "alex"@moltbook が '
+         f'npub1qqqqqqqqqqq... の保有を主張\n{_bnd_d2}\n'),
+        ('markdown 8-line',
+         f'{_bnd_d1}\n{_bnd_d2}{_bnd_md_tail}'),
+        ('markdown no trailing newline',
+         f'{_bnd_d1}\n{_bnd_d2}{_bnd_md_tail}'.rstrip('\n')),
+    ]
+    for name, rep in bnd_pos:
+        ok, errs, info = conform_bind_report(rep)
+        print(f'bind/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        bnd_fails += 0 if ok else 1
+
+    # hand-crafted negatives
+    bnd_neg = []
+    bnd_neg.append(('empty report', ''))
+    bnd_neg.append(('garbage line', 'hello\n'))
+    bnd_neg.append(('one line (line 2 missing)',
+                    f'{_bnd_d1}\n'))
+    bnd_neg.append(('three lines (extra line)',
+                    f'{_bnd_d1}\n{_bnd_d2}\n余計な行\n'))
+    bnd_neg.append(('two reports concatenated',
+                    f'{_bnd_d1}\n{_bnd_d2}\n{_bnd_d1}\n{_bnd_d2}\n'))
+    bnd_neg.append(('line 1 unbind issuance (sibling)',
+                    f'unbinding 証明書: unbinding.json — そのハンドルへの binding すべて '
+                    f'を取り消し（"alex"@moltbook）\n{_bnd_d2}\n'))
+    bnd_neg.append(('line 1 verify_binding valid verdict (sibling)',
+                    f'binding は有効です\n'))
+    bnd_neg.append(('line 1 verify_binding 2-line report (sibling)',
+                    f'binding は有効です\n'
+                    f'（運用手順）: この binding が実際に該当ハンドルの'
+                    f'アカウントから投稿されていることを確認してください\n'))
+    bnd_neg.append(('line 1 empty <out>',
+                    f'binding 証明書:  — "alex"@moltbook が '
+                    f'npub1qqqqqqqqqqq... の保有を主張\n{_bnd_d2}\n'))
+    bnd_neg.append(('line 1 <out> trailing space',
+                    f'binding 証明書: binding.json  — "alex"@moltbook が '
+                    f'npub1qqqqqqqqqqq... の保有を主張\n{_bnd_d2}\n'))
+    bnd_neg.append(('line 1 ASCII hyphen instead of —',
+                    f'binding 証明書: binding.json - "alex"@moltbook が '
+                    f'npub1qqqqqqqqqqq... の保有を主張\n{_bnd_d2}\n'))
+    bnd_neg.append(('line 1 handle quote missing',
+                    f'binding 証明書: binding.json — alex@moltbook が '
+                    f'npub1qqqqqqqqqqq... の保有を主張\n{_bnd_d2}\n'))
+    bnd_neg.append(('line 1 empty handle',
+                    f'binding 証明書: binding.json — ""@moltbook が '
+                    f'npub1qqqqqqqqqqq... の保有を主張\n{_bnd_d2}\n'))
+    bnd_neg.append(('line 1 npub16 short',
+                    f'binding 証明書: binding.json — "alex"@moltbook が '
+                    f'npub1qqq... の保有を主張\n{_bnd_d2}\n'))
+    bnd_neg.append(('line 1 npub16 with space',
+                    f'binding 証明書: binding.json — "alex"@moltbook が '
+                    f'npub1qq qq qqqq... の保有を主張\n{_bnd_d2}\n'))
+    bnd_neg.append(('line 1 ellipsis missing',
+                    f'binding 証明書: binding.json — "alex"@moltbook が '
+                    f'npub1qqqqqqqqqqq の保有を主張\n{_bnd_d2}\n'))
+    bnd_neg.append(('line 2 ASCII parens',
+                    f'{_bnd_d1}\n'
+                    f'運用: この binding をハンドルのアカウントからそのまま'
+                    f'投稿してください(ハンドル→鍵の方向)。\n'))
+    bnd_neg.append(('line 2 ASCII arrow',
+                    f'{_bnd_d1}\n'
+                    f'運用: この binding をハンドルのアカウントからそのまま'
+                    f'投稿してください（ハンドル->鍵の方向）。\n'))
+    bnd_neg.append(('line 2 final 。 missing',
+                    f'{_bnd_d1}\n'
+                    f'運用: この binding をハンドルのアカウントからそのまま'
+                    f'投稿してください（ハンドル→鍵の方向）\n'))
+    bnd_neg.append(('line order swapped',
+                    f'{_bnd_d2}\n{_bnd_d1}\n'))
+    bnd_neg.append(('leading blank line',
+                    f'\n{_bnd_d1}\n{_bnd_d2}\n'))
+    bnd_neg.append(('markdown missing blank line 3',
+                    f'{_bnd_d1}\n{_bnd_d2}\n'
+                    f'投稿用ブロック（コメント欄に貼る）:\n'
+                    f'<!-- nakama-binding:v1 -->\n'
+                    f'```nakama-binding\n'
+                    f'{_bnd_b64}\n'
+                    f'```\n'))
+    bnd_neg.append(('markdown label wrong',
+                    f'{_bnd_d1}\n{_bnd_d2}\n\n'
+                    f'投稿用ブロック:\n'
+                    f'<!-- nakama-binding:v1 -->\n'
+                    f'```nakama-binding\n'
+                    f'{_bnd_b64}\n'
+                    f'```\n'))
+    bnd_neg.append(('markdown marker wrong',
+                    f'{_bnd_d1}\n{_bnd_d2}\n\n'
+                    f'投稿用ブロック（コメント欄に貼る）:\n'
+                    f'<!-- nakama-binding:v2 -->\n'
+                    f'```nakama-binding\n'
+                    f'{_bnd_b64}\n'
+                    f'```\n'))
+    bnd_neg.append(('markdown fence opener wrong',
+                    f'{_bnd_d1}\n{_bnd_d2}\n\n'
+                    f'投稿用ブロック（コメント欄に貼る）:\n'
+                    f'<!-- nakama-binding:v1 -->\n'
+                    f'```nakama-bind\n'
+                    f'{_bnd_b64}\n'
+                    f'```\n'))
+    bnd_neg.append(('markdown b64 with invalid char',
+                    f'{_bnd_d1}\n{_bnd_d2}\n\n'
+                    f'投稿用ブロック（コメント欄に貼る）:\n'
+                    f'<!-- nakama-binding:v1 -->\n'
+                    f'```nakama-binding\n'
+                    f'eyJ+YmFyIg==\n'
+                    f'```\n'))
+    bnd_neg.append(('markdown fence closer wrong',
+                    f'{_bnd_d1}\n{_bnd_d2}\n\n'
+                    f'投稿用ブロック（コメント欄に貼る）:\n'
+                    f'<!-- nakama-binding:v1 -->\n'
+                    f'```nakama-binding\n'
+                    f'{_bnd_b64}\n'
+                    f'````\n'))
+    bnd_neg.append(('markdown 7 lines (fence closer missing)',
+                    f'{_bnd_d1}\n{_bnd_d2}\n\n'
+                    f'投稿用ブロック（コメント欄に貼る）:\n'
+                    f'<!-- nakama-binding:v1 -->\n'
+                    f'```nakama-binding\n'
+                    f'{_bnd_b64}\n'))
+    bnd_neg.append(('plain 2-line plus extra markdown-ish line',
+                    f'{_bnd_d1}\n{_bnd_d2}\n'
+                    f'投稿用ブロック（コメント欄に貼る）:\n'))
+
+    for name, rep in bnd_neg:
+        ok, errs, info = conform_bind_report(rep)
+        good = not ok
+        print(f'bind-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            bnd_fails += 1
+
+    bnd_total = len(_bnd_e2e) + len(bnd_pos) + len(bnd_neg)
+    print(f'--- bind {bnd_total - bnd_fails}/{bnd_total} passed ---')
+    fails += bnd_fails
+
     # ---------- check_init: init report consistency
     # The reference CLI prints the new identity's npub to stdout, one
     # line, exit 0 (cmd_init with --from-hex for a deterministic key;
@@ -16958,7 +17401,7 @@ def selftest() -> int:
         + bps_total + vbp_total + vrf_total + pr_total + ac_total \
         + ch_total + ck_total + vrv_total + rvk_total + wrn_total \
         + crgd_total + rvi_total + ini_total + dno_total + cpi_total \
-        + cpd_total + cpw_total + rti_total
+        + cpd_total + cpw_total + rti_total + bnd_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -17310,6 +17753,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_rotate_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_bind':
+        if len(argv) < 3:
+            print('usage: conformance.py check_bind '
+                  '<report.txt> [...]')
+            return 2
+        return check_bind_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_verify_revocation':
         if len(argv) < 3:
             print('usage: conformance.py check_verify_revocation '
@@ -17415,6 +17864,7 @@ def main(argv: list[str]) -> int:
           'check_dm_send <report.txt> [...] | '
           'check_verify_rotation <report.txt> [...] | '
           'check_rotate <report.txt> [...] | '
+          'check_bind <report.txt> [...] | '
           'check_verify_revocation <report.txt> [...] | '
           'check_board_policy <report.txt> [...] | '
           'check_board_policy_sign <report.txt> [...] | '
