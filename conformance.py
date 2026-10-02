@@ -726,6 +726,35 @@ nakama.py's own `cmd_dm_recv` (offline: real key pairs, in-process
 NIP-44 seal/gift-wrap, temp keyfile + temp giftwrap file — valid,
 multi-line, and tampered-signature failure cases).
 
+Rotation-issuance report conformance:
+
+    python3 conformance.py check_rotate <report1.txt> [...]
+
+Verifies a saved `nakama.py rotate` stdout report is internally
+consistent (spec §5.5.4): exactly 4 lines — the cert line
+`rotation 証明書: <out>`, the arrow line `<old16>... → <new16>...`
+(the two prefixes are the first 16 characters of the old/new npubs;
+bech32 text, so only "16 non-whitespace characters" is checked),
+plus the two fixed advisory lines (`注意: この証明書は「旧鍵の保有者が
+新鍵への移行を宣言した」ことの証拠です。` and
+`継続的な鍵の保有 (custody) の証明には、都度の challenge–response を
+使ってください。` — the 「」 brackets and the en dash in
+challenge–response are literal and must match byte for byte).
+Trailing blank lines tolerated; a leading blank line is rejected.
+The failure paths (no --gen/--to-hex, same key) print to stderr, so
+an empty stdout report is rejected. Explicitly out of scope: the
+cert file's existence and content (`check_rotation` /
+`verify_rotation_cert`), the prefixes' truth, stderr, and the exit
+code. The `verify_rotation` verdict line, `rotate_fetch` listing
+lines, and `rotate_pub` publish lines are different grammars — the
+checkers reject each other's reports. Use this to prove a second
+implementation's `rotate` CLI prints a compatible issuance report.
+
+`python3 conformance.py selftest` also covers
+`check_rotate` with reports produced in-process by
+nakama.py's own `cmd_rotate` (offline: real key pairs, temp keyfile —
+fresh rotation, space-containing --out, both stderr failure paths).
+
 Rotation-verify report conformance:
 
     python3 conformance.py check_verify_rotation <report1.txt> [...]
@@ -5370,6 +5399,115 @@ def conform_board_policy_report(text: str):
                        '(` ``` `)'], info
     info.append('markdown block present')
     return (not errs), errs, info
+
+
+# ---------- check_rotate: rotate issuance report consistency ----------
+
+# A saved `nakama.py rotate [--gen|--to-hex HEX] [--out OUT]` stdout
+# report. Its grammar is fixed (spec §5.5.4). check_rotate verifies that
+# the report is internally consistent: exactly 4 lines —
+#   line 1 (always): `rotation 証明書: <out>`
+#   line 2 (always): `<old16>... → <new16>...` (old/new npub prefixes)
+#   line 3 (always): `注意: この証明書は「旧鍵の保有者が新鍵への移行を宣言した」ことの証拠です。`
+#   line 4 (always): `継続的な鍵の保有 (custody) の証明には、都度の challenge–response を使ってください。`
+# <out> is the cert JSON path verbatim (`--out`, default
+# `rotation.json`; user-controlled, so it must be non-empty with no
+# leading/trailing whitespace — §4.1.2's <out> rule). The line-2
+# prefixes are the first 16 characters of the old/new npubs (bech32
+# text, so only "16 non-whitespace characters" is checked — the same
+# treatment as §5.5.3's verify_rotation prefixes and §12.4's
+# revoke_fetch revoker). The `...` is three ASCII dots, the `→` is
+# U+2192 (literal); line 3's 「」 are full-width corner brackets
+# (U+300C/U+300D), line 4's `challenge–response` uses an en dash
+# (U+2013) — a second implementation must match these byte for byte.
+# The failure paths (neither --gen nor --to-hex, same old/new key)
+# print to stderr with exit 1, so the report exists only for the
+# success path — an empty stdout is rejected by the checker. The
+# --gen key-generation note (`新しい鍵を生成しました: ...`) is also
+# stderr, so it is not part of the report grammar.
+# The sibling rotation reports are different grammars and are
+# rejected: verify_rotation's verdict line (`rotation は有効です:
+# <old16>... → <new16>...` — check_verify_rotation's territory),
+# rotate_fetch's listing lines (`rotation 公開: ...` —
+# check_rotate_fetch's territory), and the rotate_pub publish line
+# (`publish: <受理|拒否> (...) id=<id>` — check_pub's territory).
+# Note: even if the line-2 prefixes are equal, the report is NOT
+# rejected — the full npubs never appear in the report, so a genuine
+# same-key report cannot be derived from it (the real same-key case
+# is a stderr refusal with exit 1 and leaves no stdout report).
+# Explicitly out of scope: whether the cert JSON exists and what it
+# contains (the cert's territory: `check_rotation` /
+# `verify_rotation_cert`), the old/new prefixes' truth, stderr, and
+# the exit code. Use this to prove a second implementation's
+# `rotate` CLI prints a compatible issuance report.
+
+_ROT_L1 = re.compile(r'^rotation 証明書: (.+)$')
+_ROT_L2 = re.compile(r'^(\S{16})\.\.\. → (\S{16})\.\.\.$')
+_ROT_L3 = ('注意: この証明書は「旧鍵の保有者が新鍵への移行を宣言した」'
+          'ことの証拠です。')
+_ROT_L4 = ('継続的な鍵の保有 (custody) の証明には、都度の challenge–response '
+          'を使ってください。')
+
+
+def conform_rotate_report(text: str):
+    """Verify a saved `nakama.py rotate` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    if len(lines) != 4:
+        return False, [f'report must be exactly 4 lines (cert line, '
+                       f'arrow line, 2 advisory lines), found {len(lines)}'], info
+    m1 = _ROT_L1.match(lines[0])
+    if not m1:
+        return False, ['line 1: not a rotate cert line '
+                       '(`rotation 証明書: <out>`)'], info
+    out = m1.group(1)
+    if not out or out.strip() != out:
+        return False, ['<out> is empty or has leading/trailing '
+                       'whitespace'], info
+    m2 = _ROT_L2.match(lines[1])
+    if not m2:
+        return False, ['line 2: not an arrow line '
+                       '(`<old16>... → <new16>...`)'], info
+    if lines[2] != _ROT_L3:
+        return False, ['line 3: not the advisory line (byte-exact: '
+                       '`注意: この証明書は「旧鍵の保有者が新鍵への移行を'
+                       '宣言した」ことの証拠です。`)'], info
+    if lines[3] != _ROT_L4:
+        return False, ['line 4: not the custody-advisory line (byte-exact: '
+                       '`継続的な鍵の保有 (custody) の証明には、都度の '
+                       'challenge–response を使ってください。`)'], info
+    info.append(f'out={out} old16={m2.group(1)} new16={m2.group(2)}')
+    return (not errs), errs, info
+
+
+def check_rotate_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_rotate_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
 
 
 def check_board_policy_files(paths: list[str]) -> int:
@@ -11170,6 +11308,240 @@ def selftest() -> int:
     print(f'--- compromise-withdraw {cpw_total - cpw_fails}/{cpw_total} passed ---')
     fails += cpw_fails
 
+    # ---------- check_rotate: rotate issuance report consistency
+    # The reference CLI prints a 4-line issuance report to stdout
+    # (exit 0): line 1 `rotation 証明書: <out>`, line 2
+    # `<old16>... → <new16>...`, lines 3-4 the two fixed advisory
+    # lines. Real-CLI in-process E2E below: real keyfile ->
+    # cmd_rotate. The --gen key-generation note and the failure
+    # paths print to stderr — their empty stdout is rejected by the
+    # checker.
+    rti_fails = 0
+    import tempfile as _rti_tf
+    import io as _rti_io
+    import contextlib as _rti_ctx
+    from types import SimpleNamespace as _rti_NS
+
+    _rti_sa, _rti_npa = _key()
+    _rti_sb, _rti_npb = _key()
+
+    def _rti_rotate(keyfile, out, gen, to_hex, to_keyfile):
+        buf = _rti_io.StringIO()
+        err = _rti_io.StringIO()
+        code = 0
+        with _rti_ctx.redirect_stdout(buf), _rti_ctx.redirect_stderr(err):
+            try:
+                nakama.cmd_rotate(_rti_NS(keyfile=keyfile, out=out,
+                                         gen=gen, to_hex=to_hex,
+                                         to_keyfile=to_keyfile))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        return buf.getvalue(), err.getvalue(), code
+
+    def _rti_rep(out, old16, new16):
+        return (f'rotation 証明書: {out}\n'
+                f'{old16}... → {new16}...\n'
+                f'注意: この証明書は「旧鍵の保有者が新鍵への移行を宣言した」'
+                f'ことの証拠です。\n'
+                f'継続的な鍵の保有 (custody) の証明には、都度の challenge–response '
+                f'を使ってください。\n')
+
+    def _rti_cert_ok(path):
+        try:
+            import json as _rti_json
+            return nakama.verify_rotation_cert(
+                _rti_json.load(open(path)))
+        except Exception:
+            return False
+
+    _rti_e2e = []  # (name, rep, err, code, kind, want)
+    with _rti_tf.TemporaryDirectory() as _rti_td:
+        _rti_kf = os.path.join(_rti_td, 'keyfile.json')
+        nakama.save_key(_rti_kf, _rti_sa)
+        # fresh rotation via --to-hex (deterministic new key)
+        _rti_out1 = os.path.join(_rti_td, 'rotation.json')
+        _rep, _err, _code = _rti_rotate(_rti_kf, _rti_out1, False,
+                                       _rti_sb.hex(), None)
+        _rti_e2e.append(('fresh rotation (4 lines)', _rep, _err, _code,
+                         'exact',
+                         (_rti_rep(_rti_out1, _rti_npa[:16], _rti_npb[:16]),
+                          '', _rti_cert_ok(_rti_out1))))
+        # --out with a space in the filename
+        _rti_out2 = os.path.join(_rti_td, 'my rotation.json')
+        _rep, _err, _code = _rti_rotate(_rti_kf, _rti_out2, False,
+                                       _rti_sb.hex(), None)
+        _rti_e2e.append(('custom --out with space', _rep, _err, _code,
+                         'exact',
+                         (_rti_rep(_rti_out2, _rti_npa[:16], _rti_npb[:16]),
+                          '', _rti_cert_ok(_rti_out2))))
+        # --gen: new key generated (stderr note + exit 0, 4-line stdout)
+        _rti_out3 = os.path.join(_rti_td, 'rotation-gen.json')
+        _rti_tkf = os.path.join(_rti_td, 'new-keyfile.json')
+        _rep, _err, _code = _rti_rotate(_rti_kf, _rti_out3, True, None,
+                                       _rti_tkf)
+        _rti_e2e.append(('--gen (new keyfile)', _rep, _err, _code, 'gen',
+                         (f'新しい鍵を生成しました: {_rti_tkf}\n',
+                          _rti_npa[:16], _rti_out3,
+                          _rti_cert_ok(_rti_out3))))
+        # failure: neither --gen nor --to-hex
+        _rep, _err, _code = _rti_rotate(_rti_kf, _rti_out1, False, None,
+                                       None)
+        _rti_e2e.append(('no --gen/--to-hex (stderr refusal, exit 1)',
+                         _rep, _err, _code, 'fail',
+                         ('--gen または --to-hex HEX が必要です\n',)))
+        # failure: same key
+        _rep, _err, _code = _rti_rotate(_rti_kf, _rti_out1, False,
+                                       _rti_sa.hex(), None)
+        _rti_e2e.append(('same key (stderr refusal, exit 1)',
+                         _rep, _err, _code, 'fail',
+                         ('同じ鍵です。ローテーションになりません。\n',)))
+    for name, rep, err, code, kind, want in _rti_e2e:
+        errs = []
+        if kind == 'fail':
+            # failure path: stdout must be empty, exit 1, stderr the
+            # refusal — and the empty stdout is rejected by the
+            # checker (the failure path has no report)
+            good = (rep == '') and (code == 1) and (err == want[0]) and \
+                not conform_rotate_report(rep)[0]
+            info = ['failure path refused on stderr (no stdout report)']
+        elif kind == 'gen':
+            # --gen: the new key is random, so check the stdout grammar
+            # plus line 1 byte-exact and the old16 prefix; the cert
+            # itself was verified inside the tempdir
+            want_err, old16, cert_out, cert_ok = want
+            lines = rep.splitlines()
+            good = (code == 0) and (err == want_err) and len(lines) == 4 \
+                and lines[0] == f'rotation 証明書: {cert_out}' \
+                and lines[1].startswith(old16 + '... → ') \
+                and conform_rotate_report(rep)[0] and cert_ok
+            info = ['--gen stdout report valid'
+                    + ('' if cert_ok else ' (cert invalid!)')]
+        else:
+            want_rep, want_err, cert_ok = want
+            exact = (rep == want_rep) and (code == 0) and (err == want_err)
+            ok, errs, info = conform_rotate_report(rep)
+            good = exact and ok and cert_ok
+            if exact and ok and not cert_ok:
+                info = ['cert failed verify_rotation_cert']
+        print(f'rotate-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        if not good:
+            print(f'    - got stdout={rep!r} code={code} stderr={err!r}')
+            if kind == 'exact' and rep != want[0]:
+                print(f'    - want stdout={want[0]!r}')
+            for e in errs:
+                print(f'    - {e}')
+            rti_fails += 1
+
+    # hand-crafted positives
+    _rti_d1 = 'rotation 証明書: rotation.json'
+    _rti_d2 = 'npub1qqqqqqqqqqq... → npub1rrrrrrrrrrr...'
+    _rti_d3 = ('注意: この証明書は「旧鍵の保有者が新鍵への移行を宣言した」'
+               'ことの証拠です。')
+    _rti_d4 = ('継続的な鍵の保有 (custody) の証明には、都度の challenge–response '
+               'を使ってください。')
+    rti_pos = [
+        ('standard 4-line',
+         f'{_rti_d1}\n{_rti_d2}\n{_rti_d3}\n{_rti_d4}\n'),
+        ('no trailing newline',
+         f'{_rti_d1}\n{_rti_d2}\n{_rti_d3}\n{_rti_d4}'),
+        ('trailing blanks',
+         f'{_rti_d1}\n{_rti_d2}\n{_rti_d3}\n{_rti_d4}\n\n\n'),
+        ('out with space and unicode',
+         f'rotation 証明書: /tmp/my 移行.json\n{_rti_d2}\n{_rti_d3}\n'
+         f'{_rti_d4}\n'),
+        ('relative out path',
+         f'rotation 証明書: certs/rotation.json\n{_rti_d2}\n{_rti_d3}\n'
+         f'{_rti_d4}\n'),
+    ]
+    for name, rep in rti_pos:
+        ok, errs, info = conform_rotate_report(rep)
+        print(f'rotate/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        rti_fails += 0 if ok else 1
+
+    # hand-crafted negatives
+    rti_neg = []
+    rti_neg.append(('empty report', ''))
+    rti_neg.append(('garbage line', 'hello\n'))
+    rti_neg.append(('three lines (line 4 missing)',
+                    f'{_rti_d1}\n{_rti_d2}\n{_rti_d3}\n'))
+    rti_neg.append(('five lines (extra line)',
+                    f'{_rti_d1}\n{_rti_d2}\n{_rti_d3}\n{_rti_d4}\n'
+                    f'余計な行\n'))
+    rti_neg.append(('two reports concatenated',
+                    f'{_rti_d1}\n{_rti_d2}\n{_rti_d3}\n{_rti_d4}\n'
+                    f'{_rti_d1}\n{_rti_d2}\n{_rti_d3}\n{_rti_d4}\n'))
+    rti_neg.append(('line 1 wrong verb (revoke issuance, sibling)',
+                    f'revocation イベント: revocation.json — bond '
+                    f'{"ab" * 8}... の解消を宣言しました。\n'
+                    f'{_rti_d2}\n{_rti_d3}\n{_rti_d4}\n'))
+    rti_neg.append(('line 1 empty <out>',
+                    f'rotation 証明書: \n{_rti_d2}\n{_rti_d3}\n{_rti_d4}\n'))
+    rti_neg.append(('line 1 <out> trailing space',
+                    f'rotation 証明書: rotation.json \n{_rti_d2}\n'
+                    f'{_rti_d3}\n{_rti_d4}\n'))
+    rti_neg.append(('line 2 verify_rotation valid line (sibling)',
+                    f'{_rti_d1}\n'
+                    f'rotation は有効です: npub1qqqqqqqqqqq... → '
+                    f'npub1rrrrrrrrrrr...\n'
+                    f'{_rti_d3}\n{_rti_d4}\n'))
+    rti_neg.append(('line 2 ASCII arrow instead of →',
+                    f'{_rti_d1}\n'
+                    f'npub1qqqqqqqqqqq... -> npub1rrrrrrrrrrr...\n'
+                    f'{_rti_d3}\n{_rti_d4}\n'))
+    rti_neg.append(('line 2 ellipsis missing',
+                    f'{_rti_d1}\n'
+                    f'npub1qqqqqqqqqqq → npub1rrrrrrrrrrr\n'
+                    f'{_rti_d3}\n{_rti_d4}\n'))
+    rti_neg.append(('line 2 old prefix short',
+                    f'{_rti_d1}\n'
+                    f'npub1qqqqqqq... → npub1rrrrrrrrrrr...\n'
+                    f'{_rti_d3}\n{_rti_d4}\n'))
+    rti_neg.append(('line 2 prefix with space',
+                    f'{_rti_d1}\n'
+                    f'npub1qq qq qqqq... → npub1rrrrrrrrrrr...\n'
+                    f'{_rti_d3}\n{_rti_d4}\n'))
+    rti_neg.append(('line 3 ASCII quotes instead of 「」',
+                    f'{_rti_d1}\n{_rti_d2}\n'
+                    f'注意: この証明書は"旧鍵の保有者が新鍵への移行を宣言した"'
+                    f'ことの証拠です。\n{_rti_d4}\n'))
+    rti_neg.append(('line 3 missing (line 4 moved up)',
+                    f'{_rti_d1}\n{_rti_d2}\n{_rti_d4}\n'))
+    rti_neg.append(('line 4 ASCII hyphen in challenge-response',
+                    f'{_rti_d1}\n{_rti_d2}\n{_rti_d3}\n'
+                    f'継続的な鍵の保有 (custody) の証明には、都度の '
+                    f'challenge-response を使ってください。\n'))
+    rti_neg.append(('line 4 final 。 missing',
+                    f'{_rti_d1}\n{_rti_d2}\n{_rti_d3}\n'
+                    f'継続的な鍵の保有 (custody) の証明には、都度の challenge–response '
+                    f'を使ってください\n'))
+    rti_neg.append(('line order swapped (advisory first)',
+                    f'{_rti_d3}\n{_rti_d1}\n{_rti_d2}\n{_rti_d4}\n'))
+    rti_neg.append(('leading blank line',
+                    f'\n{_rti_d1}\n{_rti_d2}\n{_rti_d3}\n{_rti_d4}\n'))
+    rti_neg.append(('rotate_fetch listing line (sibling)',
+                    f'{_rti_d1}\n'
+                    f'rotation 公開: npub1qqqqqqqqqqq... → '
+                    f'npub1rrrrrrrrrrr... (created_at 2026-10-02)\n'
+                    f'{_rti_d3}\n{_rti_d4}\n'))
+    rti_neg.append(('rotate_pub publish line (sibling)',
+                    'publish: 受理 (OK) id=' + '0123456789abcdef' * 4 + '\n'))
+
+    for name, rep in rti_neg:
+        ok, errs, info = conform_rotate_report(rep)
+        good = not ok
+        print(f'rotate-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            rti_fails += 1
+
+    rti_total = len(_rti_e2e) + len(rti_pos) + len(rti_neg)
+    print(f'--- rotate {rti_total - rti_fails}/{rti_total} passed ---')
+    fails += rti_fails
+
     # ---------- check_init: init report consistency
     # The reference CLI prints the new identity's npub to stdout, one
     # line, exit 0 (cmd_init with --from-hex for a deterministic key;
@@ -16586,7 +16958,7 @@ def selftest() -> int:
         + bps_total + vbp_total + vrf_total + pr_total + ac_total \
         + ch_total + ck_total + vrv_total + rvk_total + wrn_total \
         + crgd_total + rvi_total + ini_total + dno_total + cpi_total \
-        + cpd_total + cpw_total
+        + cpd_total + cpw_total + rti_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -16932,6 +17304,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_verify_rotation_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_rotate':
+        if len(argv) < 3:
+            print('usage: conformance.py check_rotate '
+                  '<report.txt> [...]')
+            return 2
+        return check_rotate_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_verify_revocation':
         if len(argv) < 3:
             print('usage: conformance.py check_verify_revocation '
@@ -17036,6 +17414,7 @@ def main(argv: list[str]) -> int:
           'check_dm_recv <report.txt> [...] | '
           'check_dm_send <report.txt> [...] | '
           'check_verify_rotation <report.txt> [...] | '
+          'check_rotate <report.txt> [...] | '
           'check_verify_revocation <report.txt> [...] | '
           'check_board_policy <report.txt> [...] | '
           'check_board_policy_sign <report.txt> [...] | '
