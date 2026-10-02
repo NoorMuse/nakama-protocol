@@ -524,6 +524,10 @@ def cmd_rotate_fetch(args):
     secret = load_key(args.keyfile)
     try:
         old_hex = npub_to_hex(args.old_npub)
+        if old_hex is None:
+            # npub_to_hex は変換不能時に None を返す（例外を投げない）。
+            # None のまま進むと '#d': [None] のゴミフィルタを送ってしまう。
+            raise ValueError('invalid npub')
     except Exception:
         print('npub は有効ではありません', file=sys.stderr)
         sys.exit(1)
@@ -809,10 +813,6 @@ def compromise_registry_path(registry: str, subject_hex: str) -> str:
     return os.path.join(registry, subject_hex + '.json')
 
 
-def npub_to_hex(npub: str) -> str:
-    return NostrPublicKey.from_npub(npub).hex()
-
-
 def verify_compromise_event(decl: dict) -> bool:
     """key-compromise-declaration イベントの構造・署名検証。"""
     if decl.get('protocol') != 'nakama' or decl.get('version') != 1 or \
@@ -1018,8 +1018,8 @@ def cmd_compromise_declare(args):
     try:
         subject_hex = npub_to_hex(args.subject)
         if subject_hex is None:
-            # npub_to_hex の後発の定義は変換不能時に None を返す（例外を
-            # 投げない）ため、None も無効として拒否する。None のまま進むと
+            # npub_to_hex は変換不能時に None を返す（例外を投げない）
+            # ため、None も無効として拒否する。None のまま進むと
             # import_compromise_event 内で TypeError になる。
             raise ValueError('invalid npub')
     except Exception:
@@ -1099,6 +1099,10 @@ def cmd_compromise_fetch(args):
     secret = load_key(args.keyfile)
     try:
         subject_hex = npub_to_hex(args.npub)
+        if subject_hex is None:
+            # npub_to_hex は変換不能時に None を返す（例外を投げない）。
+            # None のまま進むと下の subject_hex + ':' で TypeError になる。
+            raise ValueError('invalid npub')
     except Exception:
         print('npub は有効ではありません', file=sys.stderr)
         sys.exit(1)
@@ -1150,8 +1154,8 @@ def cmd_compromise_withdraw(args):
     try:
         subject_hex = npub_to_hex(args.subject)
         if subject_hex is None:
-            # npub_to_hex の後発の定義は変換不能時に None を返す（例外を
-            # 投げない）ため、None も無効として拒否する。None のまま進むと
+            # npub_to_hex は変換不能時に None を返す（例外を投げない）
+            # ため、None も無効として拒否する。None のまま進むと
             # compromise_registry_path 内で TypeError になる。
             raise ValueError('invalid npub')
     except Exception:
@@ -1198,6 +1202,10 @@ def key_status(subject_npub: str, registry: str, me_npub: str | None,
     """
     try:
         subject_hex = npub_to_hex(subject_npub)
+        if subject_hex is None:
+            # npub_to_hex は変換不能時に None を返す（例外を投げない）。
+            # None のまま進むと compromise_registry_path で TypeError。
+            raise ValueError('invalid npub')
     except Exception:
         return {'declarations': [], 'suspected_count': 0, 'suspected': False,
                 'withdrawn_count': 0, 'invalid_count': 0, 'error': 'npub が無効です'}
