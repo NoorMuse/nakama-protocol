@@ -4431,6 +4431,98 @@ def check_revoke_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_revoke_import: revoke_import report consistency ----------
+
+# A saved `nakama.py revoke_import <revocation.json> [--bond] [--registry]`
+# stdout report. Its grammar is fixed (spec §12.7).
+# check_revoke_import verifies that the report is internally consistent.
+# Exactly one line:
+#   stored:    `revocation を registry に記録しました: <path>`
+#   duplicate: `既に registry に記録済みです: <path>`
+# where <path> is the registry record path `<registry>/<bond_hash>.json`
+# (the reference CLI prints `revocation_registry_path(registry, bond_hash)`
+# verbatim). The report's one internal rule: the basename is
+# `<64 hex>.json` — bond_hash is the sha256 hexdigest of the bond (§12.2),
+# and the registry file layout is `<registry>/<bond_hash>.json`; the
+# registry directory part is free (user-controlled --registry), so only
+# the basename is constrained. Uppercase hex is accepted, as with the
+# §12.5/§12.6 prefix checkers. <path> must be non-empty with no
+# leading/trailing whitespace (§4.1.2's <out> rule). Trailing blank lines
+# are tolerated; a leading blank line is rejected. The sibling revoke
+# reports are different grammars and are rejected: the `revoke` issuance
+# report (`revocation イベント: ...` — 2-3 lines, check_revoke's
+# territory), the `verify_revocation` verdicts (`revocation は有効です` /
+# `revocation は無効です` — check_verify_revocation), the `revoke_pub`
+# publish line (`publish: <受理|拒否> (...) id=<id>`), the `revoke_fetch`
+# footer (`<N> 件のイベントを取得: ...`), and the `revoke_list` report.
+# Explicitly out of scope: whether the record file exists and what it
+# contains (the revocation event's territory: `check_revocation` /
+# `verify_revocation_event`), the bond_hash truth, whether 'stored' vs
+# 'duplicate' was the right call (import_revocation_event's territory —
+# the registry's first-win rule), stderr, and the exit code. Use this to
+# prove a second implementation's `revoke_import` CLI prints a compatible
+# report.
+
+_RE_RVI_LINE = re.compile(
+    r'^(?:revocation を registry に記録しました|既に registry に記録済みです): (.+)$')
+_RE_RVI_BASENAME = re.compile(r'^[0-9a-fA-F]{64}\.json$')
+
+
+def conform_revoke_import_report(text: str):
+    """Verify a saved `nakama.py revoke_import` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    if len(lines) != 1:
+        return False, [f'report must be exactly 1 line, '
+                       f'found {len(lines)}'], info
+    m = _RE_RVI_LINE.match(lines[0])
+    if not m:
+        return False, ['line 1: not a revoke_import report line '
+                       '(`revocation を registry に記録しました: <path>` / '
+                       '`既に registry に記録済みです: <path>`)'], info
+    path = m.group(1)
+    if path.strip() != path:
+        return False, ['<path> has leading/trailing whitespace'], info
+    base = os.path.basename(path)
+    if not _RE_RVI_BASENAME.match(base):
+        return False, [f'<path> basename `{base}` is not `<64 hex>.json` '
+                       '(the registry record filename is the bond_hash '
+                       'sha256 hexdigest)'], info
+    kind = 'stored' if lines[0].startswith('revocation を') else 'duplicate'
+    info.append(f'{kind}: {base[:16]}...')
+    return (not errs), errs, info
+
+
+def check_revoke_import_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_revoke_import_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- check_compromise_warnings: compromise WARN-line consistency ----------
 
 # A saved stderr capture of the compromise-declaration warnings the
@@ -9674,6 +9766,202 @@ def selftest() -> int:
     print(f'--- revoke {rvk_total - rvk_fails}/{rvk_total} passed ---')
     fails += rvk_fails
 
+    # ---------- check_revoke_import: revoke_import report consistency
+    # The reference CLI prints one of two single-line reports to stdout
+    # (exit 0): `revocation を registry に記録しました: <path>` (stored) or
+    # `既に registry に記録済みです: <path>` (duplicate), where <path> is
+    # `<registry>/<bond_hash>.json`. Real-CLI in-process E2E below:
+    # cmd_revoke (real bond via cmd_propose+cmd_accept, real Schnorr-signed
+    # revocation) -> cmd_revoke_import, stdout captured exactly.
+    rvi_fails = 0
+    import tempfile as _rvi_tf
+    import io as _rvi_io
+    import contextlib as _rvi_ctx
+    from types import SimpleNamespace as _rvi_NS
+
+    _rvi_sa, _rvi_npa = _key()
+    _rvi_sb, _rvi_npb = _key()
+
+    def _rvi_setup(tmpd):
+        kfa = os.path.join(tmpd, 'key_a.json')
+        nakama.save_key(kfa, _rvi_sa)
+        kfb = os.path.join(tmpd, 'key_b.json')
+        nakama.save_key(kfb, _rvi_sb)
+        ppath = os.path.join(tmpd, 'proposal.json')
+        bpath = os.path.join(tmpd, 'bond.json')
+        with _rvi_ctx.redirect_stdout(_rvi_io.StringIO()), \
+                _rvi_ctx.redirect_stderr(_rvi_io.StringIO()):
+            nakama.cmd_propose(_rvi_NS(
+                npub=_rvi_npb, keyfile=kfa, out=ppath,
+                expires_days=30, no_expiry=False, markdown=False))
+            nakama.cmd_accept(_rvi_NS(
+                proposal=ppath, from_b64=None, keyfile=kfb, out=bpath,
+                markdown=False, compromise_registry=tmpd))
+        return bpath
+
+    def _rvi_make_revocation(bpath, tmpd):
+        # issue one real revocation through cmd_revoke (no registry write)
+        rpath = os.path.join(tmpd, 'revocation.json')
+        kf = os.path.join(tmpd, 'key_revk.json')
+        nakama.save_key(kf, _rvi_sa)
+        with _rvi_ctx.redirect_stdout(_rvi_io.StringIO()), \
+                _rvi_ctx.redirect_stderr(_rvi_io.StringIO()):
+            nakama.cmd_revoke(_rvi_NS(
+                bond=bpath, keyfile=kf, reason='', out=rpath,
+                no_registry=True, registry=None))
+        return rpath
+
+    def _rvi_import(rpath, tmpd, registry=None):
+        buf = _rvi_io.StringIO()
+        err = _rvi_io.StringIO()
+        code = 0
+        with _rvi_ctx.redirect_stdout(buf), _rvi_ctx.redirect_stderr(err):
+            try:
+                nakama.cmd_revoke_import(_rvi_NS(
+                    revocation=rpath, bond=None,
+                    registry=registry or os.path.join(tmpd, 'revocations')))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        return buf.getvalue(), err.getvalue(), code
+
+    _rvi_e2e = []
+    with _rvi_tf.TemporaryDirectory() as _rvi_td:
+        _rvi_bpath = _rvi_setup(_rvi_td)
+        with open(_rvi_bpath) as f:
+            _rvi_bh = nakama.bond_hash(json.load(f))
+        _rvi_rpath = _rvi_make_revocation(_rvi_bpath, _rvi_td)
+        _rvi_reg = os.path.join(_rvi_td, 'revocations')
+        _rvi_rp = os.path.join(_rvi_reg, _rvi_bh + '.json')
+        _rep, _err, _code = _rvi_import(_rvi_rpath, _rvi_td)
+        _rvi_e2e.append(('stored (fresh registry)', _rep, _err, _code,
+                         f'revocation を registry に記録しました: '
+                         f'{_rvi_rp}\n'))
+        _rep, _err, _code = _rvi_import(_rvi_rpath, _rvi_td)
+        _rvi_e2e.append(('duplicate (second import)', _rep, _err, _code,
+                         f'既に registry に記録済みです: {_rvi_rp}\n'))
+        _rvi_reg2 = os.path.join(_rvi_td, 'other registry')
+        _rvi_rp2 = os.path.join(_rvi_reg2, _rvi_bh + '.json')
+        _rep, _err, _code = _rvi_import(_rvi_rpath, _rvi_td,
+                                        registry=_rvi_reg2)
+        _rvi_e2e.append(('stored (custom --registry with space)', _rep,
+                         _err, _code,
+                         f'revocation を registry に記録しました: '
+                         f'{_rvi_rp2}\n'))
+        # tampered signature: stderr verdict + exit 1, empty stdout
+        with open(_rvi_rpath) as f:
+            _rvi_r = json.load(f)
+        _rvi_r['sig'] = ('00' if _rvi_r['sig'][:2] != '00' else 'ff') \
+            + _rvi_r['sig'][2:]
+        _rvi_bad = os.path.join(_rvi_td, 'revocation-bad.json')
+        with open(_rvi_bad, 'w') as f:
+            json.dump(_rvi_r, f)
+        _rep, _err, _code = _rvi_import(_rvi_bad, _rvi_td)
+        _rvi_e2e.append(('invalid sig (stderr verdict, exit 1)', _rep,
+                         _err, _code, None))
+    for name, rep, err, code, want_rep in _rvi_e2e:
+        if want_rep is None:
+            # invalid case: stdout must be empty, exit 1, stderr the
+            # refusal verdict — and the empty stdout is rejected by the
+            # checker (the invalid case has no report)
+            good = (rep == '') and (code == 1) and \
+                (err == 'revocation は無効です（registry には記録しません）\n') and \
+                not conform_revoke_import_report(rep)[0]
+            info = ['invalid import refused on stderr (no stdout report)']
+        else:
+            exact = (rep == want_rep) and (code == 0) and (err == '')
+            ok, errs, info = conform_revoke_import_report(rep)
+            good = exact and ok
+        print(f'revoke-import-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        if not good:
+            if want_rep is not None and rep != want_rep:
+                print(f'    - stdout/exit mismatch: {rep!r} code={code} '
+                      f'stderr={err!r}')
+            if want_rep is None:
+                print(f'    - got stdout={rep!r} code={code} stderr={err!r}')
+            for e in (errs if want_rep is not None else []):
+                print(f'    - {e}')
+            rvi_fails += 1
+
+    # hand-crafted positives
+    _rvi_bh = 'ab' * 32  # 64 lowercase hex
+    _rvi_BH = 'AB' * 32  # uppercase tolerated, as with §12.5/§12.6
+    _rvi_l1 = f'revocation を registry に記録しました: /tmp/r/{_rvi_bh}.json'
+    _rvi_l2 = f'既に registry に記録済みです: /tmp/r/{_rvi_BH}.json'
+    rvi_pos = [
+        ('stored', f'{_rvi_l1}\n'),
+        ('duplicate', f'{_rvi_l2}\n'),
+        ('uppercase hex basename', f'{_rvi_l2}\n'),
+        ('no trailing newline', _rvi_l1),
+        ('trailing blanks', f'{_rvi_l1}\n\n\n'),
+        ('relative registry dir', f'revocation を registry に記録しました: '
+                                 f'revocations/{_rvi_bh}.json\n'),
+        ('spaces in registry dir', f'revocation を registry に記録しました: '
+                                   f'/tmp/my revocations/{_rvi_bh}.json\n'),
+    ]
+    for name, rep in rvi_pos:
+        ok, errs, info = conform_revoke_import_report(rep)
+        print(f'revoke-import/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        rvi_fails += 0 if ok else 1
+
+    # hand-crafted negatives
+    rvi_neg = []
+    rvi_neg.append(('empty report', ''))
+    rvi_neg.append(('garbage line', 'hello\n'))
+    rvi_neg.append(('two reports concatenated',
+                    f'{_rvi_l1}\n{_rvi_l2}\n'))
+    rvi_neg.append(('extra line after report',
+                    f'{_rvi_l1}\n取り込み: 余計な行\n'))
+    rvi_neg.append(('missing colon separator',
+                    f'revocation を registry に記録しました /tmp/r/{_rvi_bh}.json\n'))
+    rvi_neg.append(('wrong verb (保存しました)',
+                    f'revocation を registry に保存しました: /tmp/r/{_rvi_bh}.json\n'))
+    rvi_neg.append(('wrong duplicate verb (既に…記録しました)',
+                    f'既に registry に記録しました: /tmp/r/{_rvi_bh}.json\n'))
+    rvi_neg.append(('empty path', 'revocation を registry に記録しました: \n'))
+    rvi_neg.append(('leading whitespace in path',
+                    f'revocation を registry に記録しました:  /tmp/r/{_rvi_bh}.json\n'))
+    rvi_neg.append(('trailing whitespace in path',
+                    f'revocation を registry に記録しました: /tmp/r/{_rvi_bh}.json \n'))
+    rvi_neg.append(('short bond_hash basename',
+                    'revocation を registry に記録しました: /tmp/r/ab12.json\n'))
+    rvi_neg.append(('non-hex bond_hash basename',
+                    'revocation を registry に記録しました: /tmp/r/' +
+                    'zz' * 32 + '.json\n'))
+    rvi_neg.append(('no .json extension',
+                    f'revocation を registry に記録しました: /tmp/r/{_rvi_bh}\n'))
+    rvi_neg.append(('revoke issuance report (sibling)',
+                    f'revocation イベント: revocation.json — bond abcd1234abcd1234... '
+                    f'の解消を宣言しました。\n'
+                    f'ローカル registry に記録しました: /tmp/r/{_rvi_bh}.json\n'
+                    f'解消イベントは公開チャネルで共有してください'
+                    f'（仲間の公開記録に残ります）。\n'))
+    rvi_neg.append(('verify_revocation valid verdict (sibling)',
+                    f'revocation は有効です — bond abcd1234abcd1234... は '
+                    f'npub1abc... により解消されました。\n'))
+    rvi_neg.append(('revoke_pub publish line (sibling)',
+                    'publish: 受理 (OK) id=0123456789abcdef\n'))
+    rvi_neg.append(('revoke_fetch footer (sibling)',
+                    '3 件のイベントを取得: 1 件を取り込み、2 件をスキップ\n'))
+    rvi_neg.append(('revoke_list empty line (sibling)',
+                    'revocation registry は空です\n'))
+    rvi_neg.append(('leading blank line', f'\n{_rvi_l1}\n'))
+
+    for name, rep in rvi_neg:
+        ok, errs, info = conform_revoke_import_report(rep)
+        good = not ok
+        print(f'revoke-import-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            rvi_fails += 1
+
+    rvi_total = len(_rvi_e2e) + len(rvi_pos) + len(rvi_neg)
+    print(f'--- revoke-import {rvi_total - rvi_fails}/{rvi_total} passed ---')
+    fails += rvi_fails
+
     # ---------- check_compromise_warnings: compromise WARN-line consistency
     # The reference CLI prints compromise warnings to stderr (never
     # blocking, exit code unchanged) from verify / challenge / check /
@@ -14724,7 +15012,7 @@ def selftest() -> int:
         + bdc_total + bcs_total + dmr_total + dms_total + vrt_total + bpl_total \
         + bps_total + vbp_total + vrf_total + pr_total + ac_total \
         + ch_total + ck_total + vrv_total + rvk_total + wrn_total \
-        + crgd_total
+        + crgd_total + rvi_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -15023,6 +15311,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_dm_send <report.txt> [...]')
             return 2
         return check_dm_send_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_revoke_import':
+        if len(argv) < 3:
+            print('usage: conformance.py check_revoke_import <report.txt> [...]')
+            return 2
+        return check_revoke_import_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_rotation_downgrade':
         if len(argv) < 3:
             print('usage: conformance.py check_rotation_downgrade '
