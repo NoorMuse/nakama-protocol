@@ -131,3 +131,6 @@
 - selftest 27/27（新規: 実 CLI の in-process E2E 6（通常発行・2 回目の発行も有効（署名は呼び出しごとに fresh randomness）・`cmd_check` による roundtrip 検証 `本人です 🤝`・短い nonce・非 hex nonce・64 バイト nonce）＋正常 craft 5＋却下 16）、selftest 総計 1455/1455 PASS、全 21 テストファイル回帰 PASS。
 - §3.3 に respond レポートの表示文法を固定。ロードマップ §7 に v0.87 を追加。spec を files/ と同期。
 - 外部 push なし（run 開始時 remote HEAD=seen_refs=14402fd）。
+- 2026-10-02 v0.89: conformance カバレッジ監査の自動化（§30.4）。v0.88 の監査手順を `test_conformance_audit.py`（新規テストファイル）として機械化: nakama.py の add_parser 登録（54 件）× conformance.py の check_* 分岐（64 件）を静的解析し、§30.1（47 発行レポートチェッカー）・§30.3（17 アーティファクト意味論チェッカー）の両表との突き合わせをアサート。検証 8 ケース（全サブコマンドの §30.1 掲載・checker の実在・orphan 分岐なし・§30.3 の dead 行なし・本文スナップショット数（54→47、残り 17）の一致・§30.2 共有文法の例外（check_init=init/whoami、check_pub=7 publish 系）の一致）。§30.4 に自動化の注記を追加、§7 ロードマップに v0.89 を追加、spec を files/ と同期。
+- テスト 8/8 PASS、全 22 テストファイル回帰 PASS、conformance selftest 1455/1455 PASS。
+- 外部 push なし（run 開始時 remote HEAD=seen_refs=98c981f）。
