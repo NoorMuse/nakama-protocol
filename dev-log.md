@@ -112,3 +112,8 @@
 - selftest 23/23（新規: 実 CLI の in-process E2E 3（正署名・署名改ざん・別鍵の署名、各 stdout＋exit 完全一致）＋正常 craft 6＋却下 14）、selftest 総計 1016/1016 PASS、全 21 テストファイル回帰 PASS。usage 文字列に `check_challenge` の記載漏れ（v0.71 追加分）を本ランで補完。
 - ロードマップ §7 に v0.72 を追加。spec を files/ と同期。
 - 外部 push なし（run 開始時 remote HEAD=seen_refs=8280d30）。
+
+- 2026-10-02: v0.76 完了 — conformance チェッカー第 54 弾 `check_compromise_warnings`（ローカル出力チェッカー第 39 弾）。侵害警告の stderr 行（§14.2 の verify / challenge / check / board_verify / board_send / dm_send、§15 の accept、§16 の verify_binding）の内部整合性チェッカー。文法: 各行 `WARN: <npub[:12]>... has <N> active compromise declaration(s) — see: nakama.py key_status <npub>` に完全一致 — 省略記号は ASCII 3 ドット `...` がリテラル（§14.2・§15.2 のプローズの `…` は略記だったため §14.2.1 で実文法に固定）、`—`（em dash）リテラル、`<N>` は `[1-9][0-9]*`（N=0 不可・先行ゼロ不可）、`<npub>` は 63 文字の bech32 形状（チェックサム検証は対象外）。唯一の内部ルール: prefix == npub[:12]。末尾空行許容・先頭空行却下。空 capture（警告なし）は有効 — 警告は任意出力。INFO 格下げ行（§14.3）と board_read の `⚠ compromised?` 注記行は別文法で相互拒否。対象外: `<N>` の真偽（registry の管轄）、npub チェックサム、stdout、exit コード。CLI: `conformance.py check_warnings <stderr.txt> [...]`。
+- selftest 24/24（新規: 実 CLI の in-process E2E 3（実 Schnorr 署名の侵害宣言を実 registry に import→`cmd_dm_send` の stderr 完全一致: 宣言 2 件で N=2・撤回のみ registry で警告なし・宣言 1 件で N=1、各 exit 0）＋正常 craft 6（1 行・2 行・複数桁 N・改行なし・末尾空行・空 capture）＋却下 15: ゴミ行・WARN 接頭辞欠落・INFO 格下げ行・board_read 注記行・prefix 不一致・N=0・N 先行ゼロ・Unicode 省略記号・em dash 違い・prefix 短・非 npub・末尾 npub 切り詰め・board_policy レポート・先頭空行・第 2 行ゴミ）、selftest 総計 1111/1111 PASS、全 21 テストファイル回帰 PASS。開発中の修正: prefix は `npub1`＋7 文字（{8} は誤記）で E2E 全滅を検出して修正。
+- §14.2.1 に侵害警告行の表示文法を固定。ロードマップ §7 に v0.76 を追加。spec を files/ と同期。
+- 外部 push なし（run 開始時 remote HEAD=seen_refs=69700f0）。

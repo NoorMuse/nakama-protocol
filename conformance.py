@@ -4431,6 +4431,98 @@ def check_revoke_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_compromise_warnings: compromise WARN-line consistency ----------
+
+# A saved stderr capture of the compromise-declaration warnings the
+# reference CLI prints (§14.2 verify/challenge/check/board_verify/
+# board_send/dm_send, §15 accept, §16 verify_binding). Its grammar is
+# fixed (spec §14.2.1). check_compromise_warnings verifies that the
+# capture is internally consistent. Zero or more lines, each:
+#   WARN: <npub[:12]>... has <N> active compromise declaration(s) — see: nakama.py key_status <npub>
+# Notes on the fixed grammar:
+#   - the ellipsis after the 12-char prefix is three literal ASCII
+#     dots `...` (the spec prose elsewhere uses `…`, but the reference
+#     CLI prints `...` — that is what a second implementation must
+#     match byte for byte);
+#   - the dash before `see:` is an em dash (U+2014), literal;
+#   - the npub prefix is the first 12 characters of the full npub
+#     printed at the end of the line (`npub1` + 7 bech32 chars) — the
+#     checker's one internal arithmetic rule is prefix == npub[:12];
+#   - N is the count of active (non-withdrawn) declarations, always
+#     >= 1 here (the helper returns no line when there are none), so
+#     `N=0` and leading-zero forms are rejected.
+# Trailing blank lines are tolerated; a leading blank line is rejected.
+# An empty capture is valid: it is the "no active declarations"
+# (no-warnings) case, which the reference CLI produces for most keys —
+# rejecting it would make the common case fail. The two sibling
+# warning grammars are different and are rejected: the INFO rotation
+# downgrade (`INFO: <npub[:12]>... has <N> active compromise
+# declaration(s) — 旧鍵への宣言（ローテーション済みのため情報扱い）`,
+# future checker candidate) and the board_read display note
+# (`⚠ compromised?`). Explicitly out of scope: the declaration count's
+# truth (the registry's territory: `key_status` /
+# `active_compromise_declarations`), the npub checksum (shape-checked
+# only, not bech32-validated), stdout, and the exit code (always 0 —
+# warnings never block).
+
+_RE_CMW_BECH32 = r'[023456789acdefghjklmnpqrstuvwxyz]'
+# full npub: an npub of a 32-byte key is always exactly 63 chars
+# ('npub1' + 58 bech32 chars) — shape-checked only, not checksum-validated
+_RE_CMW_LINE = re.compile(
+    r'^WARN: (npub1' + _RE_CMW_BECH32 + r'{7})\.\.\. has ([1-9][0-9]*) '
+    r'active compromise declaration\(s\) — see: nakama\.py key_status '
+    r'((npub1)' + _RE_CMW_BECH32 + r'{58})$')
+
+
+def conform_compromise_warnings(text: str):
+    """Verify a saved stderr capture of compromise warnings is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return True, [], ['no warnings emitted (no active declarations)']
+    if lines[0] == '':
+        return False, ['capture starts with a blank line'], info
+    for i, line in enumerate(lines):
+        m = _RE_CMW_LINE.match(line)
+        if not m:
+            return False, [f'line {i + 1}: not a compromise-warning line '
+                           '(`WARN: <npub[:12]>... has <N> active '
+                           'compromise declaration(s) — see: nakama.py '
+                           'key_status <npub>`)'], info
+        prefix, n, npub = m.group(1), m.group(2), m.group(3)
+        if prefix != npub[:12]:
+            return False, [f'line {i + 1}: npub prefix `{prefix}` does not '
+                           f'match the first 12 chars of `{npub[:12]}`'], info
+        info.append(f'warn {i + 1}: {prefix}... N={n}')
+    return (not errs), errs, info
+
+
+def check_compromise_warnings_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_compromise_warnings(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- check_board_policy: board_policy creation-report consistency ----------
 
 # A saved `nakama.py board_policy` stdout report. Its grammar is fixed
@@ -9484,6 +9576,177 @@ def selftest() -> int:
     print(f'--- revoke {rvk_total - rvk_fails}/{rvk_total} passed ---')
     fails += rvk_fails
 
+    # ---------- check_compromise_warnings: compromise WARN-line consistency
+    # The reference CLI prints compromise warnings to stderr (never
+    # blocking, exit code unchanged) from verify / challenge / check /
+    # board_verify / board_send / dm_send (§14.2), accept (§15), and
+    # verify_binding (§16). The selftest builds real Schnorr-signed
+    # declarations, imports them into a temp registry, and runs the real
+    # `cmd_dm_send` in-process, capturing stderr byte-for-byte.
+    wrn_fails = 0
+
+    def _wrn_keys():
+        import secrets as _secrets
+        s1 = _secrets.token_bytes(32)
+        s2 = _secrets.token_bytes(32)
+        s3 = _secrets.token_bytes(32)
+        return (s1, nakama.npub_of(s1)), (s2, nakama.npub_of(s2)), \
+            (s3, nakama.npub_of(s3))
+
+    (_wrn_ds, _wrn_dn), (_wrn_ss, _wrn_sn), (_wrn_ts, _wrn_tn) = _wrn_keys()
+    _WRN_TS = 1759370000
+
+    def _wrn_declare(decl_secret, subject_npub, ts, withdrawn=False):
+        return nakama.build_compromise_declaration(
+            decl_secret, subject_npub, ts, withdrawn, '', 'test', '')
+
+    def _wrn_run(registry):
+        # real CLI: dm_send to the subject key, stderr captured
+        kf = os.path.join(registry, '..', 'key_wrn.json')
+        kf = os.path.normpath(kf)
+        nakama.save_key(kf, _wrn_ts)
+        out = os.path.join(registry, '..', 'wrap.json')
+        out = os.path.normpath(out)
+        err = io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            try:
+                nakama.cmd_dm_send(SimpleNamespace(
+                    npub=_wrn_sn, message='hi', out=out, keyfile=kf,
+                    compromise_registry=registry))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        return err.getvalue(), code
+
+    _wrn_e2e = []
+    with tempfile.TemporaryDirectory() as _wrn_td:
+        _wrn_reg = os.path.join(_wrn_td, 'compromises')
+        # E2E 1: two active declarations -> N=2
+        nakama.import_compromise_event(
+            _wrn_declare(_wrn_ds, _wrn_sn, _WRN_TS), _wrn_reg)
+        nakama.import_compromise_event(
+            _wrn_declare(_wrn_ss, _wrn_sn, _WRN_TS + 60), _wrn_reg)
+        _err, _code = _wrn_run(_wrn_reg)
+        _wrn_e2e.append(('two active declarations', _err, _code,
+                         f'WARN: {_wrn_sn[:12]}... has 2 active '
+                         f'compromise declaration(s) — see: nakama.py '
+                         f'key_status {_wrn_sn}\n'))
+        # E2E 2: withdrawn-only registry -> no warnings
+        _wrn_reg2 = os.path.join(_wrn_td, 'compromises2')
+        nakama.import_compromise_event(
+            _wrn_declare(_wrn_ds, _wrn_sn, _WRN_TS + 120, True), _wrn_reg2)
+        _err2, _code2 = _wrn_run(_wrn_reg2)
+        _wrn_e2e.append(('withdrawn-only (silent)', _err2, _code2, ''))
+        # E2E 3: single active declaration -> N=1
+        _wrn_reg3 = os.path.join(_wrn_td, 'compromises3')
+        nakama.import_compromise_event(
+            _wrn_declare(_wrn_ts, _wrn_sn, _WRN_TS + 180), _wrn_reg3)
+        _err3, _code3 = _wrn_run(_wrn_reg3)
+        _wrn_e2e.append(('single active declaration', _err3, _code3,
+                         f'WARN: {_wrn_sn[:12]}... has 1 active '
+                         f'compromise declaration(s) — see: nakama.py '
+                         f'key_status {_wrn_sn}\n'))
+    for name, rep, code, want_rep in _wrn_e2e:
+        exact = (rep == want_rep) and (code == 0)
+        ok, errs, info = conform_compromise_warnings(rep)
+        good = exact and ok
+        print(f'warnings-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        if not good:
+            if not exact:
+                print(f'    - stderr/exit mismatch: {rep!r} code={code}')
+            for e in errs:
+                print(f'    - {e}')
+            wrn_fails += 1
+
+    # hand-crafted positives
+    _wrn_npub = _wrn_sn
+    _wrn_l = (f'WARN: {_wrn_npub[:12]}... has 1 active compromise '
+              f'declaration(s) — see: nakama.py key_status {_wrn_npub}')
+    wrn_pos = [
+        ('single warn', f'{_wrn_l}\n'),
+        ('two warns (two subjects)',
+         f'{_wrn_l}\n{_wrn_l}\n'),
+        ('multi-digit N',
+         f'WARN: {_wrn_npub[:12]}... has 12 active compromise '
+         f'declaration(s) — see: nakama.py key_status {_wrn_npub}\n'),
+        ('no trailing newline', f'{_wrn_l}'),
+        ('trailing blanks', f'{_wrn_l}\n\n\n'),
+        ('empty capture (no warnings)', ''),
+    ]
+    for name, rep in wrn_pos:
+        ok, errs, info = conform_compromise_warnings(rep)
+        print(f'warnings/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        wrn_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    wrn_neg = []
+    wrn_neg.append(('garbage line', 'hello\n'))
+    wrn_neg.append(('missing WARN prefix',
+                    f'{_wrn_l[6:]}\n'))
+    wrn_neg.append(('INFO rotation downgrade (sibling grammar)',
+                    f'INFO: {_wrn_npub[:12]}... has 1 active compromise '
+                    f'declaration(s) — 旧鍵への宣言'
+                    f'（ローテーション済みのため情報扱い）\n'))
+    wrn_neg.append(('board_read note (sibling grammar)',
+                    f'⚠ compromised?\n'))
+    wrn_neg.append(('prefix mismatch',
+                    f'WARN: npub1xxxxxxxx... has 1 active compromise '
+                    f'declaration(s) — see: nakama.py key_status '
+                    f'{_wrn_npub}\n'))
+    wrn_neg.append(('N=0 (never emitted)',
+                    f'WARN: {_wrn_npub[:12]}... has 0 active compromise '
+                    f'declaration(s) — see: nakama.py key_status '
+                    f'{_wrn_npub}\n'))
+    wrn_neg.append(('N with leading zero',
+                    f'WARN: {_wrn_npub[:12]}... has 01 active compromise '
+                    f'declaration(s) — see: nakama.py key_status '
+                    f'{_wrn_npub}\n'))
+    wrn_neg.append(('unicode ellipsis instead of ASCII dots',
+                    f'WARN: {_wrn_npub[:12]}… has 1 active compromise '
+                    f'declaration(s) — see: nakama.py key_status '
+                    f'{_wrn_npub}\n'))
+    wrn_neg.append(('colon instead of em dash',
+                    f'WARN: {_wrn_npub[:12]}... has 1 active compromise '
+                    f'declaration(s): see: nakama.py key_status '
+                    f'{_wrn_npub}\n'))
+    wrn_neg.append(('short prefix (11 chars)',
+                    f'WARN: {_wrn_npub[:11]}... has 1 active compromise '
+                    f'declaration(s) — see: nakama.py key_status '
+                    f'{_wrn_npub}\n'))
+    wrn_neg.append(('non-npub subject',
+                    f'WARN: deadbeefcafe... has 1 active compromise '
+                    f'declaration(s) — see: nakama.py key_status '
+                    f'deadbeefcafe0123456789\n'))
+    wrn_neg.append(('truncated npub at end',
+                    f'WARN: {_wrn_npub[:12]}... has 1 active compromise '
+                    f'declaration(s) — see: nakama.py key_status '
+                    f'{_wrn_npub[:12]}\n'))
+    wrn_neg.append(('board_policy report (other grammar)',
+                    'board-policy 案: /tmp/p.json — あなたの署名 1/2'
+                    '（初回は全員 2/2 の署名が必要）\n'))
+    wrn_neg.append(('leading blank line',
+                    f'\n{_wrn_l}\n'))
+    wrn_neg.append(('second line garbage',
+                    f'{_wrn_l}\nhogehoge\n'))
+
+    for name, rep in wrn_neg:
+        ok, errs, info = conform_compromise_warnings(rep)
+        good = not ok
+        print(f'warnings-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            wrn_fails += 1
+
+    wrn_total = len(_wrn_e2e) + len(wrn_pos) + len(wrn_neg)
+    print(f'--- compromise-warnings {wrn_total - wrn_fails}/{wrn_total} '
+          f'passed ---')
+    fails += wrn_fails
+
     # ---------- check_board_policy: board_policy creation-report consistency
     # Reference reports are produced in-process with nakama.py's own
     # cmd_board_policy (offline: real key pair, temp keyfile, 3 eligible
@@ -14130,7 +14393,7 @@ def selftest() -> int:
         + bj_total + bs_total + bc_total + vbd_total + bvr_total \
         + bdc_total + bcs_total + dmr_total + dms_total + vrt_total + bpl_total \
         + bps_total + vbp_total + vrf_total + pr_total + ac_total \
-        + ch_total + ck_total + vrv_total + rvk_total
+        + ch_total + ck_total + vrv_total + rvk_total + wrn_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -14429,6 +14692,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_dm_send <report.txt> [...]')
             return 2
         return check_dm_send_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_warnings':
+        if len(argv) < 3:
+            print('usage: conformance.py check_warnings <stderr.txt> [...]')
+            return 2
+        return check_compromise_warnings_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_verify_rotation':
         if len(argv) < 3:
             print('usage: conformance.py check_verify_rotation '
