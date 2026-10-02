@@ -1017,6 +1017,11 @@ def cmd_compromise_declare(args):
     me = npub_of(secret)
     try:
         subject_hex = npub_to_hex(args.subject)
+        if subject_hex is None:
+            # npub_to_hex の後発の定義は変換不能時に None を返す（例外を
+            # 投げない）ため、None も無効として拒否する。None のまま進むと
+            # import_compromise_event 内で TypeError になる。
+            raise ValueError('invalid npub')
     except Exception:
         print('subject は有効な npub ではありません', file=sys.stderr)
         sys.exit(1)
@@ -1144,6 +1149,11 @@ def cmd_compromise_withdraw(args):
     me = npub_of(secret)
     try:
         subject_hex = npub_to_hex(args.subject)
+        if subject_hex is None:
+            # npub_to_hex の後発の定義は変換不能時に None を返す（例外を
+            # 投げない）ため、None も無効として拒否する。None のまま進むと
+            # compromise_registry_path 内で TypeError になる。
+            raise ValueError('invalid npub')
     except Exception:
         print('subject は有効な npub ではありません', file=sys.stderr)
         sys.exit(1)

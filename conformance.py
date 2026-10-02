@@ -4631,6 +4631,136 @@ def check_compromise_import_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_compromise_declare: compromise_declare report consistency ----------
+
+# A saved `nakama.py compromise_declare --subject <npub> [--reason ...]`
+# `[--evidence ...] [--bond bond.json] [--out OUT] [--no-registry]`
+# `[--registry DIR]` stdout report. Its grammar is fixed (spec §13.10).
+# check_compromise_declare verifies that the report is internally
+# consistent: 2 or 3 lines —
+#   line 1 (always): `侵害宣言: <out> — <declarant16>... が
+#                     <subject16>... の鍵は危ないと宣言しました。`
+#   line 2 (only when the registry recorded the declaration — a fresh
+#            declare without --no-registry):
+#            `ローカル registry に記録しました: <path>`
+#   final line (always): `宣言は公開チャネルで共有してください（仲間の
+#            公開記録に残ります）。虚偽の宣言はあなたの署名付きで
+#            残ることを忘れずに。`
+# <out> is the declaration JSON path verbatim (`--out`, default
+# `compromise.json`; user-controlled, so it must be non-empty with no
+# leading/trailing whitespace — §4.1.2's <out> rule). <declarant16> and
+# <subject16> are the first 16 chars of the declarant's and the subject's
+# npubs (16 non-whitespace chars; the reference truncates real npubs —
+# the §12.4 revoker / §13.8 declarant convention; bech32 checksum
+# validity is out of scope, as everywhere). The `—` is an em dash
+# (U+2014), the `...` are ASCII three dots, the final `。` and the
+# full-width parens `（）` in the advisory line are literals. <path> is
+# `compromise_registry_path(registry, subject_hex)` verbatim; the
+# report's one internal rule is §13.9's: basename == `<64 hex>.json`
+# (the subject's x-only pubkey; uppercase accepted).
+# Note the verbs: the registry line reads `ローカル registry に記録し
+# ました: ` while compromise_import's stored line reads `侵害宣言を
+# registry に記録しました: ` — different verbs, so the two are mutually
+# rejected (like the check_board_send / check_pub / check_board_join
+# prefix split: check_compromise_declare rejects an import stored line
+# as its middle line, and a 1-line import report fails line 1). The
+# other sibling compromise reports are different grammars and are
+# rejected: the compromise_withdraw report (`侵害宣言を撤回しました:
+# ...` — verb differs on line 1), compromise_fetch's footer (`<N> 件の
+# イベントを取得: ...` — check_compromise_fetch's territory), and the
+# compromise_pub publish line (`publish: <受理|拒否> (...) id=<id>` —
+# check_pub's territory).
+# Explicitly out of scope: whether the declaration JSON exists and what
+# it contains (the declaration's territory: `check_compromise` /
+# `verify_compromise_event`), the subject's truth, whether the registry
+# line was the right call (import_compromise_event's territory — a fresh
+# declare normally stores, --no-registry drops line 2), the
+# declaration's signature, stderr, and the exit code. Use this to prove
+# a second implementation's `compromise_declare` CLI prints a compatible
+# issuance report.
+
+_CPD_L1 = re.compile(
+    r'^侵害宣言: (.+) — (\S{16})\.\.\. が (\S{16})\.\.\. の鍵は危ないと宣言しました。$')
+_CPD_L2 = re.compile(r'^ローカル registry に記録しました: (.+)$')
+_CPD_L3 = ('宣言は公開チャネルで共有してください（仲間の公開記録に残ります）。'
+          '虚偽の宣言はあなたの署名付きで残ることを忘れずに。')
+_CPD_BASENAME = re.compile(r'^[0-9a-fA-F]{64}\.json$')
+
+
+def conform_compromise_declare_report(text: str):
+    """Verify a saved `nakama.py compromise_declare` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    if len(lines) not in (2, 3):
+        return False, [f'report must be 2 or 3 lines (issuance line, '
+                       f'optional registry line, advisory line), '
+                       f'found {len(lines)}'], info
+    m1 = _CPD_L1.match(lines[0])
+    if not m1:
+        return False, ['line 1: not a compromise_declare issuance line '
+                       '(`侵害宣言: <out> — <declarant16>... が '
+                       '<subject16>... の鍵は危ないと宣言しました。`)'], info
+    out, decl_p, subj_p = m1.group(1), m1.group(2), m1.group(3)
+    if not out or out.strip() != out:
+        return False, ['<out> is empty or has leading/trailing '
+                       'whitespace'], info
+    has_reg = False
+    if len(lines) == 3:
+        m2 = _CPD_L2.match(lines[1])
+        if not m2:
+            return False, ['line 2: not the registry line '
+                           '(`ローカル registry に記録しました: <path>`)'], info
+        path = m2.group(1)
+        if not path or path.strip() != path:
+            return False, ['<path> is empty or has leading/trailing '
+                           'whitespace'], info
+        base = os.path.basename(path)
+        if not _CPD_BASENAME.match(base):
+            return False, [f'<path> basename `{base}` is not `<64 hex>.json` '
+                           '(the registry record filename is the subject '
+                           'x-only pubkey hex)'], info
+        has_reg = True
+        info.append(f'registry: {base[:16]}...')
+    if lines[-1] != _CPD_L3:
+        return False, ['final line: not the advisory line (byte-exact: '
+                       '`宣言は公開チャネルで共有してください（仲間の公開'
+                       '記録に残ります）。虚偽の宣言はあなたの署名付きで'
+                       '残ることを忘れずに。`)'], info
+    info.append(f'out={out} decl={decl_p}... subj={subj_p}... '
+                f'{"registry" if has_reg else "no-registry"}')
+    return (not errs), errs, info
+
+
+def check_compromise_declare_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_compromise_declare_report(text)
+        if ok:
+            print(f'{p}: PASS ({ "; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- check_init: init report consistency ----------
 
 # A saved `nakama.py init [--from-hex HEX] [--force] <keyfile>` stdout
@@ -10492,6 +10622,241 @@ def selftest() -> int:
     print(f'--- compromise-import {cpi_total - cpi_fails}/{cpi_total} passed ---')
     fails += cpi_fails
 
+    # ---------- check_compromise_declare: compromise_declare report consistency
+    # The reference CLI prints a 2-3 line issuance report to stdout
+    # (exit 0): line 1 `侵害宣言: <out> — <declarant16>... が
+    # <subject16>... の鍵は危ないと宣言しました。`, optional line 2
+    # `ローカル registry に記録しました: <path>` (fresh declare without
+    # --no-registry), final line the advisory literal. Real-CLI
+    # in-process E2E below: real keyfile (nakama.save_key on a _key()
+    # secret, the same constructor path cmd_init uses) ->
+    # cmd_compromise_declare, stdout captured exactly. Separate registry
+    # dirs per case so same-second created_at dedup can never hide line 2.
+    cpd_fails = 0
+    import tempfile as _cpd_tf
+    import io as _cpd_io
+    import contextlib as _cpd_ctx
+    from types import SimpleNamespace as _cpd_NS
+
+    _cpd_sa, _cpd_npa = _key()
+    _cpd_sb, _cpd_npb = _key()
+    _cpd_shex = nakama.npub_to_hex(_cpd_npb)
+
+    def _cpd_declare(keyfile, out, registry=None, no_registry=False,
+                     subject=None):
+        buf = _cpd_io.StringIO()
+        err = _cpd_io.StringIO()
+        code = 0
+        with _cpd_ctx.redirect_stdout(buf), _cpd_ctx.redirect_stderr(err):
+            try:
+                nakama.cmd_compromise_declare(_cpd_NS(
+                    keyfile=keyfile, subject=subject or _cpd_npb,
+                    bond=None, reason='', evidence='', out=out,
+                    no_registry=no_registry, registry=registry))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        return buf.getvalue(), err.getvalue(), code
+
+    _cpd_l3 = ('宣言は公開チャネルで共有してください'
+               '（仲間の公開記録に残ります）。虚偽の宣言はあなたの'
+               '署名付きで残ることを忘れずに。\n')
+
+    def _cpd_l1(out):
+        return (f'侵害宣言: {out} — {_cpd_npa[:16]}... が '
+                f'{_cpd_npb[:16]}... の鍵は危ないと宣言しました。\n')
+
+    def _cpd_l2(reg):
+        return (f'ローカル registry に記録しました: '
+                f'{os.path.join(reg, _cpd_shex + ".json")}\n')
+
+    _cpd_e2e = []
+    with _cpd_tf.TemporaryDirectory() as _cpd_td:
+        _cpd_kf = os.path.join(_cpd_td, 'keyfile.json')
+        nakama.save_key(_cpd_kf, _cpd_sa)
+        _cpd_reg1 = os.path.join(_cpd_td, 'compromises')
+        _cpd_out1 = os.path.join(_cpd_td, 'compromise.json')
+        _rep, _err, _code = _cpd_declare(_cpd_kf, _cpd_out1,
+                                        registry=_cpd_reg1)
+        _cpd_e2e.append(('fresh declare (3 lines)', _rep, _err, _code,
+                         _cpd_l1(_cpd_out1) + _cpd_l2(_cpd_reg1) +
+                         _cpd_l3))
+        # --no-registry: 2 lines
+        _cpd_out2 = os.path.join(_cpd_td, 'compromise2.json')
+        _rep, _err, _code = _cpd_declare(_cpd_kf, _cpd_out2,
+                                        no_registry=True)
+        _cpd_e2e.append(('--no-registry (2 lines)', _rep, _err, _code,
+                         _cpd_l1(_cpd_out2) + _cpd_l3))
+        # custom --registry with a space in the dir name
+        _cpd_reg3 = os.path.join(_cpd_td, 'other registry')
+        _cpd_out3 = os.path.join(_cpd_td, 'compromise3.json')
+        _rep, _err, _code = _cpd_declare(_cpd_kf, _cpd_out3,
+                                        registry=_cpd_reg3)
+        _cpd_e2e.append(('custom --registry with space', _rep, _err,
+                         _code,
+                         _cpd_l1(_cpd_out3) + _cpd_l2(_cpd_reg3) +
+                         _cpd_l3))
+        # custom --out with a space in the filename
+        _cpd_reg4 = os.path.join(_cpd_td, 'compromises4')
+        _cpd_out4 = os.path.join(_cpd_td, 'my decl.json')
+        _rep, _err, _code = _cpd_declare(_cpd_kf, _cpd_out4,
+                                        registry=_cpd_reg4)
+        _cpd_e2e.append(('custom --out with space', _rep, _err, _code,
+                         _cpd_l1(_cpd_out4) + _cpd_l2(_cpd_reg4) +
+                         _cpd_l3))
+        # invalid subject: stderr refusal + exit 1, empty stdout
+        _rep, _err, _code = _cpd_declare(_cpd_kf, _cpd_out1,
+                                        registry=_cpd_reg1,
+                                        subject='npub1bad')
+        _cpd_e2e.append(('invalid subject (stderr refusal, exit 1)',
+                         _rep, _err, _code, None))
+    for name, rep, err, code, want_rep in _cpd_e2e:
+        if want_rep is None:
+            # invalid case: stdout must be empty, exit 1, stderr the
+            # refusal verdict — and the empty stdout is rejected by the
+            # checker (the invalid case has no report)
+            good = (rep == '') and (code == 1) and \
+                (err == 'subject は有効な npub ではありません\n') and \
+                not conform_compromise_declare_report(rep)[0]
+            info = ['invalid subject refused on stderr (no stdout report)']
+        else:
+            exact = (rep == want_rep) and (code == 0) and (err == '')
+            ok, errs, info = conform_compromise_declare_report(rep)
+            good = exact and ok
+        print(f'compromise-declare-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ("; ".join(info))')
+        if not good:
+            if want_rep is not None and rep != want_rep:
+                print(f'    - stdout/exit mismatch: {rep!r} code={code} '
+                      f'stderr={err!r}')
+            if want_rep is None:
+                print(f'    - got stdout={rep!r} code={code} stderr={err!r}')
+            for e in (errs if want_rep is not None else []):
+                print(f'    - {e}')
+            cpd_fails += 1
+
+    # hand-crafted positives
+    _cpd_hx = 'ab' * 32  # 64 lowercase hex (subject x-only pubkey)
+    _cpd_HX = 'AB' * 32  # uppercase tolerated, as with §13.9
+    _cpd_p1 = 'npub1' + 'q' * 11  # 16 chars, npub truncation
+    _cpd_p2 = 'npub1' + 'r' * 11
+    _cpd_d1 = (f'侵害宣言: compromise.json — {_cpd_p1}... が '
+               f'{_cpd_p2}... の鍵は危ないと宣言しました。')
+    _cpd_d2 = (f'ローカル registry に記録しました: '
+               f'/tmp/c/{_cpd_hx}.json')
+    _cpd_d3 = ('宣言は公開チャネルで共有してください'
+               '（仲間の公開記録に残ります）。虚偽の宣言はあなたの'
+               '署名付きで残ることを忘れずに。')
+    cpd_pos = [
+        ('standard 3-line', f'{_cpd_d1}\n{_cpd_d2}\n{_cpd_d3}\n'),
+        ('2-line (no-registry)', f'{_cpd_d1}\n{_cpd_d3}\n'),
+        ('no trailing newline', f'{_cpd_d1}\n{_cpd_d2}\n{_cpd_d3}'),
+        ('trailing blanks', f'{_cpd_d1}\n{_cpd_d2}\n{_cpd_d3}\n\n\n'),
+        ('uppercase hex basename',
+         f'{_cpd_d1}\nローカル registry に記録しました: '
+         f'/tmp/c/{_cpd_HX}.json\n{_cpd_d3}\n'),
+        ('out with space',
+         f'侵害宣言: /tmp/my decl.json — {_cpd_p1}... が '
+         f'{_cpd_p2}... の鍵は危ないと宣言しました。\n{_cpd_d2}\n'
+         f'{_cpd_d3}\n'),
+        ('relative registry dir',
+         f'{_cpd_d1}\nローカル registry に記録しました: '
+         f'compromises/{_cpd_hx}.json\n{_cpd_d3}\n'),
+        ('spaces in registry dir',
+         f'{_cpd_d1}\nローカル registry に記録しました: '
+         f'/tmp/my compromises/{_cpd_hx}.json\n{_cpd_d3}\n'),
+        ('self-declare (declarant == subject prefix, legitimate)',
+         f'侵害宣言: compromise.json — {_cpd_p1}... が '
+         f'{_cpd_p1}... の鍵は危ないと宣言しました。\n{_cpd_d2}\n'
+         f'{_cpd_d3}\n'),
+    ]
+    for name, rep in cpd_pos:
+        ok, errs, info = conform_compromise_declare_report(rep)
+        print(f'compromise-declare/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        cpd_fails += 0 if ok else 1
+
+    # hand-crafted negatives
+    cpd_neg = []
+    cpd_neg.append(('empty report', ''))
+    cpd_neg.append(('garbage line', 'hello\n'))
+    cpd_neg.append(('line 1 only', f'{_cpd_d1}\n'))
+    cpd_neg.append(('four lines (extra line)',
+                    f'{_cpd_d1}\n{_cpd_d2}\n{_cpd_d3}\n余計な行\n'))
+    cpd_neg.append(('two reports concatenated',
+                    f'{_cpd_d1}\n{_cpd_d2}\n{_cpd_d3}\n'
+                    f'{_cpd_d1}\n{_cpd_d3}\n'))
+    cpd_neg.append(('line 1 wrong verb (import stored line)',
+                    f'侵害宣言を registry に記録しました: '
+                    f'/tmp/c/{_cpd_hx}.json\n'))
+    cpd_neg.append(('line 1 ASCII dashes instead of em dash',
+                    f'侵害宣言: compromise.json - {_cpd_p1}... が '
+                    f'{_cpd_p2}... の鍵は危ないと宣言しました。\n'
+                    f'{_cpd_d3}\n'))
+    cpd_neg.append(('line 1 unicode ellipsis instead of ASCII',
+                    f'侵害宣言: compromise.json — {_cpd_p1}… が '
+                    f'{_cpd_p2}… の鍵は危ないと宣言しました。\n'
+                    f'{_cpd_d3}\n'))
+    cpd_neg.append(('line 1 short declarant prefix',
+                    f'侵害宣言: compromise.json — {_cpd_p1[:15]}... が '
+                    f'{_cpd_p2}... の鍵は危ないと宣言しました。\n'
+                    f'{_cpd_d3}\n'))
+    cpd_neg.append(('line 1 prefix with space',
+                    f'侵害宣言: compromise.json — npub1qq qqqqqqq... が '
+                    f'{_cpd_p2}... の鍵は危ないと宣言しました。\n'
+                    f'{_cpd_d3}\n'))
+    cpd_neg.append(('line 1 missing final 。',
+                    f'侵害宣言: compromise.json — {_cpd_p1}... が '
+                    f'{_cpd_p2}... の鍵は危ないと宣言しました\n'
+                    f'{_cpd_d3}\n'))
+    cpd_neg.append(('line 2 import stored line (verb differs, rejected)',
+                    f'{_cpd_d1}\n'
+                    f'侵害宣言を registry に記録しました: '
+                    f'/tmp/c/{_cpd_hx}.json\n{_cpd_d3}\n'))
+    cpd_neg.append(('line 2 basename short',
+                    f'{_cpd_d1}\n'
+                    f'ローカル registry に記録しました: /tmp/c/ab12.json\n'
+                    f'{_cpd_d3}\n'))
+    cpd_neg.append(('line 2 basename non-hex',
+                    f'{_cpd_d1}\n'
+                    f'ローカル registry に記録しました: /tmp/c/'
+                    f'{"zz" * 32}.json\n{_cpd_d3}\n'))
+    cpd_neg.append(('line 2 basename missing .json',
+                    f'{_cpd_d1}\n'
+                    f'ローカル registry に記録しました: /tmp/c/{_cpd_hx}\n'
+                    f'{_cpd_d3}\n'))
+    cpd_neg.append(('advisory line missing',
+                    f'{_cpd_d1}\n{_cpd_d2}\n'))
+    cpd_neg.append(('advisory line ASCII parens',
+                    f'{_cpd_d1}\n{_cpd_d2}\n'
+                    f'宣言は公開チャネルで共有してください(仲間の公開記録に'
+                    f'残ります)。虚偽の宣言はあなたの署名付きで残ることを'
+                    f'忘れずに。\n'))
+    cpd_neg.append(('advisory line first (order swapped)',
+                    f'{_cpd_d3}\n{_cpd_d1}\n'))
+    cpd_neg.append(('compromise_withdraw report (sibling)',
+                    f'侵害宣言を撤回しました: compromise_withdrawn.json'
+                    f'（registry の記録を withdrawn: true に更新）\n'
+                    f'公開済みの宣言は compromise_pub で上書きしてください'
+                    f'（kind 30108 の replaceable で撤回が効きます）。\n'))
+    cpd_neg.append(('compromise_import stored line (sibling)',
+                    f'侵害宣言を registry に記録しました: '
+                    f'/tmp/c/{_cpd_hx}.json\n'))
+    cpd_neg.append(('leading blank line', f'\n{_cpd_d1}\n{_cpd_d3}\n'))
+
+    for name, rep in cpd_neg:
+        ok, errs, info = conform_compromise_declare_report(rep)
+        good = not ok
+        print(f'compromise-declare-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            cpd_fails += 1
+
+    cpd_total = len(_cpd_e2e) + len(cpd_pos) + len(cpd_neg)
+    print(f'--- compromise-declare {cpd_total - cpd_fails}/{cpd_total} passed ---')
+    fails += cpd_fails
+
     # ---------- check_init: init report consistency
     # The reference CLI prints the new identity's npub to stdout, one
     # line, exit 0 (cmd_init with --from-hex for a deterministic key;
@@ -15907,7 +16272,8 @@ def selftest() -> int:
         + bdc_total + bcs_total + dmr_total + dms_total + vrt_total + bpl_total \
         + bps_total + vbp_total + vrf_total + pr_total + ac_total \
         + ch_total + ck_total + vrv_total + rvk_total + wrn_total \
-        + crgd_total + rvi_total + ini_total + dno_total + cpi_total
+        + crgd_total + rvi_total + ini_total + dno_total + cpi_total \
+        + cpd_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -16216,6 +16582,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_compromise_import <report.txt> [...]')
             return 2
         return check_compromise_import_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_compromise_declare':
+        if len(argv) < 3:
+            print('usage: conformance.py check_compromise_declare <report.txt> [...]')
+            return 2
+        return check_compromise_declare_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_init':
         if len(argv) < 3:
             print('usage: conformance.py check_init <report.txt> [...]')
@@ -16330,6 +16701,7 @@ def main(argv: list[str]) -> int:
           'check_rotate_fetch <report.txt> [...] | '
           'check_compromise_fetch <report.txt> [...] | '
           'check_compromise_import <report.txt> [...] | '
+          'check_compromise_declare <report.txt> [...] | '
           'check_liveness_verify <report.txt> [...] | '
           'check_liveness_report <report.txt> [...] | '
           'check_verify_binding <report.txt> [...] | '
