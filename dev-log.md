@@ -122,3 +122,7 @@
 - selftest 34/34（新規: 実 CLI の in-process E2E 5（`build_compromise_declaration` で実署名の宣言 → `cmd_compromise_import` — stored（stdout 完全一致＋exit 0＋stderr 空）・duplicate・withdrawn 再発行の updated・space 含み --registry・署名改ざん（stderr 拒否＋exit 1、空 stdout は checker が却下））＋正常 craft 9＋却下 20）、selftest 総計 1253/1253 PASS、全 21 テストファイル回帰 PASS。
 - §13.9 に compromise_import レポートの表示文法を固定。ロードマップ §7 に v0.81 を追加。spec を files/ と同期。
 - 外部 push なし（run 開始時 remote HEAD=seen_refs=d31cca5）。
+- 2026-10-02 v0.86: `check_unbind`（conformance チェッカー第 64 弾、ローカル出力チェッカー第 49 弾）。`unbind` 発行レポート（§9.1.2）の一貫性チェッカー: 常に 2 行（全 scope リテラル `そのハンドルへの binding すべて` / `指定 binding (created_at=<N>)`、`<N>` は 0 以外の整数 — 参照実装は 0 を全 scope に写像するため `created_at=0` の指定形は却下）＋運用手順リテラル（バイト完全一致）、`--markdown` 時は 6 行追加（`<!-- nakama-unbinding:v1 -->`・fenced block — 形状のみ）。
+- selftest 39/39（新規: 実 CLI の in-process E2E 5（通常発行・指定 scope・--markdown・space 含み --out・keyfile 不可読）＋正常 craft 8＋却下 26）、selftest 総計 1428/1428 PASS、全 21 テストファイル回帰 PASS。
+- §9.1.2 に unbind 発行レポートの表示文法を固定（§8.9 の「将来候補」記述を `check_unbind` 参照に更新）。ロードマップ §7 に v0.86 を追加。spec を files/ と同期。
+- 外部 push なし（run 開始時 remote HEAD=seen_refs=6895170）。

@@ -5337,6 +5337,149 @@ def check_rotation_downgrade_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+
+# ---------- check_unbind: unbind issuance report consistency ----------
+
+# A saved `nakama.py unbind --platform P --handle H [--binding-created-at N]
+# [--reason R] [--out OUT] [--markdown]` stdout report. Its grammar is fixed
+# (spec §9.1.2). check_unbind verifies that the report is internally
+# consistent: always 2 lines --
+#   line 1: `unbinding 証明書: <out> — <scope> を取り消し（"<handle>"@<platform>）`
+#   line 2: `運用: この unbinding をハンドルのアカウントから投稿してください（取り消しの公開告知）。`
+# plus, with --markdown, 6 more lines --
+#   line 3: blank
+#   line 4: `投稿用ブロック（コメント欄に貼る）:`
+#   line 5: `<!-- nakama-unbinding:v1 -->`
+#   line 6: ` ```nakama-unbinding `
+#   line 7: <base64url>
+#   line 8: ` ``` `
+# <out> is the cert JSON path verbatim (`--out`, default `unbinding.json`;
+# user-controlled, so it must be non-empty with no leading/trailing
+# whitespace -- §4.1.2's <out> rule). <handle> is non-empty and
+# quote-free (the CLI wraps it in ASCII double quotes), <platform> is
+# non-empty with no leading/trailing whitespace. <scope> is either the
+# all-literal `そのハンドルへの binding すべて` (the default,
+# --binding-created-at 0) or `指定 binding (created_at=<N>)` with <N> a
+# nonzero integer (--binding-created-at N; the reference CLI maps 0 to
+# the all-scope, so `指定 binding (created_at=0)` is not reference
+# output and is rejected). The parens around `"<handle>"@<platform>` are
+# full-width (U+FF08/U+FF09), the parens inside the scope's
+# `(created_at=...)` are ASCII -- both byte-exact. The `—` is an em dash
+# (U+2014) literal. The markdown block (lines 5-8) is `markdown_block`'s
+# fenced output: the detection marker, the fence opener, one base64url
+# line (base64.urlsafe_b64encode keeps `=` padding), the closing fence --
+# shape only is checked, not the payload's truth (the cert's territory:
+# `check_unbinding` / `verify_unbinding_cert`). The failure path
+# (unreadable keyfile) raises before printing anything, so the report
+# exists only for the success path -- an empty stdout is rejected by the
+# checker. Sibling reports are different grammars and are rejected: the
+# bind issuance report (`binding 証明書: ...` -- check_bind's territory)
+# and verify_unbinding's verdict lines (`unbinding は有効です` /
+# `unbinding は無効です` -- check_verify_unbinding's territory); both
+# checkers in turn reject unbind's issuance report. Explicitly out of
+# scope: the cert file's existence and content, the scope's truth (which
+# binding is actually revoked), the handle/platform truth, the markdown
+# payload's truth, stderr, and the exit code. Use this to prove a second
+# implementation's `unbind` CLI prints a compatible issuance report.
+
+_UNB_L1 = re.compile(
+    r'^unbinding 証明書: (.+?) — '
+    r'(指定 binding \(created_at=(-?[0-9]+)\)|そのハンドルへの binding すべて)'
+    r' を取り消し（"([^"]+)"@(.+?)）$')
+_UNB_L2 = ('運用: この unbinding をハンドルのアカウントから投稿して'
+           'ください（取り消しの公開告知）。')
+_UNB_MD_LABEL = '投稿用ブロック（コメント欄に貼る）:'
+_UNB_MD_MARKER = '<!-- nakama-unbinding:v1 -->'
+_UNB_MD_FOPEN = '```nakama-unbinding'
+_UNB_MD_FCLOSE = '```'
+_UNB_MD_B64 = re.compile(r'^[A-Za-z0-9_\-=]+$')
+
+
+def conform_unbind_report(text: str):
+    """Verify a saved `nakama.py unbind` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    m1 = _UNB_L1.match(lines[0])
+    if not m1:
+        return False, ['line 1: not an unbind cert line '
+                       '(`unbinding 証明書: <out> — <scope> '
+                       'を取り消し（"<handle>"@<platform>）` with <scope> = '
+                       '`そのハンドルへの binding すべて` or '
+                       '`指定 binding (created_at=<N>)`)'], info
+    out, scope, created_at_s, handle, platform = m1.groups()
+    if not out or out.strip() != out:
+        return False, ['<out> is empty or has leading/trailing '
+                       'whitespace'], info
+    if not platform or platform.strip() != platform:
+        return False, ['<platform> is empty or has leading/trailing '
+                       'whitespace'], info
+    if created_at_s is not None and int(created_at_s) == 0:
+        return False, ['line 1: `指定 binding (created_at=0)` is not '
+                       'reference output (the reference CLI maps '
+                       '--binding-created-at 0 to the all-scope '
+                       '`そのハンドルへの binding すべて`)'], info
+    if lines[1:2] != [_UNB_L2]:
+        return False, ['line 2: not the operational note (byte-exact: '
+                       '`運用: この unbinding をハンドルのアカウントから'
+                       '投稿してください（取り消しの公開告知）。`)'], info
+    if len(lines) == 2:
+        info.append(f'out={out} scope={scope} handle={handle} '
+                    f'platform={platform}')
+        return True, errs, info
+    if len(lines) != 8:
+        return False, [f'unbind report must be 2 lines (plain) or 8 lines '
+                       f'(--markdown), found {len(lines)}'], info
+    if lines[2] != '':
+        return False, ['line 3: not blank (markdown mode needs a blank '
+                       'line after the operational note)'], info
+    if lines[3] != _UNB_MD_LABEL:
+        return False, ['line 4: not the markdown label (byte-exact: '
+                       '`投稿用ブロック（コメント欄に貼る）:`)'], info
+    if lines[4] != _UNB_MD_MARKER:
+        return False, ['line 5: not the detection marker (byte-exact: '
+                       '`<!-- nakama-unbinding:v1 -->`)'], info
+    if lines[5] != _UNB_MD_FOPEN:
+        return False, ['line 6: not the fence opener (byte-exact: '
+                       '` ```nakama-unbinding `)'], info
+    if not _UNB_MD_B64.match(lines[6]):
+        return False, ['line 7: not a base64url line'], info
+    if lines[7] != _UNB_MD_FCLOSE:
+        return False, ['line 8: not the fence closer (byte-exact: '
+                       '` ``` `)'], info
+    info.append(f'out={out} scope={scope} handle={handle} '
+                f'platform={platform} markdown')
+    return True, errs, info
+
+
+def check_unbind_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_unbind_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
 # ---------- check_board_policy: board_policy creation-report consistency ----------
 
 # A saved `nakama.py board_policy` stdout report. Its grammar is fixed
@@ -5582,7 +5725,7 @@ def check_rotate_files(paths: list[str]) -> int:
 # are rejected: verify_binding's verdict lines (`binding
 # \u306f\u6709\u52b9\u3067\u3059` / `binding \u306f\u7121\u52b9\u3067\u3059`
 # -- check_verify_binding's territory) and the unbind issuance report
-# (`unbinding \u8a3c\u660e\u66f8: ...` -- check_unbind's future
+# (`unbinding \u8a3c\u660e\u66f8: ...` -- check_unbind's
 # territory); check_verify_binding in turn rejects bind's issuance
 # report (its line 1 is not a verdict line). Explicitly out of scope:
 # the cert file's existence and content, the handle/platform/npub16
@@ -11985,6 +12128,291 @@ def selftest() -> int:
     print(f'--- bind {bnd_total - bnd_fails}/{bnd_total} passed ---')
     fails += bnd_fails
 
+
+    # ---------- check_unbind: unbind issuance report consistency
+    # The reference CLI prints a 2-line issuance report to stdout
+    # (exit 0): line 1 `unbinding 証明書: <out> — <scope>
+    # を取り消し（"<handle>"@<platform>）` where <scope> is the
+    # all-literal (default --binding-created-at 0) or
+    # `指定 binding (created_at=<N>)`, line 2 the fixed operational
+    # note. With --markdown, 6 more lines follow (blank, label,
+    # detection marker, fence opener, base64url, fence closer).
+    # Real-CLI in-process E2E below: real keyfile -> cmd_unbind. The
+    # failure path (unreadable keyfile) raises before printing -- its
+    # empty stdout is rejected by the checker.
+    unb_fails = 0
+    import tempfile as _unb_tf
+    import io as _unb_io
+    import contextlib as _unb_ctx
+    from types import SimpleNamespace as _unb_NS
+    import json as _unb_json
+
+    _unb_s, _unb_np = _key()
+
+    def _unb_unbind(keyfile, platform, handle, out, markdown, bca=0,
+                    reason=''):
+        buf = _unb_io.StringIO()
+        err = _unb_io.StringIO()
+        code = 0
+        with _unb_ctx.redirect_stdout(buf), _unb_ctx.redirect_stderr(err):
+            try:
+                nakama.cmd_unbind(_unb_NS(keyfile=keyfile, platform=platform,
+                                         handle=handle, out=out,
+                                         binding_created_at=bca,
+                                         reason=reason, markdown=markdown))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+            except Exception as e:
+                code = f'exc:{type(e).__name__}'
+        return buf.getvalue(), err.getvalue(), code
+
+    def _unb_scope(bca):
+        return ('そのハンドルへの binding すべて' if not bca
+                else f'指定 binding (created_at={bca})')
+
+    def _unb_rep(out, handle, platform, scope):
+        return (f'unbinding 証明書: {out} — {scope} を取り消し'
+                f'（"{handle}"@{platform}）\n'
+                f'運用: この unbinding をハンドルのアカウントから投稿して'
+                f'ください（取り消しの公開告知）。\n')
+
+    def _unb_cert_ok(path, platform, handle, bca=0):
+        try:
+            u = _unb_json.load(open(path))
+            return nakama.verify_unbinding_cert(u) \
+                and u['platform'] == platform and u['handle'] == handle \
+                and u['npub'] == _unb_np \
+                and u['binding_created_at'] == bca
+        except Exception:
+            return False
+
+    _unb_e2e = []  # (name, rep, err, code, kind, want)
+    with _unb_tf.TemporaryDirectory() as _unb_td:
+        _unb_kf = os.path.join(_unb_td, 'keyfile.json')
+        nakama.save_key(_unb_kf, _unb_s)
+        # fresh plain unbind (all-scope)
+        _unb_out1 = os.path.join(_unb_td, 'unbinding.json')
+        _rep, _err, _code = _unb_unbind(_unb_kf, 'moltbook', 'alex',
+                                       _unb_out1, False)
+        _unb_e2e.append(('plain unbind (all-scope, 2 lines)', _rep, _err,
+                         _code, 'exact',
+                         (_unb_rep(_unb_out1, 'alex', 'moltbook',
+                                   _unb_scope(0)),
+                          '', _unb_cert_ok(_unb_out1, 'moltbook', 'alex'))))
+        # --binding-created-at: specified scope
+        _unb_out2 = os.path.join(_unb_td, 'unbinding-scope.json')
+        _rep, _err, _code = _unb_unbind(_unb_kf, 'moltbook', 'alex',
+                                       _unb_out2, False, bca=1759370000)
+        _unb_e2e.append(('specified scope (created_at=1759370000)', _rep,
+                         _err, _code, 'exact',
+                         (_unb_rep(_unb_out2, 'alex', 'moltbook',
+                                   _unb_scope(1759370000)),
+                          '', _unb_cert_ok(_unb_out2, 'moltbook', 'alex',
+                                           bca=1759370000))))
+        # --markdown: 8-line report (byte-exact, incl. fenced block)
+        _unb_out3 = os.path.join(_unb_td, 'unbinding-md.json')
+        _rep, _err, _code = _unb_unbind(_unb_kf, 'nostr', 'alex_jp',
+                                       _unb_out3, True,
+                                       reason='アカウント移行のため')
+        _unb_cert3 = _unb_json.load(open(_unb_out3))
+        _unb_want_md = (_unb_rep(_unb_out3, 'alex_jp', 'nostr',
+                                _unb_scope(0))
+                        + '\n投稿用ブロック（コメント欄に貼る）:\n'
+                        + nakama.markdown_block(_unb_cert3, 'unbinding')
+                        + '\n')
+        _unb_e2e.append(('--markdown (8 lines)', _rep, _err, _code, 'exact',
+                         (_unb_want_md, '',
+                          _unb_cert_ok(_unb_out3, 'nostr', 'alex_jp'))))
+        # --out with a space in the filename
+        _unb_out4 = os.path.join(_unb_td, 'my unbinding.json')
+        _rep, _err, _code = _unb_unbind(_unb_kf, 'moltbook', 'alex',
+                                       _unb_out4, False)
+        _unb_e2e.append(('custom --out with space', _rep, _err, _code,
+                         'exact',
+                         (_unb_rep(_unb_out4, 'alex', 'moltbook',
+                                   _unb_scope(0)),
+                          '', _unb_cert_ok(_unb_out4, 'moltbook', 'alex'))))
+        # failure: unreadable keyfile (raises before printing)
+        _rep, _err, _code = _unb_unbind(os.path.join(_unb_td, 'nope.json'),
+                                       'moltbook', 'alex', _unb_out1, False)
+        _unb_e2e.append(('missing keyfile (no stdout report)', _rep, _err,
+                         _code, 'fail', ()))
+    for name, rep, err, code, kind, want in _unb_e2e:
+        errs = []
+        if kind == 'fail':
+            # failure path: stdout must be empty (raised before
+            # printing) -- and the empty stdout is rejected by the
+            # checker (the failure path has no report)
+            good = (rep == '') and (code != 0) and \
+                not conform_unbind_report(rep)[0]
+            info = ['failure path printed nothing (no stdout report)']
+        else:
+            want_rep, want_err, cert_ok = want
+            exact = (rep == want_rep) and (code == 0) and (err == want_err)
+            ok, errs, info = conform_unbind_report(rep)
+            good = exact and ok and cert_ok
+            if exact and ok and not cert_ok:
+                info = ['cert failed verify_unbinding_cert']
+        print(f'unbind-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        if not good:
+            print(f'    - got stdout={rep!r} code={code} stderr={err!r}')
+            if kind == 'exact' and rep != want[0]:
+                print(f'    - want stdout={want[0]!r}')
+            for e in errs:
+                print(f'    - {e}')
+            unb_fails += 1
+
+    # hand-crafted positives
+    _unb_all = 'そのハンドルへの binding すべて'
+    _unb_spec = '指定 binding (created_at=1759370000)'
+    _unb_d1 = (f'unbinding 証明書: unbinding.json — {_unb_all} を取り消し'
+               f'（"alex"@moltbook）')
+    _unb_d2 = ('運用: この unbinding をハンドルのアカウントから投稿して'
+               'ください（取り消しの公開告知）。')
+    _unb_b64 = 'eyJmb28iOiJiYXIifQ=='
+    _unb_md_tail = ('\n\n投稿用ブロック（コメント欄に貼る）:\n'
+                    '<!-- nakama-unbinding:v1 -->\n'
+                    '```nakama-unbinding\n'
+                    f'{_unb_b64}\n'
+                    '```\n')
+    unb_pos = [
+        ('standard 2-line (all-scope)',
+         f'{_unb_d1}\n{_unb_d2}\n'),
+        ('specified scope',
+         f'unbinding 証明書: unbinding.json — {_unb_spec} を取り消し'
+         f'（"alex"@moltbook）\n{_unb_d2}\n'),
+        ('no trailing newline',
+         f'{_unb_d1}\n{_unb_d2}'),
+        ('trailing blanks',
+         f'{_unb_d1}\n{_unb_d2}\n\n\n'),
+        ('out with space and unicode',
+         f'unbinding 証明書: /tmp/my unbinding 移行.json — {_unb_all} '
+         f'を取り消し（"alex"@moltbook）\n{_unb_d2}\n'),
+        ('relative out path',
+         f'unbinding 証明書: certs/unbinding.json — {_unb_all} を取り消し'
+         f'（"alex"@moltbook）\n{_unb_d2}\n'),
+        ('markdown 8-line',
+         f'{_unb_d1}\n{_unb_d2}{_unb_md_tail}'),
+        ('markdown no trailing newline',
+         f'{_unb_d1}\n{_unb_d2}{_unb_md_tail}'.rstrip('\n')),
+    ]
+    for name, rep in unb_pos:
+        ok, errs, info = conform_unbind_report(rep)
+        print(f'unbind/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        unb_fails += 0 if ok else 1
+
+    # hand-crafted negatives
+    unb_neg = []
+    unb_neg.append(('empty report', ''))
+    unb_neg.append(('garbage line', 'hello\n'))
+    unb_neg.append(('one line (line 2 missing)',
+                    f'{_unb_d1}\n'))
+    unb_neg.append(('three lines (extra line)',
+                    f'{_unb_d1}\n{_unb_d2}\n余計な行\n'))
+    unb_neg.append(('two reports concatenated',
+                    f'{_unb_d1}\n{_unb_d2}\n{_unb_d1}\n{_unb_d2}\n'))
+    unb_neg.append(('line 1 bind issuance (sibling)',
+                    f'binding 証明書: binding.json — "alex"@moltbook が '
+                    f'npub1qqqqqqqqqqq... の保有を主張\n{_unb_d2}\n'))
+    unb_neg.append(('line 1 verify_unbinding valid verdict (sibling)',
+                    f'unbinding は有効です\n'))
+    unb_neg.append(('line 1 verify_unbinding 2-line report (sibling)',
+                    f'unbinding は有効です\n'
+                    f'（運用手順）: 取り消し対象の binding がこの unbinding の '
+                    f'binding_created_at 以前であることを確認してください\n'))
+    unb_neg.append(('line 1 empty <out>',
+                    f'unbinding 証明書:  — {_unb_all} を取り消し'
+                    f'（"alex"@moltbook）\n{_unb_d2}\n'))
+    unb_neg.append(('line 1 <out> trailing space',
+                    f'unbinding 証明書: unbinding.json  — {_unb_all} '
+                    f'を取り消し（"alex"@moltbook）\n{_unb_d2}\n'))
+    unb_neg.append(('line 1 ASCII hyphen instead of —',
+                    f'unbinding 証明書: unbinding.json - {_unb_all} '
+                    f'を取り消し（"alex"@moltbook）\n{_unb_d2}\n'))
+    unb_neg.append(('line 1 handle quote missing',
+                    f'unbinding 証明書: unbinding.json — {_unb_all} '
+                    f'を取り消し（alex@moltbook）\n{_unb_d2}\n'))
+    unb_neg.append(('line 1 empty handle',
+                    f'unbinding 証明書: unbinding.json — {_unb_all} '
+                    f'を取り消し（""@moltbook）\n{_unb_d2}\n'))
+    unb_neg.append(('line 1 specified scope created_at=0',
+                    f'unbinding 証明書: unbinding.json — '
+                    f'指定 binding (created_at=0) を取り消し'
+                    f'（"alex"@moltbook）\n{_unb_d2}\n'))
+    unb_neg.append(('line 1 created_at non-numeric',
+                    f'unbinding 証明書: unbinding.json — '
+                    f'指定 binding (created_at=abc) を取り消し'
+                    f'（"alex"@moltbook）\n{_unb_d2}\n'))
+    unb_neg.append(('line 1 wrong scope literal',
+                    f'unbinding 証明書: unbinding.json — '
+                    f'すべての binding を取り消し（"alex"@moltbook）\n'
+                    f'{_unb_d2}\n'))
+    unb_neg.append(('line 2 ASCII parens',
+                    f'{_unb_d1}\n'
+                    f'運用: この unbinding をハンドルのアカウントから投稿して'
+                    f'ください(取り消しの公開告知)。\n'))
+    unb_neg.append(('line 2 final 。 missing',
+                    f'{_unb_d1}\n'
+                    f'運用: この unbinding をハンドルのアカウントから投稿して'
+                    f'ください（取り消しの公開告知）\n'))
+    unb_neg.append(('line order swapped',
+                    f'{_unb_d2}\n{_unb_d1}\n'))
+    unb_neg.append(('leading blank line',
+                    f'\n{_unb_d1}\n{_unb_d2}\n'))
+    unb_neg.append(('markdown missing blank line 3',
+                    f'{_unb_d1}\n{_unb_d2}\n'
+                    f'投稿用ブロック（コメント欄に貼る）:\n'
+                    f'<!-- nakama-unbinding:v1 -->\n'
+                    f'```nakama-unbinding\n'
+                    f'{_unb_b64}\n'
+                    f'```\n'))
+    unb_neg.append(('markdown marker wrong (binding)',
+                    f'{_unb_d1}\n{_unb_d2}\n\n'
+                    f'投稿用ブロック（コメント欄に貼る）:\n'
+                    f'<!-- nakama-binding:v1 -->\n'
+                    f'```nakama-unbinding\n'
+                    f'{_unb_b64}\n'
+                    f'```\n'))
+    unb_neg.append(('markdown fence opener wrong',
+                    f'{_unb_d1}\n{_unb_d2}\n\n'
+                    f'投稿用ブロック（コメント欄に貼る）:\n'
+                    f'<!-- nakama-unbinding:v1 -->\n'
+                    f'```nakama-binding\n'
+                    f'{_unb_b64}\n'
+                    f'```\n'))
+    unb_neg.append(('markdown b64 with invalid char',
+                    f'{_unb_d1}\n{_unb_d2}\n\n'
+                    f'投稿用ブロック（コメント欄に貼る）:\n'
+                    f'<!-- nakama-unbinding:v1 -->\n'
+                    f'```nakama-unbinding\n'
+                    f'eyJ+YmFyIg==\n'
+                    f'```\n'))
+    unb_neg.append(('markdown 7 lines (fence closer missing)',
+                    f'{_unb_d1}\n{_unb_d2}\n\n'
+                    f'投稿用ブロック（コメント欄に貼る）:\n'
+                    f'<!-- nakama-unbinding:v1 -->\n'
+                    f'```nakama-unbinding\n'
+                    f'{_unb_b64}\n'))
+    unb_neg.append(('plain 2-line plus extra markdown-ish line',
+                    f'{_unb_d1}\n{_unb_d2}\n'
+                    f'投稿用ブロック（コメント欄に貼る）:\n'))
+
+    for name, rep in unb_neg:
+        ok, errs, info = conform_unbind_report(rep)
+        good = not ok
+        print(f'unbind-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            unb_fails += 1
+
+    unb_total = len(_unb_e2e) + len(unb_pos) + len(unb_neg)
+    print(f'--- unbind {unb_total - unb_fails}/{unb_total} passed ---')
+    fails += unb_fails
+
     # ---------- check_init: init report consistency
     # The reference CLI prints the new identity's npub to stdout, one
     # line, exit 0 (cmd_init with --from-hex for a deterministic key;
@@ -17401,7 +17829,8 @@ def selftest() -> int:
         + bps_total + vbp_total + vrf_total + pr_total + ac_total \
         + ch_total + ck_total + vrv_total + rvk_total + wrn_total \
         + crgd_total + rvi_total + ini_total + dno_total + cpi_total \
-        + cpd_total + cpw_total + rti_total + bnd_total
+        + cpd_total + cpw_total + rti_total + bnd_total \
+        + unb_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -17759,6 +18188,12 @@ def main(argv: list[str]) -> int:
                   '<report.txt> [...]')
             return 2
         return check_bind_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_unbind':
+        if len(argv) < 3:
+            print('usage: conformance.py check_unbind '
+                  '<report.txt> [...]')
+            return 2
+        return check_unbind_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_verify_revocation':
         if len(argv) < 3:
             print('usage: conformance.py check_verify_revocation '
