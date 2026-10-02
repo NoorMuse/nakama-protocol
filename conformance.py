@@ -4595,6 +4595,158 @@ def check_init_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_draft_notify: board_draft_notify report consistency ----------
+
+# A saved `nakama.py board_draft_notify <relay> <board_id> [opts]` stdout
+# report. Its grammar is fixed (spec §25.5). check_draft_notify verifies
+# that the report is internally consistent. The reference CLI prints one
+# stdout line per target draft, in two independent loops: first the
+# issuer loop (the draft event's publisher), then — only with
+# `--cosigners` — the cosigner loop (unsigned eligible approvers).
+#
+# Line grammars:
+#   no targets (early return — never mixed with other lines):
+#     通知対象の草案はありませんでした
+#   issuer lines:
+#     [dry-run] <core12> (<reason>) → <hex16>... (<decision>)
+#     [skip]    <core12> (<reason>) — <N>s 以内に送信済み
+#     [sent]    <core12> (<reason>) → <hex16>... (id=<id64>)
+#   cosigner lines (with --cosigners): the same three forms with
+#   `cosigner ` inserted right after the tag, e.g.:
+#     [dry-run] cosigner <core12> (<reason>) → <hex16>... (<decision>)
+# Notes on the fixed grammar:
+#   - the arrow is U+2192 (`→`), never ASCII `->`;
+#   - the ellipsis after the 16-hex recipient prefix is three literal
+#     ASCII dots `...`;
+#   - the dash in a skip line is an em dash (U+2014), literal;
+#   - <reason> is `expiring_soon` | `expired` (issuer and cosigner share
+#     the vocabulary — the notification vocabulary of §25/§27);
+#   - <core12> is the decision_core_hash (32 hex) head, <hex16> the
+#     recipient pubkey (64 hex) head, both hex-case-insensitive;
+#   - <decision> is one of BOARD_DECISION_TYPES and appears only on
+#     dry-run lines; <id64> (the kind-1059 gift wrap event id, 64 hex,
+#     case-insensitive) only on sent lines; <N> only on skip lines.
+# Internal rules the checker derives:
+#   R1 mode consistency: if any `[dry-run]` line is present, every line
+#      is `[dry-run]` (--dry-run neither sends nor records, so it never
+#      mixes with sent/skip);
+#   R2 skip N consistency: every `[skip]` line carries the same <N>
+#      (the one run's `--within` value);
+#   R3 order: the issuer-line block comes before the cosigner-line
+#      block (two independent loops — an issuer line never follows a
+#      cosigner line);
+#   R4 the no-target line stands alone (the CLI returns early).
+# An empty stdout is rejected: the reference CLI never finishes silently
+# — every fail-fast path goes to stderr. Trailing blank lines are
+# tolerated; a leading blank line is rejected.
+# Explicitly out of scope: whether anything was really sent (the gift
+# wrap's content is the DM layer's territory), the truth of
+# core/hex/id fields (R2 checks only N consistency, not its value), the
+# mapping of <hex16> to an npub, stderr, and the exit code. Use this to
+# prove a second implementation's `board_draft_notify` CLI prints a
+# compatible report.
+
+_DNO_HEX = r'[0-9a-fA-F]'
+_DNO_MIDDLE = (r'\[(dry-run|skip|sent)\] (cosigner )?('
+               + _DNO_HEX + r'{12}) \((expiring_soon|expired)\) ')
+_DNO_TAIL = {
+    # dry-run: the decision type is shown instead of a wrap id (nothing
+    # was sent)
+    'dry-run': r'→ ' + _DNO_HEX + r'{16}\.\.\. '
+               r'\((?:admit|handover|policy-update|close|remove)\)',
+    # skip: the already-sent record's suppression window, printed with
+    # an em dash — captured as group 5 so R2 can compare N across lines
+    'skip': r'— ([0-9]+)s 以内に送信済み',
+    # sent: the accepted gift wrap (kind 1059) event id
+    'sent': r'→ ' + _DNO_HEX + r'{16}\.\.\. \(id=' + _DNO_HEX + r'{64}\)',
+}
+_DNO_LINE = {mode: re.compile(r'^' + _DNO_MIDDLE + tail + r'$')
+             for mode, tail in _DNO_TAIL.items()}
+_DNO_NO_TARGETS = '通知対象の草案はありませんでした'
+
+
+def conform_draft_notify_report(text: str):
+    """Verify a saved `nakama.py board_draft_notify` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty (the CLI never finishes silently '
+                       '— every fail-fast path goes to stderr)'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    if lines[0] == _DNO_NO_TARGETS:
+        if len(lines) != 1:
+            return False, ['the no-target line must stand alone (the CLI '
+                           'returns early when there is nothing to '
+                           'notify)'], info
+        return True, [], ['no notification targets']
+    parsed = []
+    for i, line in enumerate(lines):
+        m = None
+        mode = None
+        for cand, rx in _DNO_LINE.items():
+            m = rx.match(line)
+            if m:
+                mode = cand
+                break
+        if m is None or mode is None:
+            return False, [f'line {i + 1}: not a draft-notify report line '
+                           f'(`{line}`)'], info
+        parsed.append((i, mode, m))
+    modes = [mode for _, mode, _ in parsed]
+    # R1: mode consistency — a dry-run line never mixes with sent/skip
+    if 'dry-run' in modes and any(m != 'dry-run' for m in modes):
+        return False, ['R1 violated: a [dry-run] line mixed with '
+                       '[sent]/[skip] lines (--dry-run neither sends nor '
+                       'records)'], info
+    # R2: skip N consistency — one run, one --within
+    skip_ns = [m.group(5) for _, mode, m in parsed if mode == 'skip']
+    if len(set(skip_ns)) > 1:
+        return False, [f'R2 violated: [skip] lines carry different N '
+                       f'({", ".join(sorted(set(skip_ns)))}) — one run '
+                       f'has one --within'], info
+    # R3: order — issuer block first, cosigner block second
+    seen_cosigner = False
+    for i, mode, m in parsed:
+        if m.group(2) is not None:
+            seen_cosigner = True
+        elif seen_cosigner:
+            return False, [f'R3 violated: issuer line after a cosigner '
+                           f'line (line {i + 1} — the CLI runs the issuer '
+                           f'loop first, the cosigner loop second)'], info
+    for i, mode, m in parsed:
+        who = ' (cosigner)' if m.group(2) is not None else ''
+        info.append(f'{mode} line {i + 1}: {m.group(3)}... '
+                    f'{m.group(4)}{who}')
+    return (not errs), errs, info
+
+
+def check_draft_notify_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_draft_notify_report(text)
+        if ok:
+            print(f'{p}: PASS ("{"; ".join(info)}")')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- check_compromise_warnings: compromise WARN-line consistency ----------
 
 # A saved stderr capture of the compromise-declaration warnings the
@@ -10158,6 +10310,247 @@ def selftest() -> int:
     print(f'--- init {ini_total - ini_fails}/{ini_total} passed ---')
     fails += ini_fails
 
+    # ---------- check_draft_notify: board_draft_notify report consistency
+    # The reference CLI prints one stdout line per target draft (§25.5):
+    # the issuer loop first, then (with --cosigners) the cosigner loop.
+    # The selftest runs the real cmd_board_draft_notify in-process with
+    # nostr_request monkeypatched to return crafted kind-30111 draft
+    # events (no relay contact): dry-run (byte-exact stdout, nothing
+    # sent or recorded), skip (a pre-written send record suppresses the
+    # send, byte-exact stdout), and sent (nostr_publish monkeypatched,
+    # byte-exact stdout with the captured gift wrap id, record written).
+    # Hand-crafted positives exercise issuer/cosigner blocks, R3 order,
+    # and skip+sent mixing; negatives must all be rejected.
+    dno_fails = 0
+    import tempfile as _dno_tf
+    import io as _dno_io
+    import contextlib as _dno_ctx
+    from types import SimpleNamespace as _dno_NS
+
+    def _dno_signer():
+        s = secrets.token_bytes(32)
+        return (s, nakama.npub_of(s), nakama.hexpub_of(s))
+
+    def _dno_approve(d, signer):
+        msg = nakama.board_decision_message(d['board_id'], d['relay'],
+                                            d['decision'], d['payload'],
+                                            d['created_at'])
+        d['approvals'].append({'npub': signer[1],
+                               'sig': nakama.sign_schnorr(signer[0],
+                                                          msg).hex()})
+        return d
+
+    _dno_relay = 'wss://example.invalid'
+    _dno_board = 'dno-board-001'
+
+    def _dno_decision(dtype, approvers, ts, expires_at):
+        d = {'protocol': 'nakama', 'version': 1, 'type': 'board-decision',
+             'board_id': _dno_board, 'relay': _dno_relay, 'decision': dtype,
+             'payload': {'candidate': approvers[0][1],
+                         'expires_at': expires_at},
+             'created_at': ts, 'approvals': []}
+        for a in approvers:
+            _dno_approve(d, a)
+        return d
+
+    def _dno_event(d, publisher):
+        content = json.dumps(d, sort_keys=True, separators=(',', ':'),
+                             ensure_ascii=False)
+        tags = [['d', nakama.decision_core_hash(d)], ['h', d['board_id']]]
+        return nakama.sign_event(publisher[0], d['created_at'] + 60,
+                                 nakama.DRAFT_NOSTR_KIND(), tags, content)
+
+    def _dno_run(events, keyfile, notif_dir, dry_run=False, publish=None):
+        orig_req = nakama.nostr_request
+        nakama.nostr_request = lambda *a, **k: events
+        orig_pub = nakama.nostr_publish
+        if publish is not None:
+            nakama.nostr_publish = publish
+        code = 0
+        try:
+            buf = _dno_io.StringIO()
+            err = _dno_io.StringIO()
+            with _dno_ctx.redirect_stdout(buf), \
+                    _dno_ctx.redirect_stderr(err):
+                try:
+                    nakama.cmd_board_draft_notify(_dno_NS(
+                        relay=_dno_relay, board_id=_dno_board, limit=20,
+                        auth=False, policy=None, within=86400,
+                        include_expired=False, dry_run=dry_run,
+                        resend=False, from_npub=None, notif_dir=notif_dir,
+                        cosigners=False, keyfile=keyfile))
+                except SystemExit as e:
+                    code = e.code if isinstance(e.code, int) else 0
+            return buf.getvalue(), err.getvalue(), code
+        finally:
+            nakama.nostr_request = orig_req
+            nakama.nostr_publish = orig_pub
+
+    with _dno_tf.TemporaryDirectory() as _dno_td:
+        _dno_s_sender = secrets.token_bytes(32)
+        _dno_kf = os.path.join(_dno_td, 'k.json')
+        with open(_dno_kf, 'w') as f:
+            json.dump({'secret_hex': _dno_s_sender.hex()}, f)
+        os.chmod(_dno_kf, 0o600)
+        _dno_m1 = _dno_signer()
+        _dno_pub = _dno_signer()
+        _dno_now = int(time.time())
+        _dno_d1 = _dno_decision('admit', [_dno_m1], _dno_now - 100,
+                                _dno_now + 3600)
+        _dno_ev1 = _dno_event(_dno_d1, _dno_pub)
+        _dno_core1 = nakama.decision_core_hash(_dno_d1)
+
+        # E2E 1: dry-run — byte-exact stdout, nothing sent or recorded
+        _dno_nd1 = os.path.join(_dno_td, 'notifs1')
+        _rep, _err, _code = _dno_run([_dno_ev1], _dno_kf, _dno_nd1,
+                                     dry_run=True)
+        _want = (f'[dry-run] {_dno_core1[:12]} (expiring_soon) → '
+                 f'{_dno_pub[2][:16]}... (admit)\n')
+        _ok, _errs, _info = conform_draft_notify_report(_rep)
+        _good = (_rep == _want) and (_code == 0) and (_err == '') and _ok \
+            and not os.path.exists(_dno_nd1)
+        print(f'draft-notify-e2e/dry-run: {"PASS" if _good else "FAIL"} '
+              f'({"; ".join(_info)})')
+        if not _good:
+            print(f'    - got stdout={_rep!r} code={_code} stderr={_err!r}')
+            for e in _errs:
+                print(f'    - {e}')
+            dno_fails += 1
+
+        # E2E 2: skip — a pre-written send record suppresses the send
+        _dno_nd2 = os.path.join(_dno_td, 'notifs2')
+        nakama.draft_notif_record(_dno_nd2, _dno_core1, 'expiring_soon',
+                                  _dno_pub[2],
+                                  nakama.npub_of(_dno_s_sender), _dno_now,
+                                  gift_wrap_id='00' * 32, rumor_id='11' * 32)
+        _rep, _err, _code = _dno_run([_dno_ev1], _dno_kf, _dno_nd2)
+        _want = (f'[skip] {_dno_core1[:12]} (expiring_soon) — '
+                 f'86400s 以内に送信済み\n')
+        _ok, _errs, _info = conform_draft_notify_report(_rep)
+        _good = (_rep == _want) and (_code == 0) and (_err == '') and _ok
+        print(f'draft-notify-e2e/skip: {"PASS" if _good else "FAIL"} '
+              f'({"; ".join(_info)})')
+        if not _good:
+            print(f'    - got stdout={_rep!r} code={_code} stderr={_err!r}')
+            for e in _errs:
+                print(f'    - {e}')
+            dno_fails += 1
+
+        # E2E 3: sent — publish mocked, byte-exact stdout with the real
+        # captured gift wrap id, and the send record is written
+        _dno_nd3 = os.path.join(_dno_td, 'notifs3')
+        _dno_cap = {}
+
+        def _dno_fake_pub(url, event, timeout=15, auth_secret=None):
+            _dno_cap['wrap'] = event
+            return True, ''
+
+        _rep, _err, _code = _dno_run([_dno_ev1], _dno_kf, _dno_nd3,
+                                     publish=_dno_fake_pub)
+        _wid = _dno_cap['wrap']['id']
+        _want = (f'[sent] {_dno_core1[:12]} (expiring_soon) → '
+                 f'{_dno_pub[2][:16]}... (id={_wid})\n')
+        _ok, _errs, _info = conform_draft_notify_report(_rep)
+        _rec = nakama.draft_notif_record_path(_dno_nd3, _dno_core1,
+                                               'expiring_soon')
+        _good = (_rep == _want) and (_code == 0) and (_err == '') and _ok \
+            and len(_wid) == 64 \
+            and all(c in '0123456789abcdef' for c in _wid) \
+            and os.path.exists(_rec)
+        print(f'draft-notify-e2e/sent: {"PASS" if _good else "FAIL"} '
+              f'({"; ".join(_info)})')
+        if not _good:
+            print(f'    - got stdout={_rep!r} code={_code} stderr={_err!r}')
+            for e in _errs:
+                print(f'    - {e}')
+            dno_fails += 1
+
+    # hand-crafted positives
+    _dno_h1, _dno_h2 = 'ab' * 6, 'cd' * 6
+    _dno_p1, _dno_p2 = 'ef' * 8, '01' * 8
+    _dno_id = 'ab' * 32
+    _dno_l_dry = (f'[dry-run] {_dno_h1} (expiring_soon) → {_dno_p1}... '
+                  f'(admit)')
+    _dno_l_dry2 = (f'[dry-run] {_dno_h2} (expired) → {_dno_p2}... (remove)')
+    _dno_l_skip = (f'[skip] {_dno_h1} (expiring_soon) — '
+                   f'86400s 以内に送信済み')
+    _dno_l_skip_c = (f'[skip] cosigner {_dno_h2} (expired) — '
+                     f'86400s 以内に送信済み')
+    _dno_l_sent = (f'[sent] {_dno_h1} (expiring_soon) → {_dno_p1}... '
+                   f'(id={_dno_id})')
+    _dno_l_sent_c = (f'[sent] cosigner {_dno_h2} (expired) → {_dno_p2}... '
+                     f'(id={_dno_id})')
+    dno_pos = [
+        ('issuer dry-run lines',
+         _dno_l_dry + '\n' + _dno_l_dry2 + '\n'),
+        ('cosigner lines only', _dno_l_sent_c + '\n' + _dno_l_skip_c + '\n'),
+        ('issuer block then cosigner block (R3)',
+         _dno_l_sent + '\n' + _dno_l_skip_c + '\n'),
+        ('skip+sent mixed (R1 constrains dry-run only)',
+         _dno_l_skip + '\n' + _dno_l_sent.replace(_dno_h1, _dno_h2) + '\n'),
+        ('no trailing newline', _dno_l_sent),
+        ('trailing blank lines tolerated', _dno_l_dry + '\n\n'),
+        ('no-target line alone (R4)',
+         '通知対象の草案はありませんでした\n'),
+    ]
+    for name, rep in dno_pos:
+        ok, errs, info = conform_draft_notify_report(rep)
+        print(f'draft-notify/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        dno_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    dno_neg = [
+        ('empty report', ''),
+        ('garbage line', 'hello\n'),
+        ('leading blank line', '\n' + _dno_l_sent + '\n'),
+        ('trailing garbage line', _dno_l_sent + '\nunexpected\n'),
+        ('two no-target reports concatenated',
+         '通知対象の草案はありませんでした\n'
+         '通知対象の草案はありませんでした\n'),
+        ('no-target line followed by a notify line',
+         '通知対象の草案はありませんでした\n' + _dno_l_sent + '\n'),
+        ('R3 violated (issuer line after a cosigner line)',
+         _dno_l_skip_c + '\n' + _dno_l_sent + '\n'),
+        ('R1 violated (dry-run mixed with sent)',
+         _dno_l_dry + '\n' + _dno_l_sent + '\n'),
+        ('R2 violated (skip N mismatch)',
+         _dno_l_skip + '\n'
+         + _dno_l_skip.replace('86400s', '3600s')
+                      .replace(_dno_h1, _dno_h2) + '\n'),
+        ('unknown reason vocabulary',
+         _dno_l_dry.replace('(expiring_soon)', '(expiring_later)') + '\n'),
+        ('core12 too short (11 hex)',
+         _dno_l_dry.replace(_dno_h1, _dno_h1[:-1]) + '\n'),
+        ('hex16 not hex',
+         _dno_l_sent.replace(_dno_p1, 'zz' * 8) + '\n'),
+        ('unknown decision vocabulary',
+         _dno_l_dry.replace('(admit)', '(banish)') + '\n'),
+        ('sent id too short (63 hex)',
+         _dno_l_sent.replace(_dno_id, _dno_id[:-1]) + '\n'),
+        ('tag variant ([send])',
+         _dno_l_sent.replace('[sent]', '[send]') + '\n'),
+        ('ASCII arrow instead of →',
+         _dno_l_dry.replace('→', '->') + '\n'),
+        ('ASCII hyphen instead of em dash',
+         _dno_l_skip.replace('—', '-') + '\n'),
+        ('stderr line mixed into the report',
+         f'DM の構築に失敗しました ({_dno_h1} (expiring_soon)): boom\n'),
+    ]
+    for name, rep in dno_neg:
+        ok, errs, info = conform_draft_notify_report(rep)
+        good = not ok
+        print(f'draft-notify-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            dno_fails += 1
+
+    dno_total = 3 + len(dno_pos) + len(dno_neg)
+    print(f'--- draft-notify {dno_total - dno_fails}/{dno_total} passed ---')
+    fails += dno_fails
+
     # ---------- check_compromise_warnings: compromise WARN-line consistency
     # The reference CLI prints compromise warnings to stderr (never
     # blocking, exit code unchanged) from verify / challenge / check /
@@ -15208,7 +15601,7 @@ def selftest() -> int:
         + bdc_total + bcs_total + dmr_total + dms_total + vrt_total + bpl_total \
         + bps_total + vbp_total + vrf_total + pr_total + ac_total \
         + ch_total + ck_total + vrv_total + rvk_total + wrn_total \
-        + crgd_total + rvi_total + ini_total
+        + crgd_total + rvi_total + ini_total + dno_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -15517,6 +15910,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_init <report.txt> [...]')
             return 2
         return check_init_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_draft_notify':
+        if len(argv) < 3:
+            print('usage: conformance.py check_draft_notify <report.txt> [...]')
+            return 2
+        return check_draft_notify_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_rotation_downgrade':
         if len(argv) < 3:
             print('usage: conformance.py check_rotation_downgrade '
