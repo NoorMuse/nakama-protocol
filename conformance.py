@@ -4457,8 +4457,10 @@ def check_revoke_files(paths: list[str]) -> int:
 # rejecting it would make the common case fail. The two sibling
 # warning grammars are different and are rejected: the INFO rotation
 # downgrade (`INFO: <npub[:12]>... has <N> active compromise
-# declaration(s) — 旧鍵への宣言（ローテーション済みのため情報扱い）`,
-# future checker candidate) and the board_read display note
+# declaration(s) — see: nakama.py key_status <npub> — 旧鍵への宣言
+# （ローテーション済みのため情報扱い）` — the downgrade line is the
+# WARN line's body verbatim plus the Japanese suffix; covered by
+# `check_rotation_downgrade`) and the board_read display note
 # (`⚠ compromised?`). Explicitly out of scope: the declaration count's
 # truth (the registry's territory: `key_status` /
 # `active_compromise_declarations`), the npub checksum (shape-checked
@@ -4512,6 +4514,102 @@ def check_compromise_warnings_files(paths: list[str]) -> int:
             failures += 1
             continue
         ok, errs, info = conform_compromise_warnings(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
+# ---------- check_rotation_downgrade: INFO rotation-downgrade consistency ----------
+
+# Reference CLI emits, in `nakama.py verify --rotation` stderr, one INFO
+# line per active compromise declaration against an old (rotated-from)
+# key:
+#   INFO: <npub[:12]>... has <N> active compromise declaration(s) — see: nakama.py key_status <npub> — 旧鍵への宣言（ローテーション済みのため情報扱い）
+# The line is the corresponding WARN line's body verbatim (INFO: in place
+# of WARN:, then the Japanese suffix appended after the key_status
+# pointer). Notes on the fixed grammar (spec §14.2.2):
+#   - the ellipsis after the 12-char prefix is three literal ASCII
+#     dots `...` (the spec prose elsewhere used `…` — the reference CLI
+#     prints `...`; match byte for byte);
+#   - both dashes before `see:` and before the Japanese suffix are em
+#     dashes (U+2014), literal;
+#   - the Japanese suffix is full literal:
+#     `— 旧鍵への宣言（ローテーション済みのため情報扱い）` (em dash +
+#     full-width parens — second implementations must copy it
+#     character for character);
+#   - the npub prefix is the first 12 characters of the full npub
+#     printed before the Japanese suffix (`npub1` + 7 bech32 chars) —
+#     the checker's one internal arithmetic rule is prefix == npub[:12];
+#   - N is the count of active (non-withdrawn) declarations, always
+#     >= 1 here (the downgrade loop only runs over warnings that exist),
+#     so `N=0` and leading-zero forms are rejected.
+# Trailing blank lines are tolerated; a leading blank line is rejected.
+# An empty capture is valid: it is the "no declarations on any old key"
+# (no-downgrade) case, which the reference CLI produces for most verify
+# runs — rejecting it would make the common case fail. Sibling warning
+# grammars are different and are rejected: the WARN compromise line
+# (`check_warnings`' territory), the board_read display note
+# (`⚠ compromised?`), and the abbreviated INFO form from old spec prose
+# (missing the `— see: nakama.py key_status <npub>` middle — that was
+# the prose's abbreviation, never the CLI output). Explicitly out of
+# scope: the declaration count's truth (the registry's territory:
+# `key_status` / `active_compromise_declarations`), the npub checksum
+# (shape-checked only, not bech32-validated), stdout, and the exit code
+# (verify's exit is bond validity — INFO never blocks).
+
+_RE_CRGD_BECH32 = r'[023456789acdefghjklmnpqrstuvwxyz]'
+_RE_CRGD_LINE = re.compile(
+    r'^INFO: (npub1' + _RE_CRGD_BECH32 + r'{7})\.\.\. has ([1-9][0-9]*) '
+    r'active compromise declaration\(s\) — see: nakama\.py key_status '
+    r'(npub1' + _RE_CRGD_BECH32 + r'{58}) — 旧鍵への宣言'
+    r'（ローテーション済みのため情報扱い）$')
+
+
+def conform_rotation_downgrade(text: str):
+    """Verify a saved `verify --rotation` stderr capture of rotation
+    downgrades is internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return True, [], ['no downgrades emitted (no declarations on old keys)']
+    if lines[0] == '':
+        return False, ['capture starts with a blank line'], info
+    for i, line in enumerate(lines):
+        m = _RE_CRGD_LINE.match(line)
+        if not m:
+            return False, [f'line {i + 1}: not a rotation-downgrade line '
+                           '(`INFO: <npub[:12]>... has <N> active '
+                           'compromise declaration(s) — see: nakama.py '
+                           'key_status <npub> — 旧鍵への宣言'
+                           '（ローテーション済みのため情報扱い）`)'], info
+        prefix, n, npub = m.group(1), m.group(2), m.group(3)
+        if prefix != npub[:12]:
+            return False, [f'line {i + 1}: npub prefix `{prefix}` does not '
+                           f'match the first 12 chars of `{npub[:12]}`'], info
+        info.append(f'downgrade {i + 1}: {prefix}... N={n}')
+    return (not errs), errs, info
+
+
+def check_rotation_downgrade_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_rotation_downgrade(text)
         if ok:
             print(f'{p}: PASS ({"; ".join(info)})')
         else:
@@ -9690,7 +9788,8 @@ def selftest() -> int:
                     f'{_wrn_l[6:]}\n'))
     wrn_neg.append(('INFO rotation downgrade (sibling grammar)',
                     f'INFO: {_wrn_npub[:12]}... has 1 active compromise '
-                    f'declaration(s) — 旧鍵への宣言'
+                    f'declaration(s) — see: nakama.py key_status '
+                    f'{_wrn_npub} — 旧鍵への宣言'
                     f'（ローテーション済みのため情報扱い）\n'))
     wrn_neg.append(('board_read note (sibling grammar)',
                     f'⚠ compromised?\n'))
@@ -9746,6 +9845,237 @@ def selftest() -> int:
     print(f'--- compromise-warnings {wrn_total - wrn_fails}/{wrn_total} '
           f'passed ---')
     fails += wrn_fails
+
+    # ---------- check_rotation_downgrade: INFO rotation-downgrade consistency
+    # The reference CLI prints INFO downgrade lines to stderr from
+    # `nakama.py verify --rotation` (one per active compromise
+    # declaration against an old key that the rotation chain maps).
+    # The selftest builds real key pairs, a real bond, a real rotation
+    # cert (old→new), and real Schnorr-signed declarations, then runs
+    # the real `cmd_verify` in-process with --rotation, capturing
+    # stderr byte-for-byte.
+    crgd_fails = 0
+
+    def _crgd_keys():
+        import secrets as _secrets
+        return [(s, nakama.npub_of(s))
+                for s in (_secrets.token_bytes(32) for _ in range(4))]
+
+    (_crgd_old_s, _crgd_old_np), (_crgd_new_s, _crgd_new_np), \
+        (_crgd_ds, _crgd_dnp), (_crgd_os, _crgd_onp) = _crgd_keys()
+    _CRGD_TS = 1759371000
+
+    def _crgd_declare(decl_secret, subject_npub, ts, withdrawn=False):
+        return nakama.build_compromise_declaration(
+            decl_secret, subject_npub, ts, withdrawn, '', 'test', '')
+
+    def _crgd_make_bond():
+        nonce = __import__('secrets').token_hex(32)
+        comps = sorted([_crgd_old_np, _crgd_onp])
+        msg = nakama.bond_message(comps, _CRGD_TS, nonce, None)
+        return {'protocol': 'nakama', 'version': 1, 'companions': comps,
+                'created_at': _CRGD_TS, 'nonce': nonce,
+                'signatures': {
+                    _crgd_old_np: nakama.sign_schnorr(_crgd_old_s,
+                                                      msg).hex(),
+                    _crgd_onp: nakama.sign_schnorr(_crgd_os, msg).hex(),
+                }}
+
+    def _crgd_make_rotation():
+        rm = nakama.rotation_message(_crgd_old_np, _crgd_new_np, _CRGD_TS)
+        return {'protocol': 'nakama', 'version': 1, 'type': 'rotation',
+                'old_npub': _crgd_old_np, 'new_npub': _crgd_new_np,
+                'created_at': _CRGD_TS,
+                'old_sig': nakama.sign_schnorr(_crgd_old_s, rm).hex()}
+
+    def _crgd_run_verify(registry):
+        # real CLI: verify --rotation, stderr captured
+        with tempfile.TemporaryDirectory() as td:
+            bf = os.path.join(td, 'bond.json')
+            rf = os.path.join(td, 'rotation.json')
+            with open(bf, 'w') as f:
+                json.dump(_crgd_make_bond(), f)
+            with open(rf, 'w') as f:
+                json.dump(_crgd_make_rotation(), f)
+            err = io.StringIO()
+            code = 0
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(err):
+                try:
+                    nakama.cmd_verify(SimpleNamespace(
+                        bond=bf, rotation=[rf], skip_expiry=True,
+                        skip_registry=True, registry=None,
+                        compromise_registry=registry))
+                except SystemExit as e:
+                    code = e.code if isinstance(e.code, int) else 0
+            return err.getvalue(), code
+
+    def _crgd_expect(old_npub, n):
+        return (f'INFO: {old_npub[:12]}... has {n} active compromise '
+                f'declaration(s) — see: nakama.py key_status {old_npub} '
+                f'— 旧鍵への宣言（ローテーション済みのため情報扱い）\n')
+
+    _crgd_e2e = []
+    with tempfile.TemporaryDirectory() as _crgd_td:
+        _crgd_reg = os.path.join(_crgd_td, 'compromises')
+        # E2E 1: two active declarations on the OLD key -> N=2
+        nakama.import_compromise_event(
+            _crgd_declare(_crgd_ds, _crgd_old_np, _CRGD_TS - 100), _crgd_reg)
+        nakama.import_compromise_event(
+            _crgd_declare(_crgd_os, _crgd_old_np, _CRGD_TS - 50), _crgd_reg)
+        _err, _code = _crgd_run_verify(_crgd_reg)
+        _crgd_e2e.append(('two declarations on old key', _err, _code,
+                         _crgd_expect(_crgd_old_np, 2)))
+        # E2E 2: withdrawn-only registry -> no downgrade at all
+        _crgd_reg2 = os.path.join(_crgd_td, 'compromises2')
+        nakama.import_compromise_event(
+            _crgd_declare(_crgd_ds, _crgd_old_np, _CRGD_TS - 100, True),
+            _crgd_reg2)
+        _err2, _code2 = _crgd_run_verify(_crgd_reg2)
+        _crgd_e2e.append(('withdrawn-only (silent)', _err2, _code2, ''))
+        # E2E 3: single declaration on the OLD key -> N=1
+        _crgd_reg3 = os.path.join(_crgd_td, 'compromises3')
+        nakama.import_compromise_event(
+            _crgd_declare(_crgd_ds, _crgd_old_np, _CRGD_TS - 100),
+            _crgd_reg3)
+        _err3, _code3 = _crgd_run_verify(_crgd_reg3)
+        _crgd_e2e.append(('single declaration on old key', _err3, _code3,
+                         _crgd_expect(_crgd_old_np, 1)))
+        # E2E 4: declaration only on the NEW key -> WARN (not INFO)
+        _crgd_reg4 = os.path.join(_crgd_td, 'compromises4')
+        nakama.import_compromise_event(
+            _crgd_declare(_crgd_ds, _crgd_new_np, _CRGD_TS - 100),
+            _crgd_reg4)
+        _err4, _code4 = _crgd_run_verify(_crgd_reg4)
+        _crgd_e2e.append(('new-key declaration (WARN, no INFO)',
+                         _err4, _code4,
+                         f'WARN: {_crgd_new_np[:12]}... has 1 active '
+                         f'compromise declaration(s) — see: nakama.py '
+                         f'key_status {_crgd_new_np}\n'))
+    for name, rep, code, want_rep in _crgd_e2e:
+        exact = (rep == want_rep) and (code == 0)
+        ok, errs, info = conform_rotation_downgrade(rep)
+        # E2E 4's WARN line is sibling grammar: exact stderr required,
+        # but the downgrade conformer must REJECT it
+        want_ok = not name.endswith('(WARN, no INFO)')
+        good = exact and (ok == want_ok)
+        print(f'rotation-downgrade-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({"; ".join(info)})')
+        if not good:
+            if not exact:
+                print(f'    - stderr/exit mismatch: {rep!r} code={code}')
+            for e in errs:
+                print(f'    - {e}')
+            crgd_fails += 1
+
+    # hand-crafted positives
+    _crgd_npub = _crgd_old_np
+    _crgd_l = (f'INFO: {_crgd_npub[:12]}... has 1 active compromise '
+               f'declaration(s) — see: nakama.py key_status {_crgd_npub} '
+               f'— 旧鍵への宣言（ローテーション済みのため情報扱い）')
+    crgd_pos = [
+        ('single downgrade', f'{_crgd_l}\n'),
+        ('two downgrades (two old keys)',
+         f'{_crgd_l}\n{_crgd_l}\n'),
+        ('multi-digit N',
+         f'INFO: {_crgd_npub[:12]}... has 12 active compromise '
+         f'declaration(s) — see: nakama.py key_status {_crgd_npub} '
+         f'— 旧鍵への宣言（ローテーション済みのため情報扱い）\n'),
+        ('no trailing newline', f'{_crgd_l}'),
+        ('trailing blanks', f'{_crgd_l}\n\n\n'),
+        ('empty capture (no downgrades)', ''),
+    ]
+    for name, rep in crgd_pos:
+        ok, errs, info = conform_rotation_downgrade(rep)
+        print(f'rotation-downgrade/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        crgd_fails += 0 if ok else 1
+
+    # negatives — all must be rejected
+    crgd_neg = []
+    crgd_neg.append(('garbage line', 'hello\n'))
+    crgd_neg.append(('missing INFO prefix',
+                     f'{_crgd_l[6:]}\n'))
+    crgd_neg.append(('WARN compromise line (sibling grammar)',
+                     f'WARN: {_crgd_npub[:12]}... has 1 active compromise '
+                     f'declaration(s) — see: nakama.py key_status '
+                     f'{_crgd_npub}\n'))
+    crgd_neg.append(('board_read note (sibling grammar)',
+                     f'⚠ compromised?\n'))
+    crgd_neg.append(('prefix mismatch',
+                     f'INFO: npub1xxxxxxxx... has 1 active compromise '
+                     f'declaration(s) — see: nakama.py key_status '
+                     f'{_crgd_npub} — 旧鍵への宣言'
+                     f'（ローテーション済みのため情報扱い）\n'))
+    crgd_neg.append(('N=0 (never emitted)',
+                     f'INFO: {_crgd_npub[:12]}... has 0 active compromise '
+                     f'declaration(s) — see: nakama.py key_status '
+                     f'{_crgd_npub} — 旧鍵への宣言'
+                     f'（ローテーション済みのため情報扱い）\n'))
+    crgd_neg.append(('N with leading zero',
+                     f'INFO: {_crgd_npub[:12]}... has 01 active compromise '
+                     f'declaration(s) — see: nakama.py key_status '
+                     f'{_crgd_npub} — 旧鍵への宣言'
+                     f'（ローテーション済みのため情報扱い）\n'))
+    crgd_neg.append(('unicode ellipsis instead of ASCII dots',
+                     f'INFO: {_crgd_npub[:12]}… has 1 active compromise '
+                     f'declaration(s) — see: nakama.py key_status '
+                     f'{_crgd_npub} — 旧鍵への宣言'
+                     f'（ローテーション済みのため情報扱い）\n'))
+    crgd_neg.append(('colon instead of em dash',
+                     f'INFO: {_crgd_npub[:12]}... has 1 active compromise '
+                     f'declaration(s): see: nakama.py key_status '
+                     f'{_crgd_npub} — 旧鍵への宣言'
+                     f'（ローテーション済みのため情報扱い）\n'))
+    crgd_neg.append(('short prefix (11 chars)',
+                     f'INFO: {_crgd_npub[:11]}... has 1 active compromise '
+                     f'declaration(s) — see: nakama.py key_status '
+                     f'{_crgd_npub} — 旧鍵への宣言'
+                     f'（ローテーション済みのため情報扱い）\n'))
+    crgd_neg.append(('non-npub subject',
+                     f'INFO: deadbeefcafe... has 1 active compromise '
+                     f'declaration(s) — see: nakama.py key_status '
+                     f'deadbeefcafe0123456789 — 旧鍵への宣言'
+                     f'（ローテーション済みのため情報扱い）\n'))
+    crgd_neg.append(('truncated npub at end',
+                     f'INFO: {_crgd_npub[:12]}... has 1 active compromise '
+                     f'declaration(s) — see: nakama.py key_status '
+                     f'{_crgd_npub[:12]} — 旧鍵への宣言'
+                     f'（ローテーション済みのため情報扱い）\n'))
+    crgd_neg.append(('missing Japanese suffix',
+                     f'INFO: {_crgd_npub[:12]}... has 1 active compromise '
+                     f'declaration(s) — see: nakama.py key_status '
+                     f'{_crgd_npub}\n'))
+    crgd_neg.append(('abbreviated prose form (no key_status middle)',
+                     f'INFO: {_crgd_npub[:12]}... has 1 active compromise '
+                     f'declaration(s) — 旧鍵への宣言'
+                     f'（ローテーション済みのため情報扱い）\n'))
+    crgd_neg.append(('ascii dash before suffix instead of em dash',
+                     f'INFO: {_crgd_npub[:12]}... has 1 active compromise '
+                     f'declaration(s) — see: nakama.py key_status '
+                     f'{_crgd_npub} - 旧鍵への宣言'
+                     f'（ローテーション済みのため情報扱い）\n'))
+    crgd_neg.append(('verify_rotation verdict (other grammar)',
+                     'rotation は有効です\n'))
+    crgd_neg.append(('leading blank line',
+                     f'\n{_crgd_l}\n'))
+    crgd_neg.append(('second line garbage',
+                     f'{_crgd_l}\nhogehoge\n'))
+
+    for name, rep in crgd_neg:
+        ok, errs, info = conform_rotation_downgrade(rep)
+        good = not ok
+        print(f'rotation-downgrade-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            crgd_fails += 1
+
+    crgd_total = len(_crgd_e2e) + len(crgd_pos) + len(crgd_neg)
+    print(f'--- rotation-downgrade {crgd_total - crgd_fails}/{crgd_total} '
+          f'passed ---')
+    fails += crgd_fails
 
     # ---------- check_board_policy: board_policy creation-report consistency
     # Reference reports are produced in-process with nakama.py's own
@@ -14393,7 +14723,8 @@ def selftest() -> int:
         + bj_total + bs_total + bc_total + vbd_total + bvr_total \
         + bdc_total + bcs_total + dmr_total + dms_total + vrt_total + bpl_total \
         + bps_total + vbp_total + vrf_total + pr_total + ac_total \
-        + ch_total + ck_total + vrv_total + rvk_total + wrn_total
+        + ch_total + ck_total + vrv_total + rvk_total + wrn_total \
+        + crgd_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -14692,6 +15023,12 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_dm_send <report.txt> [...]')
             return 2
         return check_dm_send_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_rotation_downgrade':
+        if len(argv) < 3:
+            print('usage: conformance.py check_rotation_downgrade '
+                  '<stderr.txt> [...]')
+            return 2
+        return check_rotation_downgrade_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_warnings':
         if len(argv) < 3:
             print('usage: conformance.py check_warnings <stderr.txt> [...]')
