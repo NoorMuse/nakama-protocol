@@ -4523,6 +4523,78 @@ def check_revoke_import_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_init: init report consistency ----------
+
+# A saved `nakama.py init [--from-hex HEX] [--force] <keyfile>` stdout
+# report. Its grammar is fixed (spec §1.1). check_init verifies that
+# the report is internally consistent: exactly one line — the new
+# identity's npub, printed verbatim by the reference CLI:
+#   npub1<58 bech32 chars>
+# The npub of a 32-byte key is always exactly 63 chars (`npub1` + 58
+# bech32 chars) — shape-checked only, the bech32 checksum is not
+# validated (the same rule as the §2.2.1 `あなたの npub:` line and the
+# §14.2.1 warn lines' npub shape). Trailing blank lines are tolerated;
+# a leading blank line is rejected. There is no internal arithmetic to
+# check — a lone npub has no derivable fields.
+# Note: `nakama.py whoami <keyfile>` prints the same single-npub line
+# to stdout — grammatically identical (like challenge/respond), so
+# check_init does not reject whoami reports; the two commands are
+# indistinguishable from the saved text. The init refusal
+# (`既に鍵があります: ... --force で上書き`, exit 1) goes to stderr,
+# so it never appears in a saved stdout report.
+# Explicitly out of scope: whether the npub really belongs to the
+# keyfile (an ownership claim — the checker sees only the saved text),
+# the npub's checksum, stderr, and the exit code. Use this to prove a
+# second implementation's `init` CLI prints a compatible npub line.
+
+_RE_INIT_BECH32 = r'[023456789acdefghjklmnpqrstuvwxyz]'
+_RE_INIT_NPUB = re.compile(r'^npub1' + _RE_INIT_BECH32 + r'{58}$')
+
+
+def conform_init_report(text: str):
+    """Verify a saved `nakama.py init` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    if len(lines) != 1:
+        return False, [f'report must be exactly 1 line (the new npub), '
+                       f'found {len(lines)} lines'], info
+    if not _RE_INIT_NPUB.match(lines[0]):
+        return False, ['line 1: not an npub line '
+                       '(`npub1` + 58 bech32 chars, 63 chars total)'], info
+    info.append(f'npub {lines[0][:12]}...')
+    return (not errs), errs, info
+
+
+def check_init_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_init_report(text)
+        if ok:
+            print(f'{p}: PASS ("{"; ".join(info)}")')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- check_compromise_warnings: compromise WARN-line consistency ----------
 
 # A saved stderr capture of the compromise-declaration warnings the
@@ -9962,6 +10034,130 @@ def selftest() -> int:
     print(f'--- revoke-import {rvi_total - rvi_fails}/{rvi_total} passed ---')
     fails += rvi_fails
 
+    # ---------- check_init: init report consistency
+    # The reference CLI prints the new identity's npub to stdout, one
+    # line, exit 0 (cmd_init with --from-hex for a deterministic key;
+    # the keyfile is a real temp keyfile). Real-CLI in-process E2E
+    # below: cmd_init -> stdout byte-compared; second cmd_init without
+    # --force -> stderr refusal + exit 1 (empty stdout rejected by the
+    # checker); cmd_whoami on the same keyfile -> the same npub line,
+    # which check_init accepts (grammatically identical, like
+    # challenge/respond).
+    ini_fails = 0
+    import tempfile as _ini_tf
+    import io as _ini_io
+    import contextlib as _ini_ctx
+    from types import SimpleNamespace as _ini_NS
+
+    def _ini_run_init(tmpd, keyfile, from_hex=None, force=False):
+        buf = _ini_io.StringIO()
+        err = _ini_io.StringIO()
+        code = 0
+        with _ini_ctx.redirect_stdout(buf), _ini_ctx.redirect_stderr(err):
+            try:
+                nakama.cmd_init(_ini_NS(
+                    keyfile=keyfile,
+                    from_hex=from_hex, force=force))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        return buf.getvalue(), err.getvalue(), code
+
+    def _ini_run_whoami(keyfile):
+        buf = _ini_io.StringIO()
+        err = _ini_io.StringIO()
+        code = 0
+        with _ini_ctx.redirect_stdout(buf), _ini_ctx.redirect_stderr(err):
+            try:
+                nakama.cmd_whoami(_ini_NS(keyfile=keyfile))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        return buf.getvalue(), err.getvalue(), code
+
+    _ini_e2e = []
+    with _ini_tf.TemporaryDirectory() as _ini_td:
+        _ini_s, _ini_np = _key()
+        _ini_kf = os.path.join(_ini_td, 'identity.json')
+        _rep, _err, _code = _ini_run_init(_ini_td, _ini_kf,
+                                          from_hex=_ini_s.hex())
+        _ini_e2e.append(('init --from-hex', _rep, _err, _code,
+                         f'{_ini_np}\n'))
+        _rep, _err, _code = _ini_run_init(_ini_td, _ini_kf)
+        _ini_e2e.append(('init again (refused, exit 1)', _rep, _err, _code,
+                         None))
+        _rep, _err, _code = _ini_run_whoami(_ini_kf)
+        _ini_e2e.append(('whoami (same grammar, accepted)', _rep, _err,
+                         _code, f'{_ini_np}\n'))
+    for name, rep, err, code, want_rep in _ini_e2e:
+        if want_rep is None:
+            # refusal case: stderr verdict + exit 1, empty stdout — and
+            # the empty stdout is rejected by the checker (the refusal
+            # has no stdout report)
+            good = (rep == '') and (code == 1) and \
+                (err == f'既に鍵があります: {_ini_kf}（--force で上書き）\n') and \
+                not conform_init_report(rep)[0]
+            info = ['refusal on stderr, no stdout report (rejected)']
+        else:
+            exact = (rep == want_rep) and (code == 0) and (err == '')
+            ok, errs, info = conform_init_report(rep)
+            good = exact and ok
+        print(f'init-e2e/{name}: {"PASS" if good else "FAIL"} '
+              f'({"; ".join(info)})')
+        if not good:
+            print(f'    - got stdout={rep!r} code={code} stderr={err!r}')
+            for e in (errs if want_rep is not None else []):
+                print(f'    - {e}')
+            ini_fails += 1
+
+    # hand-crafted positives
+    _ini_np2 = _ini_np
+    _ini_no_nl = _ini_np2
+    ini_pos = [
+        ('single npub line', f'{_ini_np2}\n'),
+        ('no trailing newline', _ini_no_nl),
+        ('trailing blanks', f'{_ini_np2}\n\n\n'),
+        ('whoami-shaped report', f'{_ini_np2}\n'),
+    ]
+    for name, rep in ini_pos:
+        ok, errs, info = conform_init_report(rep)
+        print(f'init/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        ini_fails += 0 if ok else 1
+
+    # hand-crafted negatives
+    ini_neg = [
+        ('empty report', ''),
+        ('garbage line', 'hello\n'),
+        ('two reports concatenated', f'{_ini_np2}\n{_ini_np2}\n'),
+        ('npub with trailing space', f'{_ini_np2} \n'),
+        ('npub with leading space', f' {_ini_np2}\n'),
+        ('npub short (62 chars)', f'{_ini_np2[:-1]}\n'),
+        ('npub long (64 chars)', f'{_ini_np2}a\n'),
+        ('wrong hrp (nsec)', 'nsec1' + _ini_np2[5:] + '\n'),
+        ('uppercase npub (bech32 is lowercase-only)',
+         _ini_np2.upper() + '\n'),
+        ('non-bech32 char (o)', _ini_np2[:5] + 'o' + _ini_np2[6:] + '\n'),
+        ('challenge line (sibling)', 'ab' * 32 + '\n'),
+        ('check verdict (sibling)', '本人です 🤝\n'),
+        ('propose report first line (sibling)',
+         f'proposal を proposal.json に保存しました。相手に渡してください。\n'),
+        ('publish-result line (sibling)',
+         'publish: 受理 (OK) id=0123456789abcdef\n'),
+        ('leading blank line', f'\n{_ini_np2}\n'),
+    ]
+    for name, rep in ini_neg:
+        ok, errs, info = conform_init_report(rep)
+        good = not ok
+        print(f'init-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            ini_fails += 1
+
+    ini_total = len(_ini_e2e) + len(ini_pos) + len(ini_neg)
+    print(f'--- init {ini_total - ini_fails}/{ini_total} passed ---')
+    fails += ini_fails
+
     # ---------- check_compromise_warnings: compromise WARN-line consistency
     # The reference CLI prints compromise warnings to stderr (never
     # blocking, exit code unchanged) from verify / challenge / check /
@@ -15012,7 +15208,7 @@ def selftest() -> int:
         + bdc_total + bcs_total + dmr_total + dms_total + vrt_total + bpl_total \
         + bps_total + vbp_total + vrf_total + pr_total + ac_total \
         + ch_total + ck_total + vrv_total + rvk_total + wrn_total \
-        + crgd_total + rvi_total
+        + crgd_total + rvi_total + ini_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -15316,6 +15512,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_revoke_import <report.txt> [...]')
             return 2
         return check_revoke_import_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_init':
+        if len(argv) < 3:
+            print('usage: conformance.py check_init <report.txt> [...]')
+            return 2
+        return check_init_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_rotation_downgrade':
         if len(argv) < 3:
             print('usage: conformance.py check_rotation_downgrade '
