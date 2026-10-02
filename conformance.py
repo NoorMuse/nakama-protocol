@@ -5480,6 +5480,82 @@ def check_unbind_files(paths: list[str]) -> int:
     print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
     return 0 if failures == 0 else 1
 
+
+# ---------- check_respond: respond report consistency ----------
+
+# `nakama.py respond <nonce>` signs the 32-byte nonce with the keyfile's
+# secret key and prints the Schnorr signature to stdout as one line of
+# 128 lowercase hex chars (`sign_schnorr(secret, nonce).hex()` — a
+# 64-byte signature, spec §3.3):
+#   <128 lowercase hex>
+# check_respond verifies that a saved report is internally consistent:
+# exactly one line, exactly 128 lowercase hex chars. Trailing blank
+# lines are tolerated; a leading blank line is rejected. There is no
+# internal arithmetic to check — a signature has no derivable fields.
+# Note (correction of the v0.71/v0.72 note in §3.1/§3.2 and in
+# check_challenge's comment): `respond`'s report is NOT grammatically
+# identical to `challenge`'s. The reference CLI demonstrably prints 128
+# hex chars (64-byte Schnorr signature), not 64. challenge (64 hex) and
+# respond (128 hex) are different grammars — the two checkers mutually
+# reject each other's reports (like the propose/accept pair). `check`'s
+# reports (`本人です 🤝` / `検証失敗`) are a different grammar and are
+# naturally rejected. The failure paths (nonce not 32 bytes of hex —
+# `bytes.fromhex` ValueError or the `len(nonce) == 32` assert) raise
+# before the print, so the reference CLI's stdout on failure is empty
+# and is rejected here.
+# Explicitly out of scope: the signature's truth (a cryptographic claim —
+# `verify_schnorr` / `check`'s territory, the checker sees only the saved
+# text), the nonce's truth, and the exit code (invisible in saved stdout
+# text). Use this to prove a second implementation's `respond` CLI prints
+# a compatible signature report.
+
+_RE_RESP = re.compile(r'^[0-9a-f]{128}$')
+
+
+def conform_respond_report(text: str):
+    """Verify a saved `nakama.py respond` stdout report is internally
+    consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    if len(lines) != 1:
+        return False, [f'report must be a single signature line, '
+                       f'found {len(lines)} lines'], info
+    if not _RE_RESP.match(lines[0]):
+        return False, ['line 1: not a 128-char lowercase hex signature '
+                       '(`sign_schnorr(secret, nonce).hex()`)'], info
+    info.append(f'sig {lines[0][:16]}…')
+    return True, errs, info
+
+
+def check_respond_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_respond_report(text)
+        if ok:
+            print(f'{p}: PASS ({"; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- check_board_policy: board_policy creation-report consistency ----------
 
 # A saved `nakama.py board_policy` stdout report. Its grammar is fixed
@@ -6471,11 +6547,14 @@ def check_accept_files(paths: list[str]) -> int:
 # exactly one line, exactly 64 lowercase hex chars. Trailing blank lines
 # are tolerated; a leading blank line is rejected. There is no internal
 # arithmetic to check — a nonce has no derivable fields.
-# Note: `respond`'s report is grammatically identical — a single line of
-# 64 lowercase hex (the Schnorr signature over the nonce). The two reports
-# cannot be distinguished by grammar alone, so check_challenge does NOT
-# reject respond reports (unlike e.g. the propose/accept pair, which do
-# reject each other). `check`'s reports (`本人です 🤝` / `検証失敗`) are a
+# Note (corrected in v0.87 — the earlier text claimed otherwise):
+# `respond`'s report is NOT grammatically identical to `challenge`'s.
+# The reference CLI prints `respond`'s report as a single line of 128
+# lowercase hex (the 64-byte Schnorr signature over the nonce —
+# `sign_schnorr(secret, nonce).hex()`), while `challenge` prints 64 hex.
+# The two reports are different grammars: check_challenge rejects the
+# 128-hex respond form (like e.g. the propose/accept pair, which reject
+# each other). `check`'s reports (`本人です 🤝` / `検証失敗`) are a
 # different grammar and are naturally rejected.
 # Explicitly out of scope: the nonce's freshness and randomness (a
 # cryptographic claim — the checker sees only the saved text), whether
@@ -12413,6 +12492,142 @@ def selftest() -> int:
     print(f'--- unbind {unb_total - unb_fails}/{unb_total} passed ---')
     fails += unb_fails
 
+    # ---------- check_respond: respond report consistency ----------
+    # Reference reports are produced in-process with nakama.py's own
+    # cmd_respond (real temp keyfile, real Schnorr signature over a
+    # fixed nonce — no relay contact). v0.87 corrected the old §3.1 note:
+    # the reference CLI prints 128 lowercase hex (64-byte Schnorr
+    # signature), not 64. The roundtrip case proves the E2E signature
+    # really verifies via cmd_check. Failure paths (nonce not 32 bytes
+    # of hex) raise before the print, so the empty stdout must be
+    # rejected by the checker.
+    rs_fails = 0
+
+    def _rs_run(keyfile, nonce):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                nakama.cmd_respond(SimpleNamespace(
+                    keyfile=keyfile, nonce=nonce))
+            except Exception:
+                pass
+        return buf.getvalue()
+
+    with tempfile.TemporaryDirectory() as _rs_td:
+        _rs_s, _rs_np = _key()
+        _rs_kf = os.path.join(_rs_td, 'identity.json')
+        nakama.save_key(_rs_kf, _rs_s)
+        _rs_nonce = 'ab' * 32
+        _rs_rep = _rs_run(_rs_kf, _rs_nonce)       # real sig line
+        _rs_rep2 = _rs_run(_rs_kf, _rs_nonce)      # determinism
+        _rs_bad_short = _rs_run(_rs_kf, 'ab')     # assert fails
+        _rs_bad_hex = _rs_run(_rs_kf, 'zz' * 32)  # ValueError
+        _rs_bad_len = _rs_run(_rs_kf, 'ab' * 64)  # 64-byte nonce
+        # roundtrip: the E2E signature verifies via cmd_check
+        # (empty compromise registry separates the §14.2 stderr warnings)
+        _rs_sig = _rs_rep.strip()
+        _ck_buf = io.StringIO()
+        with contextlib.redirect_stdout(_ck_buf), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                nakama.cmd_check(SimpleNamespace(
+                    npub=_rs_np, nonce=_rs_nonce, sig=_rs_sig,
+                    compromise_registry=_rs_td))
+            except SystemExit:
+                pass
+        _rs_roundtrip = _ck_buf.getvalue()
+
+    _rs_e2e = [
+        # (name, report, checker_must_accept [None: checker not
+        # applicable], stdout shape_ok)
+        ('plain (real Schnorr sig, 128 hex)', _rs_rep, True,
+         re.fullmatch(r'[0-9a-f]{128}\n', _rs_rep) is not None),
+        # signing draws fresh randomness per call (coincurve BIP-340),
+        # so a second call gives a different line — both runs must
+        # still be valid 128-hex reports.
+        ('second run also valid', _rs_rep2, True,
+         re.fullmatch(r'[0-9a-f]{128}\n', _rs_rep2) is not None),
+        # the roundtrip report is cmd_check's verdict line, not a
+        # respond report — the checker does not apply here (None);
+        # the shape assertion is the real check.
+        ('roundtrip cmd_check verifies', _rs_roundtrip, None,
+         _rs_roundtrip == '本人です 🤝\n'),
+        ('short nonce -> empty stdout', _rs_bad_short, False,
+         _rs_bad_short == ''),
+        ('non-hex nonce -> empty stdout', _rs_bad_hex, False,
+         _rs_bad_hex == ''),
+        ('64-byte nonce -> empty stdout', _rs_bad_len, False,
+         _rs_bad_len == ''),
+    ]
+    for _name, _rep, _want_ok, _shape_ok in _rs_e2e:
+        _ok, _errs, _info = conform_respond_report(_rep)
+        _good = _shape_ok and (_want_ok is None or _ok == _want_ok)
+        print(f'respond-e2e/{_name}: '
+              f'{"PASS" if _good else "FAIL"} ("{"; ".join(_info)}")')
+        if not _good:
+            if not _shape_ok:
+                print(f'    - stdout shape mismatch: {_rep!r}')
+            if _want_ok is not None and _ok != _want_ok:
+                print(f'    - checker returned {_ok}, want {_want_ok}: '
+                      f'{_errs}')
+            rs_fails += 1
+
+    # hand-crafted positives
+    _rsig = 'ab' * 64  # 128 lowercase hex
+    rs_pos = [
+        ('minimal', f'{_rsig}\n'),
+        ('no trailing newline', _rsig),
+        ('trailing blanks', f'{_rsig}\n\n\n'),
+        ('all zeros', '00' * 64 + '\n'),
+        ('all f', 'ff' * 64 + '\n'),
+    ]
+    for _name, _rep in rs_pos:
+        _ok, _errs, _info = conform_respond_report(_rep)
+        print(f'respond-pos/{_name}: '
+              f'{"PASS" if _ok else "FAIL"} ("{"; ".join(_info)}")')
+        if not _ok:
+            for _e in _errs:
+                print(f'    - {_e}')
+            rs_fails += 1
+
+    # hand-crafted negatives (must be rejected)
+    rs_neg = [
+        ('empty', ''),
+        ('garbage', 'hello\n'),
+        # the old (v0.71) belief was that a respond report is 64 hex —
+        # v0.87 corrected this: real respond reports are 128 hex, so the
+        # challenge-shaped 64-hex line is rejected here (mutual
+        # rejection holds, like the propose/accept pair)
+        ('challenge-shaped (64 hex)', 'cd' * 32 + '\n'),
+        ('too short (127)', 'ab' * 63 + 'a' + '\n'),
+        ('too long (129)', 'ab' * 64 + 'a' + '\n'),
+        ('uppercase hex', 'AB' * 64 + '\n'),
+        ('mixed case', 'aB' * 64 + '\n'),
+        ('non-hex char', 'ab' * 63 + 'zz' + '\n'),
+        ('inner whitespace', 'ab' * 32 + ' ' + 'ab' * 32 + '\n'),
+        ('0x prefix', '0x' + 'ab' * 64 + '\n'),
+        ('two reports concatenated', f'{_rsig}\n{_rsig}\n'),
+        ('leading blank', f'\n{_rsig}\n'),
+        ('trailing junk line', f'{_rsig}\nextra\n'),
+        # check's reports are a different grammar — rejected
+        ('check success report', '本人です 🤝\n'),
+        ('check failure report', '検証失敗\n'),
+        # init's npub report is a different grammar — rejected
+        ('init npub report', f'{_rs_np}\n'),
+    ]
+    for _name, _rep in rs_neg:
+        _ok, _errs, _info = conform_respond_report(_rep)
+        _good = not _ok
+        print(f'respond-neg/{_name}: '
+              f'{"PASS (rejected)" if _good else "FAIL (accepted!)"}')
+        if not _good:
+            rs_fails += 1
+
+    rs_total = len(_rs_e2e) + len(rs_pos) + len(rs_neg)
+    print(f'--- respond {rs_total - rs_fails}/{rs_total} passed ---')
+    fails += rs_fails
+
     # ---------- check_init: init report consistency
     # The reference CLI prints the new identity's npub to stdout, one
     # line, exit 0 (cmd_init with --from-hex for a deterministic key;
@@ -14374,9 +14589,11 @@ def selftest() -> int:
         ('trailing blanks', f'{_cnonce}\n\n\n'),
         ('all zeros', '00' * 32 + '\n'),
         ('all f', 'ff' * 32 + '\n'),
-        # a respond report is grammatically identical (64 hex signature) —
-        # check_challenge cannot and must not reject it
-        ('respond-shaped report (indistinguishable)',
+        # the old (v0.71) belief was that a respond report is 64 hex and
+        # indistinguishable from a challenge line — v0.87 corrected this:
+        # real respond reports are 128 hex. this 64-hex line stays as a
+        # challenge-shaped positive (it is not a real respond report).
+        ('respond-shaped per old belief (64 hex — challenge-shaped)',
          'cd' * 32 + '\n'),
     ]
     for _name, _rep in ch_pos:
@@ -17830,7 +18047,7 @@ def selftest() -> int:
         + ch_total + ck_total + vrv_total + rvk_total + wrn_total \
         + crgd_total + rvi_total + ini_total + dno_total + cpi_total \
         + cpd_total + cpw_total + rti_total + bnd_total \
-        + unb_total
+        + unb_total + rs_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -18243,6 +18460,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_challenge <report.txt> [...]')
             return 2
         return check_challenge_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_respond':
+        if len(argv) < 3:
+            print('usage: conformance.py check_respond <report.txt> [...]')
+            return 2
+        return check_respond_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_check':
         if len(argv) < 3:
             print('usage: conformance.py check_check <report.txt> [...]')
@@ -18308,6 +18530,7 @@ def main(argv: list[str]) -> int:
           'check_propose <report.txt> [...] | '
           'check_accept <report.txt> [...] | '
           'check_challenge <report.txt> [...] | '
+          'check_respond <report.txt> [...] | '
           'check_check <report.txt> [...] | '
           'selftest')
     return 2

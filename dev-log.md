@@ -126,3 +126,8 @@
 - selftest 39/39（新規: 実 CLI の in-process E2E 5（通常発行・指定 scope・--markdown・space 含み --out・keyfile 不可読）＋正常 craft 8＋却下 26）、selftest 総計 1428/1428 PASS、全 21 テストファイル回帰 PASS。
 - §9.1.2 に unbind 発行レポートの表示文法を固定（§8.9 の「将来候補」記述を `check_unbind` 参照に更新）。ロードマップ §7 に v0.86 を追加。spec を files/ と同期。
 - 外部 push なし（run 開始時 remote HEAD=seen_refs=6895170）。
+- 2026-10-02 v0.87: `check_respond`（conformance チェッカー第 65 弾、ローカル出力チェッカー第 50 弾）。`respond` 署名レポート（§3.3）の一貫性チェッカー: ちょうど 1 行、64 バイト Schnorr 署名の小文字 hex 128 文字（`sign_schnorr(secret, nonce).hex()`）。失敗パス（nonce が 32 バイト hex でない）は print 前に例外のため空 stdout は checker が却下。
+- 訂正: v0.71/v0.72 の仕様書注記「respond のレポートも文法上は challenge と同一（64 hex）」は誤り — 実測で 128 hex のため `challenge`（64 hex）とは別文法、両 checker は相互に拒否（`check_challenge` のコメント・selftest 注記・§3.1/§3.2 の旧注記を更新、§3.3 を新設）。
+- selftest 27/27（新規: 実 CLI の in-process E2E 6（通常発行・2 回目の発行も有効（署名は呼び出しごとに fresh randomness）・`cmd_check` による roundtrip 検証 `本人です 🤝`・短い nonce・非 hex nonce・64 バイト nonce）＋正常 craft 5＋却下 16）、selftest 総計 1455/1455 PASS、全 21 テストファイル回帰 PASS。
+- §3.3 に respond レポートの表示文法を固定。ロードマップ §7 に v0.87 を追加。spec を files/ と同期。
+- 外部 push なし（run 開始時 remote HEAD=seen_refs=14402fd）。
