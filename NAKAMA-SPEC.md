@@ -1,7 +1,8 @@
 # 仲間プロトコル / Nakama Protocol — 仕様書 v0.3
 
 **状態**: draft（Noor と alex が共同開発中）
-**日付**: 2026-10-02（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21）。v0.17 完了 — 30103+30104 横断 fetch の統合（§22）。v0.18 完了 — fetch 時点の政策スナップショットの保存（§23））。v0.19 完了 — 草案の期限（§24）。v0.20 完了 — 草案への自動通知（§25））。v0.21 設計完了 — kind 30100–30104 の正式割当申請（§26）、v0.22 完了 — NIP ドラフト文書の作成（§26）。v0.23 完了 — 既存採用の確認結果と kind 再マップ実装（30100–30104→30107–30111、§26.9・§26.10）。v0.24 完了 — 承認者への草案通知（§27）。v0.25 完了 — 通知の既読追跡・返信連携（§28）。v0.26 完了 — policy-update 決定の草案化（§29）。v0.80 完了 — `board_draft_notify` レポートの conformance チェッカー（§25.5）。v0.81 完了 — `compromise_import` レポートの conformance チェッカー（§13.9）。v0.82 完了 — `compromise_declare` レポートの conformance チェッカー（§13.10）、v0.83 完了 — `compromise_withdraw` レポートの conformance チェッカー（§13.11）、v0.84 完了 — `rotate` 発行レポートの conformance チェッカー（§5.5.4）、v0.85 完了 — `bind` 発行レポートの conformance チェッカー（§8.9）、v0.86 完了 — `unbind` 発行レポートの conformance チェッカー（§9.1.2）、v0.87 完了 — `respond` 署名レポートの conformance チェッカー（§3.3）
+**日付**: 2026-10-02（v0.2 完了 — NIP-17 DM、NIP-29 グループ掲示板、NIP-42 認証、revocation registry、liveness。v0.3 完了 — platform binding / proposal 交換 UX。v0.4 完了 — binding 取り消し、bond 期限・更新、L2 ガバナンス。v0.5 完了 — handover ガバナンスの照合。v0.6 完了 — policy-update/close のガバナンス照合。v0.7 完了 — revocation UX の改善。v0.8 完了 — 鍵スコープの侵害宣言（§13）。v0.9 完了 — 侵害宣言の統合と移行完了の表示（§14）。v0.10 完了 — `accept` への侵害警告統合（§15）。v0.11 完了 — `verify_binding` への侵害警告統合（§16）。v0.12 完了 — rotation 証明書の Nostr 公開（§17）。v0.13 完了 — `remove` 決定種別の追加（§18）。v0.14 完了 — board-decision の Nostr 公開（§19）。v0.15 完了 — fetch 側の threshold 表示（§20）。v0.16 完了 — cosign 回覧（決定前）の Nostr 化（§21）。v0.17 完了 — 30103+30104 横断 fetch の統合（§22）。v0.18 完了 — fetch 時点の政策スナップショットの保存（§23））。v0.19 完了 — 草案の期限（§24）。v0.20 完了 — 草案への自動通知（§25））。v0.21 設計完了 — kind 30100–30104 の正式割当申請（§26）、v0.22 完了 — NIP ドラフト文書の作成（§26）。v0.23 完了 — 既存採用の確認結果と kind 再マップ実装（30100–30104→30107–30111、§26.9・§26.10）。v0.24 完了 — 承認者への草案通知（§27）。v0.25 完了 — 通知の既読追跡・返信連携（§28）。v0.26 完了 — policy-update 決定の草案化（§29）。v0.80 完了 — `board_draft_notify` レポートの conformance チェッカー（§25.5）。v0.81 完了 — `compromise_import` レポートの conformance チェッカー（§13.9）。v0.82 完了 — `compromise_declare` レポートの conformance チェッカー（§13.10）、v0.83 完了 — `compromise_withdraw` レポートの conformance チェッカー（§13.11）、v0.84 完了 — `rotate` 発行レポートの conformance チェッカー（§5.5.4）、v0.85 完了 — `bind` 発行レポートの conformance チェッカー（§8.9）、v0.86 完了 — `unbind` 発行レポートの conformance チェッカー（§9.1.2）、v0.87 完了 — `respond` 署名レポートの conformance チェッカー（§3.3）、v0.88 完了 — conformance カバレッジ監査（§30）
+- **v0.88**（完了）: conformance カバレッジの完全監査（§30）。`nakama.py` の全 54 サブコマンド × `conformance.py` の 64 `check_*` 分岐を突き合わせ、発行レポートチェッカーの対応表（§30.1）を文書化: 54 サブコマンド → 47 チェッカー（`check_pub` が 7 publish 系、`check_init` が `init`/`whoami` を共有）。残り 17 分岐は発行レポートではなくアーティファクト意味論チェッカーとして分類（§30.3）。監査結果: 未カバー 0。文書不備 1 件を発見・修正 — `board_notif_ack`（§28.4）は `publish: 受理/拒否 (理由) id=<64 hex>` の §4.3 文法を出力するにもかかわらず §4.3 の対象コマンド一覧（6 件）に含まれていなかったため 7 件に訂正（コード変更なし — `check_pub` が既に受理することを実測確認: `publish: 受理 (OK) id=<64hex>` → PASS、兄弟レポート `参加申請:` 形は相互拒否）。共有文法の例外は実 CLI 出力で roundtrip 検証（`whoami`→`check_init` PASS、`propose`→`check_propose` PASS、`accept`→`check_accept` PASS、`verify`→`check_verify` PASS — いずれも新規 temp keyfile の実鍵ペア）。監査の維持ルールを §30.4 に固定（新規サブコマンドは表に載せる）。外部プッシュなし（run 開始時 remote HEAD=seen_refs=65fe764）。次候補: v0.2 以降の v0.3 系サブコマンド追加時の §30.1 表の更新、または NIP ドラフトの 人間の確認（§26.11 の PR 投稿は引き続き承認待ち）。
 - **v0.87**（完了）: conformance チェッカー第 65 弾 `check_respond`（ローカル出力チェッカー第 50 弾）。`conformance.py` に `respond` 署名レポート（§3.3）の一貫性チェッカーを追加: `check_respond <report.txt> [...]`（`nakama.py respond` の stdout 保存テキストの検証: ちょうど 1 行で、64 バイト Schnorr 署名の小文字 hex 128 文字（`sign_schnorr(secret, nonce).hex()`）。末尾の空行は許容、先頭の空行は却下。失敗パス（nonce が 32 バイト hex でない — `bytes.fromhex` の ValueError / `len(nonce) == 32` の assert）は print 前に例外のため空 stdout は checker が却下）。訂正 — v0.71/v0.72 の仕様書注記「`respond` のレポートも文法上は `challenge` と同一（単一行 64 hex）」は誤り。参照実装の実測で `respond` は 128 hex のため `challenge`（64 hex）とは別文法、両 checker は相互に拒否（`propose` / `accept` と同型）。兄弟レポート（`check` の判定行・`init` の npub 行）は別文法で自然に拒否。対象外を明示 — 署名の真偽（`verify_schnorr` / `check` の管轄）、nonce の真偽、stderr、exit コード。§3.3 に respond レポートの表示文法を固定（§3.1/§3.2 の旧注記を訂正 — `conformance.py` 内の `check_challenge` のコメントと selftest の注記も更新）。selftest 27/27（新規: 実 CLI の in-process E2E 6（実鍵ペア＋temp keyfile — 通常発行（stdout 完全一致＋stderr 空）・2 回目の発行も有効 128 hex（署名は呼び出しごとに fresh randomness のため同一行にはならない）・発行した署名の `cmd_check` による roundtrip 検証（`本人です 🤝`）・短い nonce（assert 失敗、stdout 空、checker が却下）・非 hex nonce（ValueError、stdout 空、却下）・64 バイト nonce（assert 失敗、stdout 空、却下））＋正常 craft 5（最小・改行なし・末尾空行・all 0・all f）＋却下 16: 空テキスト・ゴミ行・challenge 形（64 hex — 相互拒否）・127 文字・129 文字・大文字 hex・大小混じり・非 hex・内側空白・`0x` 接頭辞・2 レポート連結・先頭空行・末尾ゴミ行・`check` の成功行・`check` の失敗行・`init` の npub 行）、selftest 総計 1455/1455 PASS、全 21 テストファイル回帰 PASS。外部プッシュなし（run 開始時 remote HEAD=seen_refs=14402fd）。次候補: conformance カバレッジの完全監査（54 サブコマンド × `check_*` の対応表を仕様書に文書化 — 本ランで `respond` が最後の未カバーだったことを確認。`*_pub` 系は `check_pub` の §4.3 共通文法、`whoami` は `check_init` でカバー済み）。
 - **v0.86**（完了）: conformance チェッカー第 64 弾 `check_unbind`（ローカル出力チェッカー第 49 弾）。`conformance.py` に `unbind` 発行レポート（§9.1.2）の一貫性チェッカーを追加: `check_unbind <report.txt> [...]`（`nakama.py unbind` の stdout 保存テキストの検証: 常に 2 行（`--markdown` なし）または 8 行（`--markdown` あり） — 第 1 行 `unbinding 証明書: <out> — <scope> を取り消し（"<handle>"@<platform>）`（`<out>` 非空・前後空白なし、§4.1.2 の `<out>` 規則。`<handle>` 非空・引用符なし、`<platform>` 非空・前後空白なし、ハンドル周りの括弧は全角 `（）`。`<scope>` は全リテラル `そのハンドルへの binding すべて`（`--binding-created-at 0`＝既定）または `指定 binding (created_at=<N>)`（`N` は 0 以外の整数、括弧は ASCII — 参照実装が 0 を全 scope に写像するため `created_at=0` の指定形は参照出力たりえず却下）。`—` は em dash U+2014 リテラル）・第 2 行 運用手順リテラル（`運用: この unbinding をハンドルのアカウントから投稿してください（取り消しの公開告知）。` — 括弧は全角 `（）`）。`--markdown` 時は 6 行追加（空行・`投稿用ブロック（コメント欄に貼る）:`・`<!-- nakama-unbinding:v1 -->`・` ```nakama-unbinding `・base64url 1 行（`=` パディングあり）・` ``` ` — 形状のみ検証、ペイロードの真偽は対象外）。失敗パス（keyfile 不可読）は print 前に例外のため空 stdout は checker が却下。末尾の空行は許容、先頭の空行は却下）。兄弟レポート（`bind` の発行レポート・`verify_unbinding` の判定行）は別文法で相互に拒否。対象外を明示 — 証明書ファイルの実在・内容（`check_unbinding` / `verify_unbinding_cert` の管轄）、取り消し対象の真偽、handle / platform の真偽、markdown ペイロードの真偽、stderr、exit コード。§9.1.2 に unbind 発行レポートの表示文法を固定（§8.9 の「将来候補」記述を `check_unbind` 参照に更新）。selftest 39/39（新規: 実 CLI の in-process E2E 5（実鍵ペア＋temp keyfile — 通常発行（全 scope、stdout 完全一致＋exit 0＋stderr 空＋証明書の `verify_unbinding_cert` 一致＋`binding_created_at` 一致）・`--binding-created-at 1759370000`（指定 scope、stdout 完全一致＋証明書一致）・`--markdown`（8 行 stdout 完全一致＋証明書一致）・space 含み `--out`・keyfile 不可読（stdout 空、checker が却下））＋正常 craft 8（2 行標準・指定 scope・改行なし・末尾空行・space/unicode 含み out・相対 out・markdown 8 行・markdown 改行なし）＋却下 26: 空テキスト・ゴミ行・1 行・3 行・2 レポート連結・第 1 行が bind 発行レポート・第 1 行が verify_unbinding 有効行・第 1 行が verify_unbinding 2 行レポート・`<out>` 空・`<out>` 末尾空白・ASCII ハイフン・handle 引用符欠落・handle 空・指定 scope の `created_at=0`・created_at 非数値・scope リテラル違い・第 2 行の ASCII 丸括弧・第 2 行の末尾 `。` 欠落・行順入替・先頭空行・markdown の空行 3 欠落・markdown マーカー違い（binding）・markdown フェンス開き違い・b64 不正文字・markdown 7 行・2 行＋余計な行）、selftest 総計 1428/1428 PASS、全 21 テストファイル回帰 PASS。外部プッシュなし（run 開始時 remote HEAD=seen_refs=6895170）。次候補: ローカル出力チェッカーの洗い出し（`check_` 未対象の stdout/stderr レポートの継続監査 — 残りは `respond` / `verify_liveness` 系など。`*_pub` 系は `check_pub` の §4.3 共通文法で既にカバー）。
 - **v0.85**（完了）: conformance チェッカー第 63 弾 `check_bind`（ローカル出力チェッカー第 48 弾）。`conformance.py` に `bind` 発行レポート（§8.9）の一貫性チェッカーを追加: `check_bind <report.txt> [...]`（`nakama.py bind` の stdout 保存テキストの検証: 常に 2 行 — 第 1 行 `binding 証明書: <out> — "<handle>"@<platform> が <npub16>... の保有を主張`（`<out>` 非空・前後空白なし、§4.1.2 の `<out>` 規則。`<handle>` 非空・引用符なし、`<platform>` 非空・前後空白なし、`<npub16>` は発行者 npub の先頭 16 非空白文字、bech32 のため hex 検証なし — §5.5.3 と同じ扱い。`—` は em dash U+2014 リテラル、`...` は ASCII 3 ドット）・第 2 行 運用手順リテラル（`運用: この binding をハンドルのアカウントからそのまま投稿してください（ハンドル→鍵の方向）。` — `→` は U+2192 リテラル、括弧は全角 `（）`）。`--markdown` 時は 6 行追加（空行・`投稿用ブロック（コメント欄に貼る）:`・`<!-- nakama-binding:v1 -->`・` ```nakama-binding `・base64url 1 行（`=` パディングあり）・` ``` ` — 形状のみ検証、ペイロードの真偽は対象外）。失敗パス（keyfile 不可読）は print 前に例外のため空 stdout は checker が却下。末尾の空行は許容、先頭の空行は却下）。兄弟レポート（`verify_binding` の判定行・`unbind` の発行レポート）は別文法で自然に拒否 — 両 checker は相互に拒否。対象外を明示 — 証明書ファイルの実在・内容（`check_binding` / `verify_binding_cert` の管轄）、handle / platform / npub16 の真偽、markdown ペイロードの真偽、stderr、exit コード。§8.9 に bind 発行レポートの表示文法を固定。selftest 40/40（新規: 実 CLI の in-process E2E 4（実鍵ペア＋temp keyfile — 通常発行（stdout 完全一致＋exit 0＋stderr 空＋証明書の `verify_binding_cert` 一致）・`--markdown`（8 行 stdout 完全一致＋証明書一致）・space 含み `--out`・keyfile 不可読（stdout 空、checker が却下））＋正常 craft 7（2 行標準・改行なし・末尾空行・space/unicode 含み out・相対 out・markdown 8 行・markdown 改行なし）＋却下 29: 空テキスト・ゴミ行・1 行・3 行・2 レポート連結・第 1 行が unbind 発行レポート・第 1 行が verify_binding 有効行・第 1 行が verify_binding 2 行レポート・`<out>` 空・`<out>` 末尾空白・ASCII ハイフン・handle 引用符欠落・handle 空・npub16 短・npub16 内空白・省略記号欠落・第 2 行の ASCII 丸括弧・第 2 行の ASCII 矢印・第 2 行の末尾 `。` 欠落・行順入替・先頭空行・markdown の空行 3 欠落・markdown ラベル違い・マーカー違い・フェンス開き違い・b64 不正文字・フェンス閉じ違い・markdown 7 行・2 行＋余計な行）、selftest 総計 1389/1389 PASS、全 21 テストファイル回帰 PASS。外部プッシュなし（run 開始時 remote HEAD=seen_refs=daf6678）。次候補: ローカル出力チェッカーの洗い出し（`check_` 未対象の stdout/stderr レポートの継続監査 — 残りは `unbind` の発行レポートなど）。
@@ -259,7 +260,7 @@ nakama.py board_read <relay> <board_id> [--since <unix>] [--limit N]  # kind 9 +
 
 ### 4.3 publish 系コマンドの表示文法の固定（v0.46 — `check_pub` の検証対象）
 
-Nostr への publish 系コマンド（`rotate_pub` §17・`revoke_pub` §12・`compromise_pub` §13.5・`dm_pub` §4.1・`board_decide_pub` §19・`board_draft_pub` §21.3）の stdout は、単一行に固定:
+Nostr への publish 系コマンド（`rotate_pub` §17・`revoke_pub` §12・`compromise_pub` §13.5・`dm_pub` §4.1・`board_decide_pub` §19・`board_draft_pub` §21.3・`board_notif_ack` §28.4）の stdout は、単一行に固定:
 
 - 受理時: `publish: 受理 (理由) id=<64 hex>`（exit 0）
 - 拒否時: `publish: 拒否 (理由) id=<64 hex>`（exit 1）
@@ -2635,6 +2636,116 @@ Contributions that shaped this spec and the code. Built by many hands.
 - 2026-10-01: 健康チェックラン（17:47 JST） — 外部プッシュなし（remote HEAD=seen_refs=2e94755）。nostr.band 27 回目の再試行も到達不能（/v0/stats・/v0/trending/notes とも http 000、10s で打ち切り）。バックログ不変: 実装可能項目なし（外部依存: NIP-17 rumor reply 標準の確定待ち・設計で却下済み・人間判断待ち: nips PR 投稿 §26.5-3 のみ、次の単位は 人間の確認 待ち）。全 21 テストファイル回帰 PASS。
 - 2026-10-01: 健康チェックラン（17:57 JST） — 外部プッシュなし（remote HEAD=seen_refs=27c663b）。nostr.band 28 回目の再試行も到達不能（/v0/stats・/v0/trending/notes とも http 000、10s でタイムアウト）。バックログ不変: 実装可能項目なし（外部依存: NIP-17 rumor reply 標準の確定待ち・設計で却下済み・人間判断待ち: nips PR 投稿 §26.5-3 のみ、次の単位は 人間の確認 待ち）。全 21 テストファイル回帰 PASS（pytest 未導入のため各 test_*.py を直接実行）。
 - 2026-10-01: 健康チェックラン（18:06 JST） — 外部プッシュなし（remote HEAD=seen_refs=5219226）。nostr.band 29 回目の再試行も到達不能（/v0/stats・/v0/trending/notes とも http 000、10s でタイムアウト）。バックログ不変: 実装可能項目なし（外部依存: NIP-17 rumor reply 標準の確定待ち・設計で却下済み・人間判断待ち: nips PR 投稿 §26.5-3 のみ、次の単位は 人間の確認 待ち）。全 21 テストファイル回帰 PASS（pytest 未導入のため各 test_*.py を直接実行）。
+
+## 30. v0.88: conformance カバレッジ監査（完了）
+
+v0.28〜v0.87 で `conformance.py` に蓄積した `check_*` チェッカーが、`nakama.py` の全 54 サブコマンドの stdout レポート文法を漏れなくカバーしていることを監査し、対応表として文書化した。コード変更なし（仕様の文書化のみ）。
+
+監査の方法:
+
+1. `nakama.py` の `add_parser` 登録（54 件）・`conformance.py` の `main()` の `argv[1] == 'check_*'` 分岐（64 件）を列挙し、全サブコマンドに発行レポートチェッカーが対応することを確認（§30.1）。
+2. 共有文法の例外 2 件を実 CLI 出力で roundtrip 検証: `whoami`→`check_init`（§1.1、npub 1 行は `init` と同一文法）、`*_pub` 系＋`board_notif_ack`→`check_pub`（§4.3、`publish: 受理/拒否 (理由) id=<64 hex>`）。いずれも checker が受理し、兄弟レポート（`参加申請:` / `投稿:` 形）を相互に拒否することを確認。
+3. 残り 17 分岐を分類: いずれも発行レポートではなく、アーティファクト（証明書・イベント・送信記録）の意味論チェッカー（§30.3）。
+
+監査結果: 未カバー 0。文書不備 1 件を発見・修正 — `board_notif_ack`（§28.4）は `publish:` 行の §4.3 文法を出力するにもかかわらず、§4.3 の対象コマンド一覧（v0.46 記載の 6 件）に含まれていなかった。§4.3 を 7 件に訂正（`check_pub` は既に受理することを確認済み — 実測 PASS）。
+
+### 30.1 対応表（54 サブコマンド → 発行レポートチェッカー）
+
+各チェッカーの検証文法は、それぞれの「表示文法の固定」小節（チェッカー名で検索）に固定済み。備考の § はその小節。
+
+| サブコマンド | チェッカー | 備考 |
+|---|---|---|
+| init | check_init | §1.1 |
+| whoami | check_init | §1.1 — 共有文法（npub 1 行は init と同一） |
+| propose | check_propose | §2.2.1 |
+| accept | check_accept | §2.2.2 |
+| verify | check_verify | §2.3.1 |
+| renew | check_renew | §9.3.1 |
+| challenge | check_challenge | §3.1 |
+| respond | check_respond | §3.3 |
+| check | check_check | §3.2 |
+| rotate | check_rotate | §5.5.4 |
+| verify_rotation | check_verify_rotation | §5.5.3 |
+| rotate_pub | check_pub | §4.3 — 共有文法 |
+| rotate_fetch | check_rotate_fetch | §17.9 |
+| revoke | check_revoke | §12.6 |
+| verify_revocation | check_verify_revocation | §12.5 |
+| revoke_list | check_revoke_list | registry 一覧レポート |
+| revoke_import | check_revoke_import | §12.7 |
+| revoke_pub | check_pub | §4.3 — 共有文法 |
+| revoke_fetch | check_revoke_fetch | §12.4 |
+| compromise_declare | check_compromise_declare | §13.10 |
+| compromise_import | check_compromise_import | §13.9 |
+| compromise_pub | check_pub | §4.3 — 共有文法 |
+| compromise_fetch | check_compromise_fetch | §13.8 |
+| compromise_withdraw | check_compromise_withdraw | §13.11 |
+| key_status | check_key_status | 4 カテゴリ重みづけ表示（§13 系） |
+| liveness | check_liveness_report | §5.6.3 |
+| verify_liveness | check_liveness_verify | §5.6.2 |
+| dm_send | check_dm_send | §4.1.2 |
+| dm_recv | check_dm_recv | §4.1.1 |
+| dm_pub | check_pub | §4.3 — 共有文法 |
+| dm_fetch | check_dm_fetch | gift wrap 取得レポート |
+| bind | check_bind | §8.9 |
+| verify_binding | check_verify_binding | §8.8 |
+| unbind | check_unbind | §9.1.2 |
+| verify_unbinding | check_verify_unbinding | §9.1.1 |
+| board_create | check_board_create | §4.6 |
+| board_join | check_board_join | §4.4 |
+| board_send | check_board_send | §4.5 |
+| board_read | check_board_read | 表示レポート（§4.2 系） |
+| board_fetch_all | check_board_fetch_all | §22.8 |
+| board_cosign | check_board_cosign | §9.8 |
+| board_decide | check_board_decide | §9.7 |
+| board_decide_fetch | check_board_decide_fetch | 30110 fetch レポート（§19 系） |
+| board_decide_pub | check_pub | §4.3 — 共有文法 |
+| board_draft_fetch | check_board_draft_fetch | 30111 fetch レポート（§21 系） |
+| board_draft_notify | check_draft_notify | §25.5 |
+| board_draft_pub | check_pub | §4.3 — 共有文法 |
+| board_notif_ack | check_pub | §4.3 — 共有文法（v0.88 で文書化） |
+| board_notif_status | check_notif_status | §28 突き合わせ表示レポート |
+| board_policy | check_board_policy | §9.4.1 |
+| board_policy_sign | check_board_policy_sign | §9.4.2 |
+| board_verify | check_board_verify | §4.7 |
+| verify_board_decision | check_verify_board_decision | §9.6 |
+| verify_board_policy | check_verify_board_policy | §9.4.3 |
+
+計 54 サブコマンド → 47 の発行レポートチェッカー（`check_pub` が 7 コマンド、`check_init` が 2 コマンドを共有）。
+
+### 30.2 共有文法の例外
+
+- `whoami` → `check_init`: `whoami` は keyfile の npub を 1 行出力するだけで、`init` のレポート文法（§1.1）と同一。別チェッカーは不要。
+- 7 publish 系 → `check_pub`: `rotate_pub` / `revoke_pub` / `compromise_pub` / `dm_pub` / `board_decide_pub` / `board_draft_pub` / `board_notif_ack` は同一の単一行形式 `publish: 受理/拒否 (理由) id=<64 hex>`（§4.3）。`board_join` の `参加申請:` 形・`board_send` の `投稿:` 形・`board_create` の per-kind 行は別文法であり相互に拒否（§4.4 / §4.5 / §4.6）。
+
+### 30.3 発行レポート以外の 17 チェッカー（アーティファクト意味論）
+
+発行レポートではなく、証明書・イベント・送信記録ファイルの意味論を検証するもの。サブコマンドの stdout ではないため §30.1 の表には現れない。
+
+| チェッカー | 対象アーティファクト |
+|---|---|
+| check_bond | bond 証明書 JSON（`accept` の出力） |
+| check_binding / check_unbinding | binding / unbinding 証明書 JSON |
+| check_liveness | liveness 証明 JSON |
+| check_compromise | 侵害宣言 JSON |
+| check_rotation / check_rotation_downgrade | rotation 証明書 / ダウングレード行 |
+| check_revocation | revocation イベント JSON |
+| check_dm | NIP-17 gift wrap（seal/rumor の署名・暗号化） |
+| check_board | board descriptor（署名付き） |
+| check_decision | board 決定ファイル（threshold 意味論） |
+| check_policy | board-policy 証明書（n-of-n 署名） |
+| check_draft | 草案ファイル（30111 系） |
+| check_notif_ack | ack 平文ファイル（§28.1 の ack DM 本文） |
+| check_notif_record | 通知送信記録 JSON（§25.1 / §27.1） |
+| check_warnings | compromise 系 stderr 警告行 |
+| check_governance | `board_read --governance` レポート（§9.5） |
+
+### 30.4 監査の維持ルール
+
+- 新規サブコマンドを追加したら、そのレポート文法の `check_*` を追加するか、共有文法（§4.3 / §1.1）の対象として明記する。表に載らないサブコマンドを作らない。
+- この対応表は監査時点（v0.88）のスナップショット。追加・変更時は §30.1 の表も更新する。
+- 監査の再実行手順: `nakama.py` の `add_parser` 一覧と `conformance.py` の `main()` の `check_*` 分岐一覧を突き合わせ、§30.1 の表との差分を確認する。
+
+
 - 2026-10-01: 健康チェックラン（18:16 JST） — 外部プッシュなし（remote HEAD=seen_refs=cc54af9）。nostr.band 30 回目の再試行も到達不能（/v0/stats、http 000、10s でタイムアウト）。バックログ再棚卸し: 実装可能項目なし（残りは外部依存: NIP-17 rumor reply 標準の確定待ち・設計で却下済み: 自動 ack・threshold 達成済み通知・回覧中草案の自動リベース・成立済み policy-update の差し戻し・kind 9003 の自動発行・人間判断待ち: nips PR 投稿 §26.5-3 のみ）。次の単位は PR 投稿の承認待ち（docs/nips-pr-body.md 準備済み）。全 21 テストファイル回帰 PASS。
 - 2026-10-01: 健康チェックラン（18:26 JST） — 外部プッシュなし（remote HEAD=seen_refs=3a8b6d5）。nostr.band 31 回目の再試行も到達不能（/v0/stats、http 000、10s でタイムアウト）。バックログ不変: 実装可能項目なし（外部依存: NIP-17 rumor reply 標準の確定待ち・設計で却下済み・人間判断待ち: nips PR 投稿 §26.5-3 のみ）。全 21 テストファイル回帰 PASS。
 - 2026-10-01: 健康チェックラン（18:36 JST） — 外部プッシュなし（remote HEAD=seen_refs=81f02b7）。nostr.band 32 回目の再試行も到達不能（/v0/stats、http 000、10s でタイムアウト）。バックログ不変: 実装可能項目なし（外部依存: NIP-17 rumor reply 標準の確定待ち・設計で却下済み・人間判断待ち: nips PR 投稿 §26.5-3 のみ）。全 21 テストファイル回帰 PASS。
