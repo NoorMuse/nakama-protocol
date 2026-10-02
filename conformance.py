@@ -4985,6 +4985,103 @@ def check_draft_notify_files(paths: list[str]) -> int:
     return 0 if failures == 0 else 1
 
 
+# ---------- check_compromise_withdraw: compromise_withdraw report consistency ----------
+
+# A saved `nakama.py compromise_withdraw --subject <npub> [--out OUT]
+# [--registry DIR]` stdout report. Its grammar is fixed (spec §13.11).
+# check_compromise_withdraw verifies that the report is internally
+# consistent: exactly 2 lines —
+#   line 1 (always): `侵害宣言を撤回しました: <out>（registry の記録を
+#                     withdrawn: true に更新）`
+#   line 2 (always): `公開済みの宣言は compromise_pub で上書きしてくだ
+#                     さい（kind 30108 の replaceable で撤回が効きます）。`
+# <out> is the withdrawal JSON path verbatim (`--out`, default
+# `compromise_withdrawn.json`; user-controlled, so it must be non-empty
+# with no leading/trailing whitespace — §4.1.2's <out> rule). The `（）`
+# are full-width parens (U+FF08/U+FF09), the final `。` is a literal;
+# `withdrawn: true` and `kind 30108` are literals. No registry path is
+# printed, so there is no basename rule here (unlike §13.9/§13.10).
+# The failure paths (invalid subject, no matching declaration in the
+# registry) print to stderr, not stdout — the report exists only for
+# the success path.
+# Note the verbs: line 1 reads `侵害宣言を撤回しました: ` while
+# compromise_declare's line 1 reads `侵害宣言: ... — ` and
+# compromise_import's stored line reads `侵害宣言を registry に記録し
+# ました: ` — different verbs, so the sibling reports are mutually
+# rejected (like the check_board_send / check_pub / check_board_join
+# prefix split). The other sibling compromise reports are different
+# grammars and are rejected: compromise_fetch's footer (`<N> 件のイベン
+# トを取得: ...` — check_compromise_fetch's territory), and the
+# compromise_pub publish line (`publish: <受理|拒否> (...) id=<id>` —
+# check_pub's territory).
+# Explicitly out of scope: whether the withdrawal JSON exists and what
+# it contains (the declaration's territory: `check_compromise` /
+# `verify_compromise_event`), whether the registry update was the right
+# call (import_compromise_event's territory — the 'updated' return is
+# what produces the report), stderr, and the exit code. Use this to
+# prove a second implementation's `compromise_withdraw` CLI prints a
+# compatible withdrawal report.
+
+_CPW_L1 = re.compile(
+    r'^侵害宣言を撤回しました: (.+)（registry の記録を withdrawn: true に更新）$')
+_CPW_L2 = ('公開済みの宣言は compromise_pub で上書きしてください'
+          '（kind 30108 の replaceable で撤回が効きます）。')
+
+
+def conform_compromise_withdraw_report(text: str):
+    """Verify a saved `nakama.py compromise_withdraw` stdout report is
+    internally consistent. Returns (ok, errs, info)."""
+    errs: list[str] = []
+    info: list[str] = []
+    lines = text.splitlines()
+    while lines and lines[-1] == '':
+        lines.pop()
+    if not lines:
+        return False, ['report is empty'], info
+    if lines[0] == '':
+        return False, ['report starts with a blank line'], info
+    if len(lines) != 2:
+        return False, [f'report must be exactly 2 lines (withdrawal line, '
+                       f'pub-reminder line), found {len(lines)}'], info
+    m1 = _CPW_L1.match(lines[0])
+    if not m1:
+        return False, ['line 1: not a compromise_withdraw withdrawal line '
+                       '(`侵害宣言を撤回しました: <out>（registry の記録を '
+                       'withdrawn: true に更新）`)'], info
+    out = m1.group(1)
+    if not out or out.strip() != out:
+        return False, ['<out> is empty or has leading/trailing '
+                       'whitespace'], info
+    if lines[1] != _CPW_L2:
+        return False, ['line 2: not the pub-reminder line (byte-exact: '
+                       '`公開済みの宣言は compromise_pub で上書きしてくだ'
+                       'さい（kind 30108 の replaceable で撤回が効きます）。`)'], info
+    info.append(f'out={out}')
+    return (not errs), errs, info
+
+
+def check_compromise_withdraw_files(paths: list[str]) -> int:
+    failures = 0
+    for p in paths:
+        try:
+            with open(p, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as e:
+            print(f'{p}: FAIL (unreadable: {e})')
+            failures += 1
+            continue
+        ok, errs, info = conform_compromise_withdraw_report(text)
+        if ok:
+            print(f'{p}: PASS ({ "; ".join(info)})')
+        else:
+            print(f'{p}: FAIL')
+            for e in errs:
+                print(f'    - {e}')
+            failures += 1
+    print(f'--- {len(paths) - failures}/{len(paths)} passed ---')
+    return 0 if failures == 0 else 1
+
+
 # ---------- check_compromise_warnings: compromise WARN-line consistency ----------
 
 # A saved stderr capture of the compromise-declaration warnings the
@@ -10857,6 +10954,222 @@ def selftest() -> int:
     print(f'--- compromise-declare {cpd_total - cpd_fails}/{cpd_total} passed ---')
     fails += cpd_fails
 
+    # ---------- check_compromise_withdraw: compromise_withdraw report consistency
+    # The reference CLI prints a 2-line withdrawal report to stdout
+    # (exit 0): line 1 `侵害宣言を撤回しました: <out>（registry の記録を
+    # withdrawn: true に更新）`, line 2 `公開済みの宣言は compromise_pub
+    # で上書きしてください（kind 30108 の replaceable で撤回が効きます）。`.
+    # Real-CLI in-process E2E below: declare first (real keyfile ->
+    # cmd_compromise_declare, the same declare path the v0.82 E2E
+    # exercises) then cmd_compromise_withdraw, stdout captured exactly.
+    # Separate registry dirs per case so same-second created_at dedup
+    # can never cross-contaminate. The failure paths (already withdrawn,
+    # never declared, invalid subject) print to stderr — their empty
+    # stdout is rejected by the checker.
+    cpw_fails = 0
+    import tempfile as _cpw_tf
+    import io as _cpw_io
+    import contextlib as _cpw_ctx
+    from types import SimpleNamespace as _cpw_NS
+
+    _cpw_sa, _cpw_npa = _key()
+    _cpw_sb, _cpw_npb = _key()
+    _cpw_sc, _cpw_npc = _key()
+
+    def _cpw_declare(keyfile, out, registry):
+        buf = _cpw_io.StringIO()
+        err = _cpw_io.StringIO()
+        with _cpw_ctx.redirect_stdout(buf), _cpw_ctx.redirect_stderr(err):
+            nakama.cmd_compromise_declare(_cpw_NS(
+                keyfile=keyfile, subject=_cpw_npb,
+                bond=None, reason='', evidence='', out=out,
+                no_registry=False, registry=registry))
+        return buf.getvalue(), err.getvalue()
+
+    def _cpw_withdraw(keyfile, out, registry, subject):
+        buf = _cpw_io.StringIO()
+        err = _cpw_io.StringIO()
+        code = 0
+        with _cpw_ctx.redirect_stdout(buf), _cpw_ctx.redirect_stderr(err):
+            try:
+                nakama.cmd_compromise_withdraw(_cpw_NS(
+                    keyfile=keyfile, subject=subject, out=out,
+                    registry=registry))
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+        return buf.getvalue(), err.getvalue(), code
+
+    def _cpw_l1(out):
+        return (f'侵害宣言を撤回しました: {out}'
+                f'（registry の記録を withdrawn: true に更新）\n')
+
+    _cpw_l2 = ('公開済みの宣言は compromise_pub で上書きしてください'
+               '（kind 30108 の replaceable で撤回が効きます）。\n')
+
+    def _cpw_no_decl_err(me16, subj16):
+        return (f'あなた（{me16}...）の有効な侵害宣言が registry にありません: '
+                f'{subj16}...\n')
+
+    _cpw_e2e = []
+    with _cpw_tf.TemporaryDirectory() as _cpw_td:
+        _cpw_kf = os.path.join(_cpw_td, 'keyfile.json')
+        nakama.save_key(_cpw_kf, _cpw_sa)
+        _cpw_reg1 = os.path.join(_cpw_td, 'compromises')
+        _cpw_decl1 = os.path.join(_cpw_td, 'compromise.json')
+        _cpw_out1 = os.path.join(_cpw_td, 'compromise_withdrawn.json')
+        _cpw_declare(_cpw_kf, _cpw_decl1, _cpw_reg1)
+        _rep, _err, _code = _cpw_withdraw(_cpw_kf, _cpw_out1, _cpw_reg1,
+                                         _cpw_npb)
+        _cpw_e2e.append(('fresh withdraw (2 lines)', _rep, _err, _code,
+                         _cpw_l1(_cpw_out1) + _cpw_l2, None))
+        # custom --out with a space in the filename
+        _cpw_reg2 = os.path.join(_cpw_td, 'compromises2')
+        _cpw_decl2 = os.path.join(_cpw_td, 'compromise2.json')
+        _cpw_out2 = os.path.join(_cpw_td, 'my withdrawal.json')
+        _cpw_declare(_cpw_kf, _cpw_decl2, _cpw_reg2)
+        _rep, _err, _code = _cpw_withdraw(_cpw_kf, _cpw_out2, _cpw_reg2,
+                                         _cpw_npb)
+        _cpw_e2e.append(('custom --out with space', _rep, _err, _code,
+                         _cpw_l1(_cpw_out2) + _cpw_l2, None))
+        # double withdraw: the declaration is already withdrawn, so the
+        # registry has no non-withdrawn declaration of mine — stderr
+        # refusal + exit 1, empty stdout rejected by the checker
+        _rep, _err, _code = _cpw_withdraw(_cpw_kf, _cpw_out1, _cpw_reg1,
+                                         _cpw_npb)
+        _cpw_e2e.append(('double withdraw (already withdrawn)', _rep, _err,
+                         _code, None,
+                         _cpw_no_decl_err(_cpw_npa[:16], _cpw_npb[:16])))
+        # subject never declared: same-form refusal
+        _cpw_out4 = os.path.join(_cpw_td, 'withdrawn4.json')
+        _rep, _err, _code = _cpw_withdraw(_cpw_kf, _cpw_out4, _cpw_reg1,
+                                         _cpw_npc)
+        _cpw_e2e.append(('never-declared subject (stderr refusal, exit 1)',
+                         _rep, _err, _code, None,
+                         _cpw_no_decl_err(_cpw_npa[:16], _cpw_npc[:16])))
+        # invalid subject: stderr refusal + exit 1, empty stdout
+        _rep, _err, _code = _cpw_withdraw(_cpw_kf, _cpw_out1, _cpw_reg1,
+                                         'npub1bad')
+        _cpw_e2e.append(('invalid subject (stderr refusal, exit 1)',
+                         _rep, _err, _code, None,
+                         'subject は有効な npub ではありません\n'))
+    for name, rep, err, code, want_rep, want_err in _cpw_e2e:
+        if want_rep is None:
+            # failure path: stdout must be empty, exit 1, stderr the
+            # refusal verdict — and the empty stdout is rejected by the
+            # checker (the failure path has no report)
+            good = (rep == '') and (code == 1) and (err == want_err) and \
+                not conform_compromise_withdraw_report(rep)[0]
+            info = ['failure path refused on stderr (no stdout report)']
+        else:
+            exact = (rep == want_rep) and (code == 0) and (err == '')
+            ok, errs, info = conform_compromise_withdraw_report(rep)
+            good = exact and ok
+        print(f'compromise-withdraw-e2e/{name}: '
+              f'{"PASS" if good else "FAIL"} ({("; ".join(info))})')
+        if not good:
+            if want_rep is not None and rep != want_rep:
+                print(f'    - stdout/exit mismatch: {rep!r} code={code} '
+                      f'stderr={err!r}')
+            if want_rep is None:
+                print(f'    - got stdout={rep!r} code={code} stderr={err!r}')
+            for e in (errs if want_rep is not None else []):
+                print(f'    - {e}')
+            cpw_fails += 1
+
+    # hand-crafted positives
+    _cpw_d1 = ('侵害宣言を撤回しました: compromise_withdrawn.json'
+               '（registry の記録を withdrawn: true に更新）')
+    _cpw_d2 = ('公開済みの宣言は compromise_pub で上書きしてください'
+               '（kind 30108 の replaceable で撤回が効きます）。')
+    cpw_pos = [
+        ('standard 2-line', f'{_cpw_d1}\n{_cpw_d2}\n'),
+        ('no trailing newline', f'{_cpw_d1}\n{_cpw_d2}'),
+        ('trailing blanks', f'{_cpw_d1}\n{_cpw_d2}\n\n\n'),
+        ('out with space and unicode',
+         f'侵害宣言を撤回しました: /tmp/my 撤回.json'
+         f'（registry の記録を withdrawn: true に更新）\n{_cpw_d2}\n'),
+        ('relative out path',
+         f'侵害宣言を撤回しました: w/compromise_withdrawn.json'
+         f'（registry の記録を withdrawn: true に更新）\n{_cpw_d2}\n'),
+    ]
+    for name, rep in cpw_pos:
+        ok, errs, info = conform_compromise_withdraw_report(rep)
+        print(f'compromise-withdraw/{name}: {"PASS" if ok else "FAIL"} '
+              f'({"; ".join(info)})')
+        for e in errs:
+            print(f'    - {e}')
+        cpw_fails += 0 if ok else 1
+
+    # hand-crafted negatives
+    cpw_neg = []
+    cpw_neg.append(('empty report', ''))
+    cpw_neg.append(('garbage line', 'hello\n'))
+    cpw_neg.append(('line 1 only', f'{_cpw_d1}\n'))
+    cpw_neg.append(('three lines (extra line)',
+                    f'{_cpw_d1}\n{_cpw_d2}\n余計な行\n'))
+    cpw_neg.append(('two reports concatenated',
+                    f'{_cpw_d1}\n{_cpw_d2}\n{_cpw_d1}\n{_cpw_d2}\n'))
+    cpw_neg.append(('line 1 wrong verb (declare report, sibling)',
+                    f'侵害宣言: compromise.json — npub1qqqqqqqqqqq... が '
+                    f'npub1rrrrrrrrrrr... の鍵は危ないと宣言しました。\n'
+                    f'{_cpw_d2}\n'))
+    cpw_neg.append(('line 1 import stored line (sibling)',
+                    f'侵害宣言を registry に記録しました: '
+                    f'/tmp/c/{"ab" * 32}.json\n'))
+    cpw_neg.append(('line 1 ASCII parens instead of full-width',
+                    f'侵害宣言を撤回しました: compromise_withdrawn.json'
+                    f'(registry の記録を withdrawn: true に更新)\n'
+                    f'{_cpw_d2}\n'))
+    cpw_neg.append(('line 1 withdrawn: false instead of true',
+                    f'侵害宣言を撤回しました: compromise_withdrawn.json'
+                    f'（registry の記録を withdrawn: false に更新）\n'
+                    f'{_cpw_d2}\n'))
+    cpw_neg.append(('line 1 trailing 。 added', f'{_cpw_d1}。\n{_cpw_d2}\n'))
+    cpw_neg.append(('line 1 empty <out>',
+                    f'侵害宣言を撤回しました: '
+                    f'（registry の記録を withdrawn: true に更新）\n'
+                    f'{_cpw_d2}\n'))
+    cpw_neg.append(('line 1 <out> trailing space',
+                    f'侵害宣言を撤回しました: compromise_withdrawn.json '
+                    f'（registry の記録を withdrawn: true に更新）\n'
+                    f'{_cpw_d2}\n'))
+    cpw_neg.append(('line 2 missing final 。',
+                    f'{_cpw_d1}\n'
+                    f'公開済みの宣言は compromise_pub で上書きしてください'
+                    f'（kind 30108 の replaceable で撤回が効きます）\n'))
+    cpw_neg.append(('line 2 ASCII parens',
+                    f'{_cpw_d1}\n'
+                    f'公開済みの宣言は compromise_pub で上書きしてください'
+                    f'(kind 30108 の replaceable で撤回が効きます)。\n'))
+    cpw_neg.append(('line 2 wrong kind',
+                    f'{_cpw_d1}\n'
+                    f'公開済みの宣言は compromise_pub で上書きしてください'
+                    f'（kind 30101 の replaceable で撤回が効きます）。\n'))
+    cpw_neg.append(('line 2 wrong command',
+                    f'{_cpw_d1}\n'
+                    f'公開済みの宣言は compromise_push で上書きしてください'
+                    f'（kind 30108 の replaceable で撤回が効きます）。\n'))
+    cpw_neg.append(('line order swapped', f'{_cpw_d2}\n{_cpw_d1}\n'))
+    cpw_neg.append(('leading blank line', f'\n{_cpw_d1}\n{_cpw_d2}\n'))
+    cpw_neg.append(('compromise_fetch footer (sibling)',
+                    '5 件のイベントを取得: 1 件を取り込み、1 件を更新、'
+                    '3 件をスキップ\n'))
+    cpw_neg.append(('compromise_pub publish line (sibling)',
+                    'publish: 受理 (OK) id='
+                    + '0123456789abcdef' * 4 + '\n'))
+
+    for name, rep in cpw_neg:
+        ok, errs, info = conform_compromise_withdraw_report(rep)
+        good = not ok
+        print(f'compromise-withdraw-negative/{name}: '
+              f'{"PASS (rejected)" if good else "FAIL (accepted!)"}')
+        if not good:
+            cpw_fails += 1
+
+    cpw_total = len(_cpw_e2e) + len(cpw_pos) + len(cpw_neg)
+    print(f'--- compromise-withdraw {cpw_total - cpw_fails}/{cpw_total} passed ---')
+    fails += cpw_fails
+
     # ---------- check_init: init report consistency
     # The reference CLI prints the new identity's npub to stdout, one
     # line, exit 0 (cmd_init with --from-hex for a deterministic key;
@@ -16273,7 +16586,7 @@ def selftest() -> int:
         + bps_total + vbp_total + vrf_total + pr_total + ac_total \
         + ch_total + ck_total + vrv_total + rvk_total + wrn_total \
         + crgd_total + rvi_total + ini_total + dno_total + cpi_total \
-        + cpd_total
+        + cpd_total + cpw_total
     print(f'=== {grand - fails}/{grand} passed (all) ===')
     return 0 if fails == 0 else 1
 
@@ -16587,6 +16900,11 @@ def main(argv: list[str]) -> int:
             print('usage: conformance.py check_compromise_declare <report.txt> [...]')
             return 2
         return check_compromise_declare_files(argv[2:])
+    if len(argv) >= 2 and argv[1] == 'check_compromise_withdraw':
+        if len(argv) < 3:
+            print('usage: conformance.py check_compromise_withdraw <report.txt> [...]')
+            return 2
+        return check_compromise_withdraw_files(argv[2:])
     if len(argv) >= 2 and argv[1] == 'check_init':
         if len(argv) < 3:
             print('usage: conformance.py check_init <report.txt> [...]')
@@ -16702,6 +17020,7 @@ def main(argv: list[str]) -> int:
           'check_compromise_fetch <report.txt> [...] | '
           'check_compromise_import <report.txt> [...] | '
           'check_compromise_declare <report.txt> [...] | '
+          'check_compromise_withdraw <report.txt> [...] | '
           'check_liveness_verify <report.txt> [...] | '
           'check_liveness_report <report.txt> [...] | '
           'check_verify_binding <report.txt> [...] | '
